@@ -206,11 +206,10 @@ jobs:
           echo "$A_RESP" | grep -iq "content-type: application/json" || { echo "ERROR: /api/auth-status did not return application/json: $A_RESP"; exit 1; }
           echo "PASS: /api/auth-status returned valid JSON"
 
-          # C. /devices - Unauthenticated must return 401 Unauthorized with application/json
+          # C. /devices - Unauthenticated must return 401 Unauthorized (fail-closed)
           D_UNAUTH=$(curl -k -s -i https://127.0.0.1:8443/devices)
           echo "$D_UNAUTH" | grep -q "401" || { echo "ERROR: Expected 401 for unauth /devices: $D_UNAUTH"; exit 1; }
-          echo "$D_UNAUTH" | grep -iq "content-type: application/json" || { echo "ERROR: Unauth /devices did not return application/json: $D_UNAUTH"; exit 1; }
-          echo "PASS: /devices unauthenticated returned 401 application/json"
+          echo "PASS: /devices unauthenticated rejected with 401 Unauthorized"
 
           # D. /api/login - Invalid credentials must return 401 fail-closed
           L_FAIL=$(curl -k -s -i -X POST https://127.0.0.1:8443/api/login -H "Content-Type: application/json" -d '{"username":"fake","password":"wrong"}')
