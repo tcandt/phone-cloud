@@ -31,6 +31,8 @@ class CloudPhoneHostService : Service() {
         const val EXTRA_SERVER_URL = "extra_server_url"
         const val EXTRA_DEVICE_ID = "extra_device_id"
         const val EXTRA_TOKEN = "extra_token"
+        const val EXTRA_AGENT_SECRET = "extra_agent_secret"
+        const val EXTRA_USER_TOKEN = "extra_user_token"
         const val EXTRA_STANDALONE = "extra_standalone"
 
         var isRunning = false
@@ -61,14 +63,15 @@ class CloudPhoneHostService : Service() {
 
         val serverUrl = intent?.getStringExtra(EXTRA_SERVER_URL) ?: "ws://127.0.0.1:8000"
         val deviceId = intent?.getStringExtra(EXTRA_DEVICE_ID) ?: Build.MODEL
-        val token = intent?.getStringExtra(EXTRA_TOKEN) ?: ""
+        val agentSecret = intent?.getStringExtra(EXTRA_AGENT_SECRET)
+            ?: intent?.getStringExtra(EXTRA_TOKEN) ?: ""
         val standalone = intent?.getBooleanExtra(EXTRA_STANDALONE, false) ?: false
 
         startForeground(NOTIFICATION_ID, buildNotification("Initializing CloudPhone Host..."))
         isRunning = true
 
         serviceScope.launch {
-            deployAssetsAndStart(serverUrl, deviceId, token, standalone)
+            deployAssetsAndStart(serverUrl, deviceId, agentSecret, standalone)
         }
 
         return START_STICKY
@@ -85,7 +88,7 @@ class CloudPhoneHostService : Service() {
     private suspend fun deployAssetsAndStart(
         serverUrl: String,
         deviceId: String,
-        token: String,
+        agentSecret: String,
         standalone: Boolean
     ) {
         val targetDir = "/data/local/tmp"
@@ -101,8 +104,8 @@ class CloudPhoneHostService : Service() {
         cmd.append("chmod 755 $agentBin\n")
         cmd.append("export CLOUDPHONE_DEVICE_ID=\"$deviceId\"\n")
         cmd.append("$agentBin -signaling \"$serverUrl\" -id \"$deviceId\" -device-id \"$deviceId\" -jar \"$helperJar\" -helper \"$helperJar\"")
-        if (token.isNotEmpty()) {
-            cmd.append(" -agent-secret \"$token\" -secret \"$token\" -token \"$token\"")
+        if (agentSecret.isNotEmpty()) {
+            cmd.append(" -agent-secret \"$agentSecret\" -secret \"$agentSecret\" -token \"$agentSecret\"")
         }
         if (standalone) {
             cmd.append(" -standalone")

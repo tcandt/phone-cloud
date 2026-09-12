@@ -48,6 +48,7 @@ type Client struct {
 	Conn         *websocket.Conn
 	ActiveDevice string
 	ShareToken   string
+	TokenExpiry  time.Time
 	mu           sync.Mutex
 }
 

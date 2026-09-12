@@ -16,6 +16,7 @@ class BootReceiver : BroadcastReceiver() {
         const val KEY_SERVER_URL = "server_url"
         const val KEY_DEVICE_ID = "device_id"
         const val KEY_AUTH_TOKEN = "auth_token"
+        const val KEY_AGENT_SECRET = "agent_secret"
         const val KEY_STANDALONE = "standalone"
     }
 
@@ -34,6 +35,7 @@ class BootReceiver : BroadcastReceiver() {
                 val serverUrl = prefs.getString(KEY_SERVER_URL, "ws://127.0.0.1:8000") ?: "ws://127.0.0.1:8000"
                 val deviceId = prefs.getString(KEY_DEVICE_ID, Build.MODEL) ?: Build.MODEL
                 val token = prefs.getString(KEY_AUTH_TOKEN, "") ?: ""
+                val agentSecret = prefs.getString(KEY_AGENT_SECRET, token) ?: token
                 val standalone = prefs.getBoolean(KEY_STANDALONE, false)
 
                 Log.i(TAG, "Auto-starting CloudPhoneHostService for device $deviceId")
@@ -42,7 +44,9 @@ class BootReceiver : BroadcastReceiver() {
                     this.action = CloudPhoneHostService.ACTION_START
                     putExtra(CloudPhoneHostService.EXTRA_SERVER_URL, serverUrl)
                     putExtra(CloudPhoneHostService.EXTRA_DEVICE_ID, deviceId)
-                    putExtra(CloudPhoneHostService.EXTRA_TOKEN, token)
+                    putExtra(CloudPhoneHostService.EXTRA_AGENT_SECRET, agentSecret)
+                    putExtra(CloudPhoneHostService.EXTRA_TOKEN, agentSecret)
+                    putExtra(CloudPhoneHostService.EXTRA_USER_TOKEN, token)
                     putExtra(CloudPhoneHostService.EXTRA_STANDALONE, standalone)
                 }
 

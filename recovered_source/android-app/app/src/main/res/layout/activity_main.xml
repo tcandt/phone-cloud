@@ -212,6 +212,27 @@
                     android:inputType="textPassword"
                     android:layout_marginBottom="12dp" />
 
+                <TextView
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:text="@string/agent_secret"
+                    android:textColor="@color/text_secondary"
+                    android:textSize="12sp"
+                    android:layout_marginBottom="4dp" />
+
+                <EditText
+                    android:id="@+id/etAgentSecret"
+                    android:layout_width="match_parent"
+                    android:layout_height="46dp"
+                    android:background="@color/surface_variant"
+                    android:hint="@string/agent_secret_hint"
+                    android:textColorHint="@color/text_secondary"
+                    android:textColor="@color/text_primary"
+                    android:paddingHorizontal="12dp"
+                    android:textSize="14sp"
+                    android:inputType="textPassword"
+                    android:layout_marginBottom="12dp" />
+
                 <CheckBox
                     android:id="@+id/cbStandalone"
                     android:layout_width="wrap_content"

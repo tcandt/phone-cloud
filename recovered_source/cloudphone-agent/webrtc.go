@@ -5,11 +5,13 @@ import (
 	"log"
 	"net/url"
 	"strings"
+	"sync"
 
 	"github.com/pion/webrtc/v3"
 )
 
 type WebRTCSession struct {
+	ClientID   string
 	pc         *webrtc.PeerConnection
 	videoTrack *webrtc.TrackLocalStaticSample
 	audioTrack *webrtc.TrackLocalStaticSample
@@ -17,13 +19,16 @@ type WebRTCSession struct {
 	inputDC    *webrtc.DataChannel
 	clipDC     *webrtc.DataChannel
 	cameraDC   *webrtc.DataChannel
-	caps       SessionCapabilities
+	Caps       SessionCapabilities
+	mu         sync.RWMutex
 }
 
 func (s *WebRTCSession) SetCapabilities(caps SessionCapabilities) {
-	s.caps = caps
-	log.Printf("[Agent] Session capabilities applied: Control=%v, Clip=%v, File=%v, Shell=%v",
-		caps.CanControl, caps.CanClipboard, caps.CanFile, caps.CanShell)
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.Caps = caps
+	log.Printf("[Agent] Session capabilities applied (Client: %s): Control=%v, Clip=%v, File=%v, Shell=%v",
+		s.ClientID, caps.CanControl, caps.CanClipboard, caps.CanFile, caps.CanShell)
 }
 
 func parseICEServers(raw string) []webrtc.ICEServer {
@@ -158,7 +163,7 @@ func NewWebRTCSession(ctrl *ControlWriter, iceServersRaw string) (*WebRTCSession
 	}
 	aiCmdDC, _ := pc.CreateDataChannel("ai-command-channel", nil)
 	if aiCmdDC != nil {
-		setupAiCommandChannel(aiCmdDC)
+		setupAiCommandChannel(aiCmdDC, session)
 	}
 
 	// Listen for browser-created DataChannels (file-channel, ai-command-channel, adb-channel)
@@ -169,7 +174,7 @@ func NewWebRTCSession(ctrl *ControlWriter, iceServersRaw string) (*WebRTCSession
 		case "file-channel":
 			setupFileChannel(dc, session)
 		case "ai-command-channel":
-			setupAiCommandChannel(dc)
+			setupAiCommandChannel(dc, session)
 		case "adb-channel":
 			setupAdbChannel(dc, session)
 		case "input-channel":
@@ -187,7 +192,7 @@ func (s *WebRTCSession) setupInputChannel(dc *webrtc.DataChannel) {
 		return
 	}
 	dc.OnMessage(func(msg webrtc.DataChannelMessage) {
-		if !s.caps.CanControl {
+		if !s.Caps.CanControl {
 			log.Printf("[Agent] Input rejected: session does not have CanControl permission (view-only)")
 			return
 		}
@@ -231,7 +236,7 @@ func (s *WebRTCSession) setupClipboardChannel(dc *webrtc.DataChannel) {
 		return
 	}
 	dc.OnMessage(func(msg webrtc.DataChannelMessage) {
-		if !s.caps.CanClipboard {
+		if !s.Caps.CanClipboard {
 			log.Printf("[Agent] Clipboard rejected: session does not have CanClipboard permission")
 			return
 		}

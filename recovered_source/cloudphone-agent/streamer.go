@@ -8,13 +8,12 @@ import (
 	"sync"
 	"time"
 
-	"github.com/pion/webrtc/v3"
 	"github.com/pion/webrtc/v3/pkg/media"
 )
 
 type StreamerBridge struct {
-	videoTrack      *webrtc.TrackLocalStaticSample
-	audioTrack      *webrtc.TrackLocalStaticSample
+	sessionsMu      sync.RWMutex
+	sessions        map[string]*WebRTCSession
 	control         *ControlWriter
 	previewStreamer *PreviewStreamer
 	fps             int
@@ -22,16 +21,15 @@ type StreamerBridge struct {
 	mu              sync.Mutex
 }
 
-func NewStreamerBridge(videoTrack, audioTrack *webrtc.TrackLocalStaticSample, ctrl *ControlWriter, fps int) *StreamerBridge {
+func NewStreamerBridge(ctrl *ControlWriter, fps int) *StreamerBridge {
 	if fps <= 0 {
 		fps = 60
 	}
 	return &StreamerBridge{
-		videoTrack: videoTrack,
-		audioTrack: audioTrack,
-		control:    ctrl,
-		fps:        fps,
-		running:    true,
+		sessions: make(map[string]*WebRTCSession),
+		control:  ctrl,
+		fps:      fps,
+		running:  true,
 	}
 }
 
@@ -41,7 +39,21 @@ func (sb *StreamerBridge) SetPreviewStreamer(p *PreviewStreamer) {
 	sb.previewStreamer = p
 }
 
-// StreamVideo reads H.264 video packets from scrcpy video socket and pushes them to WebRTC
+func (sb *StreamerBridge) RegisterSession(clientID string, sess *WebRTCSession) {
+	sb.sessionsMu.Lock()
+	defer sb.sessionsMu.Unlock()
+	sb.sessions[clientID] = sess
+	log.Printf("[Streamer] Registered WebRTC session for client: %s (Total active: %d)", clientID, len(sb.sessions))
+}
+
+func (sb *StreamerBridge) UnregisterSession(clientID string) {
+	sb.sessionsMu.Lock()
+	defer sb.sessionsMu.Unlock()
+	delete(sb.sessions, clientID)
+	log.Printf("[Streamer] Unregistered WebRTC session for client: %s (Remaining active: %d)", clientID, len(sb.sessions))
+}
+
+// StreamVideo reads H.264 video packets from scrcpy video socket and broadcasts to all active WebRTC sessions
 func (sb *StreamerBridge) StreamVideo(conn net.Conn) {
 	defer conn.Close()
 
@@ -80,26 +92,28 @@ func (sb *StreamerBridge) StreamVideo(conn net.Conn) {
 			break
 		}
 
-		// WebRTC RTP Track
-		if sb.videoTrack != nil {
-			_ = sb.videoTrack.WriteSample(media.Sample{
-				Data:     payload,
-				Duration: sampleDuration,
-			})
+		sample := media.Sample{
+			Data:     payload,
+			Duration: sampleDuration,
 		}
+
+		// WebRTC RTP Track Fan-out
+		sb.sessionsMu.RLock()
+		for _, sess := range sb.sessions {
+			if sess.videoTrack != nil {
+				_ = sess.videoTrack.WriteSample(sample)
+			}
+		}
+		sb.sessionsMu.RUnlock()
 
 		// WebSocket Fallback Preview Stream (PREV framing)
 		if sb.previewStreamer != nil && sb.previewStreamer.IsActive() {
 			_ = sb.previewStreamer.SendFrame(payload, isConfig || isKeyFrame, ptsUs)
 		}
-
-		if isConfig || isKeyFrame {
-			// Periodic keyframe log
-		}
 	}
 }
 
-// StreamAudio reads Opus/audio packets from scrcpy audio socket and pushes them to WebRTC and preview streamer
+// StreamAudio reads Opus packets from scrcpy audio socket and broadcasts to all active WebRTC sessions and preview streamer
 func (sb *StreamerBridge) StreamAudio(conn net.Conn, preview *PreviewStreamer) {
 	defer conn.Close()
 
@@ -121,12 +135,20 @@ func (sb *StreamerBridge) StreamAudio(conn net.Conn, preview *PreviewStreamer) {
 			break
 		}
 
-		if sb.audioTrack != nil {
-			_ = sb.audioTrack.WriteSample(media.Sample{
-				Data:     payload,
-				Duration: 20 * time.Millisecond,
-			})
+		sample := media.Sample{
+			Data:     payload,
+			Duration: 20 * time.Millisecond,
 		}
+
+		// WebRTC RTP Track Fan-out
+		sb.sessionsMu.RLock()
+		for _, sess := range sb.sessions {
+			if sess.audioTrack != nil {
+				_ = sess.audioTrack.WriteSample(sample)
+			}
+		}
+		sb.sessionsMu.RUnlock()
+
 		if preview != nil && preview.IsActive() {
 			_ = preview.SendAudio(payload)
 		}

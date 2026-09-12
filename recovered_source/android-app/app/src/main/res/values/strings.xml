@@ -6,8 +6,10 @@
     <string name="server_url_hint">ws://192.168.1.100:8000</string>
     <string name="device_id">设备名称 / ID</string>
     <string name="device_id_hint">android-phone-01</string>
-    <string name="auth_token">认证凭证 (Token)</string>
-    <string name="auth_token_hint">可选，填入用户 Token</string>
+    <string name="auth_token">控制端 Token (User Token)</string>
+    <string name="auth_token_hint">控制端连接使用的用户 Token</string>
+    <string name="agent_secret">Agent 注册密钥 (Agent Secret)</string>
+    <string name="agent_secret_hint">被控端注册信令所需的共享密钥</string>
     <string name="start_service">启动服务 (Start)</string>
     <string name="stop_service">停止服务 (Stop)</string>
     <string name="service_running">服务运行中</string>

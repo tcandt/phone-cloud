@@ -10,6 +10,7 @@ import (
 	"os/exec"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/gorilla/websocket"
@@ -97,9 +98,18 @@ func main() {
 	}
 	defer scrcpy.Close()
 
-	var activeSession *WebRTCSession
-	var streamer *StreamerBridge
+	var sessionsMu sync.RWMutex
+	sessions := make(map[string]*WebRTCSession)
 	previewStreamer := NewPreviewStreamer(cfg.DeviceID)
+	ctrl := scrcpy.GetControlWriter()
+	streamer := NewStreamerBridge(ctrl, cfg.MaxFPS)
+	streamer.SetPreviewStreamer(previewStreamer)
+	if scrcpy.videoConn != nil {
+		go streamer.StreamVideo(scrcpy.videoConn)
+		if scrcpy.audioConn != nil {
+			go streamer.StreamAudio(scrcpy.audioConn, previewStreamer)
+		}
+	}
 
 	// 2. Persistent Signaling Loop
 	for {
@@ -171,19 +181,20 @@ func main() {
 				switch pType {
 				case "request-offer":
 					log.Printf("[Agent] Received request-offer from client: %s", clientID)
-					if activeSession != nil {
-						activeSession.Close()
-					}
-					if streamer != nil {
-						streamer.Stop()
+					sessionsMu.Lock()
+					if oldSess, exists := sessions[clientID]; exists {
+						oldSess.Close()
+						streamer.UnregisterSession(clientID)
+						delete(sessions, clientID)
 					}
 
-					ctrl := scrcpy.GetControlWriter()
 					session, err := NewWebRTCSession(ctrl, cfg.IceServers)
 					if err != nil {
+						sessionsMu.Unlock()
 						log.Printf("[Agent] Failed to create WebRTC session: %v", err)
 						continue
 					}
+					session.ClientID = clientID
 
 					// Apply session capabilities forwarded by signaling
 					if capsMap, ok := msg["capabilities"].(map[string]interface{}); ok && capsMap != nil {
@@ -203,16 +214,21 @@ func main() {
 						session.SetCapabilities(caps)
 					}
 
-					activeSession = session
+					sessions[clientID] = session
+					streamer.RegisterSession(clientID, session)
+					sessionsMu.Unlock()
 
-					// Start streaming tracks
-					if scrcpy.videoConn != nil {
-						streamer = NewStreamerBridge(session.videoTrack, session.audioTrack, ctrl, cfg.MaxFPS)
-						go streamer.StreamVideo(scrcpy.videoConn)
-						if scrcpy.audioConn != nil {
-							go streamer.StreamAudio(scrcpy.audioConn, previewStreamer)
+					// Cleanup session when connection closes
+					session.pc.OnConnectionStateChange(func(state webrtc.PeerConnectionState) {
+						if state == webrtc.PeerConnectionStateFailed || state == webrtc.PeerConnectionStateClosed {
+							sessionsMu.Lock()
+							if cur, exists := sessions[clientID]; exists && cur == session {
+								delete(sessions, clientID)
+								streamer.UnregisterSession(clientID)
+							}
+							sessionsMu.Unlock()
 						}
-					}
+					})
 
 					sdpOffer, err := session.CreateOffer()
 					if err != nil {
@@ -228,14 +244,20 @@ func main() {
 					})
 
 				case "answer":
-					if activeSession != nil {
+					sessionsMu.RLock()
+					sess := sessions[clientID]
+					sessionsMu.RUnlock()
+					if sess != nil {
 						sdp, _ := payload["sdp"].(string)
-						_ = activeSession.SetAnswer(sdp)
-						log.Printf("[Agent] Answer applied successfully")
+						_ = sess.SetAnswer(sdp)
+						log.Printf("[Agent] Answer applied successfully for client: %s", clientID)
 					}
 
 				case "ice-candidate":
-					if activeSession != nil {
+					sessionsMu.RLock()
+					sess := sessions[clientID]
+					sessionsMu.RUnlock()
+					if sess != nil {
 						candMap, _ := payload["candidate"].(map[string]interface{})
 						candStr, _ := candMap["candidate"].(string)
 						var sdpMid *string
@@ -247,13 +269,46 @@ func main() {
 							u16 := uint16(idx)
 							mlineIndex = &u16
 						}
-						_ = activeSession.AddIceCandidate(webrtc.ICECandidateInit{
+						_ = sess.AddIceCandidate(webrtc.ICECandidateInit{
 							Candidate:     candStr,
 							SDPMid:        sdpMid,
 							SDPMLineIndex: mlineIndex,
 						})
 					}
 				}
+			} else if action == "update_caps" {
+				targetClientID, _ := msg["client_id"].(string)
+				if capsMap, ok := msg["capabilities"].(map[string]interface{}); ok && capsMap != nil {
+					var caps SessionCapabilities
+					if v, ok := capsMap["can_control"].(bool); ok {
+						caps.CanControl = v
+					}
+					if v, ok := capsMap["can_clipboard"].(bool); ok {
+						caps.CanClipboard = v
+					}
+					if v, ok := capsMap["can_file"].(bool); ok {
+						caps.CanFile = v
+					}
+					if v, ok := capsMap["can_shell"].(bool); ok {
+						caps.CanShell = v
+					}
+					sessionsMu.RLock()
+					if sess, ok := sessions[targetClientID]; ok {
+						sess.SetCapabilities(caps)
+						log.Printf("[Agent] Dynamically updated capabilities for client %s: %+v", targetClientID, caps)
+					}
+					sessionsMu.RUnlock()
+				}
+			} else if action == "kick_client" {
+				targetClientID, _ := msg["client_id"].(string)
+				sessionsMu.Lock()
+				if sess, ok := sessions[targetClientID]; ok {
+					sess.Close()
+					streamer.UnregisterSession(targetClientID)
+					delete(sessions, targetClientID)
+					log.Printf("[Agent] Kicked client session: %s", targetClientID)
+				}
+				sessionsMu.Unlock()
 			} else if action == "command" {
 				cmdStr, _ := msg["command"].(string)
 				reqID, _ := msg["request_id"].(string)
@@ -273,13 +328,6 @@ func main() {
 				maxSize, _ := msg["max_size"].(float64)
 				bitrate, _ := msg["bitrate"].(float64)
 				previewStreamer.Start(int(fps), int(maxSize), int(bitrate))
-
-				if streamer == nil && scrcpy.videoConn != nil {
-					ctrl := scrcpy.GetControlWriter()
-					streamer = NewStreamerBridge(nil, nil, ctrl, cfg.MaxFPS)
-					streamer.SetPreviewStreamer(previewStreamer)
-					go streamer.StreamVideo(scrcpy.videoConn)
-				}
 				if ctrl := scrcpy.GetControlWriter(); ctrl != nil {
 					_ = ctrl.RequestKeyframe()
 				}

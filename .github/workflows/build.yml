@@ -24,10 +24,10 @@ jobs:
           cd recovered_source/webrtc-signaling
           go test -v -timeout 60s -run TestProtocolConformance .
 
-      - name: Run Agent Conformance Tests
+      - name: Run Agent Conformance & TURN Relay Tests
         run: |
           cd recovered_source/cloudphone-agent
-          go test -v -timeout 60s -run TestAgentConformance .
+          go test -v -timeout 60s -run "TestAgentConformance|TestTURNRelay" .
 
       - name: Run Differential Parity Tests (Original vs Recovered)
         run: |

@@ -41,6 +41,8 @@ func NewHub(store *PersistenceStore) *Hub {
 		}
 	}
 
+	h.StartExpiryReaper(5 * time.Second)
+
 	return h
 }
 
@@ -320,3 +322,133 @@ func (h *Hub) ForwardToClient(clientID string, msg interface{}) bool {
 	}
 	return c.Conn.WriteMessage(websocket.TextMessage, data) == nil
 }
+
+// UpdateShareCaps notifies connected agents of dynamic capability changes on active share sessions
+func (h *Hub) UpdateShareCaps(shareToken string, caps map[string]interface{}) {
+	h.mu.RLock()
+	var targets []struct{ devID, clientID string }
+	for _, c := range h.clients {
+		c.mu.Lock()
+		if c.ShareToken == shareToken && c.ActiveDevice != "" {
+			targets = append(targets, struct{ devID, clientID string }{c.ActiveDevice, c.ID})
+		}
+		c.mu.Unlock()
+	}
+	h.mu.RUnlock()
+
+	for _, t := range targets {
+		h.ForwardToAgent(t.devID, map[string]interface{}{
+			"action":       "update_caps",
+			"client_id":    t.clientID,
+			"capabilities": caps,
+		})
+	}
+}
+
+// KickClientsByShareToken closes all active client connections bound to a share token and notifies agent
+func (h *Hub) KickClientsByShareToken(shareToken string) {
+	h.mu.RLock()
+	var toKick []*Client
+	for _, c := range h.clients {
+		c.mu.Lock()
+		if c.ShareToken == shareToken {
+			toKick = append(toKick, c)
+		}
+		c.mu.Unlock()
+	}
+	h.mu.RUnlock()
+
+	for _, c := range toKick {
+		c.mu.Lock()
+		devID := c.ActiveDevice
+		cID := c.ID
+		if c.Conn != nil {
+			_ = c.Conn.WriteControl(websocket.CloseMessage, websocket.FormatCloseMessage(websocket.CloseNormalClosure, "Share link revoked"), time.Now().Add(time.Second))
+			_ = c.Conn.Close()
+		}
+		c.mu.Unlock()
+
+		if devID != "" {
+			h.ForwardToAgent(devID, map[string]interface{}{
+				"action":    "kick_client",
+				"client_id": cID,
+			})
+		}
+		h.UnregisterClient(c)
+	}
+}
+
+// KickClientsByUserID closes all active client connections for a specific user ID and notifies agent
+func (h *Hub) KickClientsByUserID(userID string) {
+	h.mu.RLock()
+	var toKick []*Client
+	for _, c := range h.clients {
+		c.mu.Lock()
+		if c.UserID == userID {
+			toKick = append(toKick, c)
+		}
+		c.mu.Unlock()
+	}
+	h.mu.RUnlock()
+
+	for _, c := range toKick {
+		c.mu.Lock()
+		devID := c.ActiveDevice
+		cID := c.ID
+		if c.Conn != nil {
+			_ = c.Conn.WriteControl(websocket.CloseMessage, websocket.FormatCloseMessage(websocket.CloseNormalClosure, "User kicked by administrator"), time.Now().Add(time.Second))
+			_ = c.Conn.Close()
+		}
+		c.mu.Unlock()
+
+		if devID != "" {
+			h.ForwardToAgent(devID, map[string]interface{}{
+				"action":    "kick_client",
+				"client_id": cID,
+			})
+		}
+		h.UnregisterClient(c)
+	}
+}
+
+// StartExpiryReaper periodically disconnects expired web sessions and notifies target agents
+func (h *Hub) StartExpiryReaper(interval time.Duration) {
+	go func() {
+		ticker := time.NewTicker(interval)
+		defer ticker.Stop()
+		for range ticker.C {
+			now := time.Now()
+			h.mu.RLock()
+			var expired []*Client
+			for _, c := range h.clients {
+				c.mu.Lock()
+				if !c.TokenExpiry.IsZero() && now.After(c.TokenExpiry) {
+					expired = append(expired, c)
+				}
+				c.mu.Unlock()
+			}
+			h.mu.RUnlock()
+
+			for _, c := range expired {
+				c.mu.Lock()
+				devID := c.ActiveDevice
+				cID := c.ID
+				if c.Conn != nil {
+					_ = c.Conn.WriteControl(websocket.CloseMessage, websocket.FormatCloseMessage(websocket.ClosePolicyViolation, "Session token expired"), time.Now().Add(time.Second))
+					_ = c.Conn.Close()
+				}
+				c.mu.Unlock()
+
+				if devID != "" {
+					h.ForwardToAgent(devID, map[string]interface{}{
+						"action":    "kick_client",
+						"client_id": cID,
+					})
+				}
+				h.UnregisterClient(c)
+				log.Printf("[Hub] Evicted expired session for client: %s (User: %s)", cID, c.UserID)
+			}
+		}
+	}()
+}
+

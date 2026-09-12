@@ -102,7 +102,7 @@ func setupFileChannel(dc *webrtc.DataChannel, s *WebRTCSession) {
 	var currentUpload *UploadSession
 
 	dc.OnMessage(func(msg webrtc.DataChannelMessage) {
-		if s != nil && !s.caps.CanFile {
+		if s != nil && !s.Caps.CanFile {
 			log.Printf("[FileChannel] Action rejected: session does not have CanFile permission")
 			return
 		}
@@ -442,7 +442,7 @@ func setupAdbChannel(dc *webrtc.DataChannel, s *WebRTCSession) {
 	var adbConn net.Conn
 
 	dc.OnMessage(func(msg webrtc.DataChannelMessage) {
-		if s != nil && !s.caps.CanShell {
+		if s != nil && !s.Caps.CanShell {
 			log.Printf("[AdbChannel] Action rejected: session does not have CanShell permission")
 			return
 		}
@@ -582,8 +582,21 @@ func setupAdbChannel(dc *webrtc.DataChannel, s *WebRTCSession) {
 }
 
 // setupAiCommandChannel executes shell commands requested via P2P
-func setupAiCommandChannel(dc *webrtc.DataChannel) {
+func setupAiCommandChannel(dc *webrtc.DataChannel, sess *WebRTCSession) {
+	if sess != nil && !sess.Caps.CanShell {
+		log.Printf("[AICommand] Rejected AI command channel: session has no shell capability (ClientID: %s)", sess.ClientID)
+		_ = dc.SendText(`{"error":"Permission denied: Shell execution is forbidden for this session","exit_code":-1}`)
+		_ = dc.Close()
+		return
+	}
+
 	dc.OnMessage(func(msg webrtc.DataChannelMessage) {
+		if sess != nil && !sess.Caps.CanShell {
+			log.Printf("[AICommand] Dropped command: session lacks shell capability (ClientID: %s)", sess.ClientID)
+			_ = dc.SendText(`{"error":"Permission denied: Shell capability required","exit_code":126}`)
+			return
+		}
+
 		var req AICommandRequest
 		if err := json.Unmarshal(msg.Data, &req); err != nil {
 			log.Printf("[AICommand] Invalid request JSON: %v", err)

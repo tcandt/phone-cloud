@@ -52,6 +52,7 @@ class MainActivity : AppCompatActivity(), ShizukuManager.StatusListener {
         binding.etServerUrl.setText(prefs.getString(BootReceiver.KEY_SERVER_URL, "ws://192.168.1.100:8000"))
         binding.etDeviceId.setText(prefs.getString(BootReceiver.KEY_DEVICE_ID, Build.MODEL))
         binding.etAuthToken.setText(prefs.getString(BootReceiver.KEY_AUTH_TOKEN, ""))
+        binding.etAgentSecret.setText(prefs.getString(BootReceiver.KEY_AGENT_SECRET, ""))
         binding.cbStandalone.isChecked = prefs.getBoolean(BootReceiver.KEY_STANDALONE, false)
     }
 
@@ -61,6 +62,7 @@ class MainActivity : AppCompatActivity(), ShizukuManager.StatusListener {
             putString(BootReceiver.KEY_SERVER_URL, binding.etServerUrl.text.toString().trim())
             putString(BootReceiver.KEY_DEVICE_ID, binding.etDeviceId.text.toString().trim())
             putString(BootReceiver.KEY_AUTH_TOKEN, binding.etAuthToken.text.toString().trim())
+            putString(BootReceiver.KEY_AGENT_SECRET, binding.etAgentSecret.text.toString().trim())
             putBoolean(BootReceiver.KEY_STANDALONE, binding.cbStandalone.isChecked)
             putBoolean(BootReceiver.KEY_AUTO_START, true)
             apply()
@@ -88,6 +90,7 @@ class MainActivity : AppCompatActivity(), ShizukuManager.StatusListener {
             savePreferences()
             val intent = Intent(this, ControllerActivity::class.java).apply {
                 putExtra(CloudPhoneHostService.EXTRA_SERVER_URL, binding.etServerUrl.text.toString().trim())
+                putExtra(CloudPhoneHostService.EXTRA_USER_TOKEN, binding.etAuthToken.text.toString().trim())
                 putExtra(CloudPhoneHostService.EXTRA_TOKEN, binding.etAuthToken.text.toString().trim())
                 val targetId = binding.etDeviceId.text.toString().trim()
                 if (targetId.isNotEmpty()) {
@@ -102,6 +105,7 @@ class MainActivity : AppCompatActivity(), ShizukuManager.StatusListener {
         savePreferences()
         val serverUrl = binding.etServerUrl.text.toString().trim()
         val deviceId = binding.etDeviceId.text.toString().trim()
+        val agentSecret = binding.etAgentSecret.text.toString().trim()
         val token = binding.etAuthToken.text.toString().trim()
         val standalone = binding.cbStandalone.isChecked
 
@@ -115,7 +119,9 @@ class MainActivity : AppCompatActivity(), ShizukuManager.StatusListener {
             action = CloudPhoneHostService.ACTION_START
             putExtra(CloudPhoneHostService.EXTRA_SERVER_URL, serverUrl)
             putExtra(CloudPhoneHostService.EXTRA_DEVICE_ID, deviceId)
-            putExtra(CloudPhoneHostService.EXTRA_TOKEN, token)
+            putExtra(CloudPhoneHostService.EXTRA_AGENT_SECRET, agentSecret)
+            putExtra(CloudPhoneHostService.EXTRA_TOKEN, if (agentSecret.isNotEmpty()) agentSecret else token)
+            putExtra(CloudPhoneHostService.EXTRA_USER_TOKEN, token)
             putExtra(CloudPhoneHostService.EXTRA_STANDALONE, standalone)
         }
 

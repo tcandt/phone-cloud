@@ -29,6 +29,7 @@ import kotlinx.coroutines.launch
 import okhttp3.*
 import okio.ByteString
 import java.nio.ByteBuffer
+import java.nio.ByteOrder
 
 class ControllerActivity : AppCompatActivity(), TextureView.SurfaceTextureListener {
 
@@ -44,6 +45,7 @@ class ControllerActivity : AppCompatActivity(), TextureView.SurfaceTextureListen
     private var surface: Surface? = null
     private var isDecoderConfigured = false
     private var audioTrack: AudioTrack? = null
+    private var audioDecoder: MediaCodec? = null
 
     private var targetDeviceId: String = ""
     private var serverUrl: String = ""
@@ -102,8 +104,42 @@ class ControllerActivity : AppCompatActivity(), TextureView.SurfaceTextureListen
                 .setBufferSizeInBytes(Math.max(minBuf * 2, 4096))
                 .build()
             audioTrack?.play()
+            initAudioDecoder()
         } catch (e: Throwable) {
             Log.w(TAG, "AudioTrack init deferred: ${e.message}")
+        }
+    }
+
+    private fun initAudioDecoder() {
+        try {
+            val format = MediaFormat.createAudioFormat(MediaFormat.MIMETYPE_AUDIO_OPUS, 48000, 2)
+            // Opus identification header (19 bytes RFC 7845)
+            val csd0 = ByteBuffer.allocate(19).order(ByteOrder.nativeOrder())
+            csd0.put("OpusHead".toByteArray(Charsets.US_ASCII))
+            csd0.put(1.toByte())
+            csd0.put(2.toByte())
+            csd0.putShort(0.toShort())
+            csd0.putInt(48000)
+            csd0.putShort(0.toShort())
+            csd0.put(0.toByte())
+            csd0.flip()
+            format.setByteBuffer("csd-0", csd0)
+
+            val csd1 = ByteBuffer.allocate(8).order(ByteOrder.nativeOrder()).putLong(0L)
+            csd1.flip()
+            format.setByteBuffer("csd-1", csd1)
+
+            val csd2 = ByteBuffer.allocate(8).order(ByteOrder.nativeOrder()).putLong(80000000L)
+            csd2.flip()
+            format.setByteBuffer("csd-2", csd2)
+
+            val codec = MediaCodec.createDecoderByType(MediaFormat.MIMETYPE_AUDIO_OPUS)
+            codec.configure(format, null, null, 0)
+            codec.start()
+            audioDecoder = codec
+            Log.i(TAG, "Audio MediaCodec (Opus) initialized successfully")
+        } catch (e: Throwable) {
+            Log.w(TAG, "Opus decoder initialization fallback: ${e.message}")
         }
     }
 
@@ -423,9 +459,48 @@ class ControllerActivity : AppCompatActivity(), TextureView.SurfaceTextureListen
 
     private fun handleBinaryAudio(data: ByteArray) {
         if (data.size < 4) return
-        val pcm = ByteArray(data.size - 4)
-        System.arraycopy(data, 4, pcm, 0, pcm.size)
-        feedAudio(pcm)
+        val payload = ByteArray(data.size - 4)
+        System.arraycopy(data, 4, payload, 0, payload.size)
+        feedOpusDecoder(payload)
+    }
+
+    private fun feedOpusDecoder(opusPacket: ByteArray) {
+        val codec = audioDecoder
+        if (codec == null) {
+            // Direct PCM fallback if Opus decoder is unavailable
+            feedAudio(opusPacket)
+            return
+        }
+
+        try {
+            val inIndex = codec.dequeueInputBuffer(5000L)
+            if (inIndex >= 0) {
+                val inBuf = codec.getInputBuffer(inIndex)
+                if (inBuf != null) {
+                    inBuf.clear()
+                    inBuf.put(opusPacket)
+                    codec.queueInputBuffer(inIndex, 0, opusPacket.size, System.nanoTime() / 1000, 0)
+                }
+            }
+
+            val bufferInfo = MediaCodec.BufferInfo()
+            var outIndex = codec.dequeueOutputBuffer(bufferInfo, 0L)
+            while (outIndex >= 0) {
+                val outBuf = codec.getOutputBuffer(outIndex)
+                if (outBuf != null && bufferInfo.size > 0) {
+                    outBuf.position(bufferInfo.offset)
+                    outBuf.limit(bufferInfo.offset + bufferInfo.size)
+                    val pcmBytes = ByteArray(bufferInfo.size)
+                    outBuf.get(pcmBytes)
+                    feedAudio(pcmBytes)
+                }
+                codec.releaseOutputBuffer(outIndex, false)
+                outIndex = codec.dequeueOutputBuffer(bufferInfo, 0L)
+            }
+        } catch (e: Throwable) {
+            Log.w(TAG, "Opus decoding error, fallback direct: ${e.message}")
+            feedAudio(opusPacket)
+        }
     }
 
     private fun feedAudio(pcmData: ByteArray) {
@@ -493,6 +568,12 @@ class ControllerActivity : AppCompatActivity(), TextureView.SurfaceTextureListen
         }
         webSocket?.close(1000, "Activity closed")
         releaseMediaCodec()
+
+        try {
+            audioDecoder?.stop()
+            audioDecoder?.release()
+        } catch (e: Throwable) {}
+        audioDecoder = null
 
         try {
             audioTrack?.stop()

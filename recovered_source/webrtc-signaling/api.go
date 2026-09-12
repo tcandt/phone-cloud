@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/json"
+	"flag"
 	"io"
 	"log"
 	"net"
@@ -23,7 +24,20 @@ var upgrader = websocket.Upgrader{
 			return true // Non-browser clients (Go Agent, Android App, curl)
 		}
 
-		// 1. If ALLOWED_ORIGINS env is explicitly configured, enforce strict whitelist
+		// 1. Same-Origin check: Origin host matches Request Host
+		u, err := url.Parse(origin)
+		if err == nil {
+			reqHost := r.Host
+			if h, _, errHost := net.SplitHostPort(reqHost); errHost == nil {
+				reqHost = h
+			}
+			originHost := u.Hostname()
+			if strings.EqualFold(originHost, reqHost) {
+				return true
+			}
+		}
+
+		// 2. If ALLOWED_ORIGINS env is explicitly configured, enforce strict whitelist
 		allowedEnv := os.Getenv("ALLOWED_ORIGINS")
 		if allowedEnv != "" {
 			if allowedEnv == "*" {
@@ -39,19 +53,17 @@ var upgrader = websocket.Upgrader{
 			return false // Reject if not in explicit ALLOWED_ORIGINS
 		}
 
-		// 2. Default whitelist: Localhost, loopback, LAN RFC1918 subnets
-		u, err := url.Parse(origin)
-		if err != nil {
-			return false
-		}
-		host := u.Hostname()
-		if host == "localhost" || host == "127.0.0.1" || host == "::1" {
-			return true
-		}
-		ip := net.ParseIP(host)
-		if ip != nil {
-			if ip.IsLoopback() || ip.IsPrivate() {
+		// 3. Default whitelist: Localhost, loopback, LAN RFC1918 subnets
+		if u != nil {
+			host := u.Hostname()
+			if host == "localhost" || host == "127.0.0.1" || host == "::1" {
 				return true
+			}
+			ip := net.ParseIP(host)
+			if ip != nil {
+				if ip.IsLoopback() || ip.IsPrivate() {
+					return true
+				}
 			}
 		}
 
@@ -197,6 +209,13 @@ func (s *APIServer) handleConnectClient(w http.ResponseWriter, r *http.Request) 
 		Conn:       conn,
 		ShareToken: shareToken,
 	}
+	if activeShare != nil && !activeShare.ExpiresAt.IsZero() {
+		client.TokenExpiry = activeShare.ExpiresAt
+	} else if user != nil && user.ExpiresAt != "" {
+		if expTime, err := time.Parse(time.RFC3339, user.ExpiresAt); err == nil {
+			client.TokenExpiry = expTime
+		}
+	}
 	if user != nil {
 		client.UserID = user.ID
 		client.Role = user.Role
@@ -302,6 +321,7 @@ func (s *APIServer) handleConnectClient(w http.ResponseWriter, r *http.Request) 
 			}
 		case "forward":
 			if deviceID != "" {
+				client.ActiveDevice = deviceID
 				s.hub.ForwardToAgent(deviceID, map[string]interface{}{
 					"type":         "client_msg",
 					"client_id":    client.ID,
@@ -473,16 +493,26 @@ func (s *APIServer) handleRegisterAgent(w http.ResponseWriter, r *http.Request) 
 	}
 
 	agentSecret := os.Getenv("AGENT_SECRET")
-	if agentSecret != "" && !s.auth.noAuth {
-		token := r.URL.Query().Get("token")
-		if token == "" {
-			token = r.URL.Query().Get("secret")
-		}
-		if token != agentSecret {
-			log.Printf("[Agent] Unauthorized registration attempt for device: %s", deviceID)
-			_ = conn.WriteControl(websocket.CloseMessage, websocket.FormatCloseMessage(websocket.ClosePolicyViolation, "Unauthorized agent secret"), time.Now().Add(time.Second))
+	if !s.auth.noAuth {
+		isDev := os.Getenv("DEV_MODE") == "true" || os.Getenv("DEBUG") == "true" || flag.Lookup("test.v") != nil
+		if agentSecret == "" && !isDev {
+			log.Printf("[Agent] FATAL/DENY: AGENT_SECRET is not configured in production mode! Rejecting agent registration for device: %s", deviceID)
+			_ = conn.WriteControl(websocket.CloseMessage, websocket.FormatCloseMessage(websocket.ClosePolicyViolation, "AGENT_SECRET must be configured in production"), time.Now().Add(time.Second))
 			conn.Close()
 			return
+		}
+
+		if agentSecret != "" {
+			token := r.URL.Query().Get("token")
+			if token == "" {
+				token = r.URL.Query().Get("secret")
+			}
+			if token != agentSecret {
+				log.Printf("[Agent] Unauthorized registration attempt for device: %s", deviceID)
+				_ = conn.WriteControl(websocket.CloseMessage, websocket.FormatCloseMessage(websocket.ClosePolicyViolation, "Unauthorized agent secret"), time.Now().Add(time.Second))
+				conn.Close()
+				return
+			}
 		}
 	}
 
@@ -1032,6 +1062,7 @@ func (s *APIServer) handleAdminUserKick(w http.ResponseWriter, r *http.Request) 
 	_ = json.NewDecoder(r.Body).Decode(&req)
 
 	s.hub.KickUser(req.Username, req.DeviceID)
+	s.hub.KickClientsByUserID(req.Username)
 	w.WriteHeader(http.StatusOK)
 	_, _ = w.Write([]byte("Kicked"))
 }
@@ -1063,6 +1094,15 @@ func (s *APIServer) handleShareUpdate(w http.ResponseWriter, r *http.Request) {
 				share.ViewOnly = true
 			}
 			s.store.SaveShare(share)
+
+			// Real-time capability update pushed to active WebRTC agent sessions
+			canControl := !share.ViewOnly
+			s.hub.UpdateShareCaps(share.Token, map[string]interface{}{
+				"can_control":   canControl,
+				"can_clipboard": canControl && share.AllowClipboard,
+				"can_file":      canControl && share.AllowFileTx,
+				"can_shell":     false,
+			})
 		}
 	}
 
@@ -1220,7 +1260,10 @@ func (s *APIServer) handleActivate(w http.ResponseWriter, r *http.Request) {
 
 func (s *APIServer) handleTags(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
-	_ = json.NewEncoder(w).Encode(s.hub.tags)
+	_ = json.NewEncoder(w).Encode(map[string]interface{}{
+		"tags":       s.hub.tags,
+		"deviceTags": map[string]interface{}{},
+	})
 }
 
 func (s *APIServer) handleShortcuts(w http.ResponseWriter, r *http.Request) {
@@ -1246,11 +1289,17 @@ func (s *APIServer) handleShareCreate(w http.ResponseWriter, r *http.Request) {
 
 func (s *APIServer) handleShareList(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
+	var shares []*ShareRecord
 	if s.store != nil {
-		_ = json.NewEncoder(w).Encode(s.store.GetAllShares())
-	} else {
-		_ = json.NewEncoder(w).Encode([]*ShareRecord{})
+		shares = s.store.GetAllShares()
 	}
+	if shares == nil {
+		shares = make([]*ShareRecord, 0)
+	}
+	_ = json.NewEncoder(w).Encode(map[string]interface{}{
+		"code": 0,
+		"data": shares,
+	})
 }
 
 func (s *APIServer) handleShareInfo(w http.ResponseWriter, r *http.Request) {
@@ -1271,8 +1320,9 @@ func (s *APIServer) handleShareRevoke(w http.ResponseWriter, r *http.Request) {
 		Token string `json:"token"`
 	}
 	_ = json.NewDecoder(r.Body).Decode(&req)
-	if s.store != nil {
+	if s.store != nil && req.Token != "" {
 		s.store.DeleteShare(req.Token)
+		s.hub.KickClientsByShareToken(req.Token)
 	}
 	w.WriteHeader(http.StatusOK)
 }
@@ -1287,8 +1337,16 @@ func (s *APIServer) handleShareRedeem(w http.ResponseWriter, r *http.Request) {
 
 func (s *APIServer) handleServerAddresses(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
-	_ = json.NewEncoder(w).Encode([]string{r.Host})
+	_ = json.NewEncoder(w).Encode(map[string]interface{}{
+		"code": 0,
+		"data": map[string]interface{}{
+			"addresses": []string{r.Host},
+			"current":   r.Host,
+		},
+	})
 }
+
+
 
 func (s *APIServer) handleAdminUsers(w http.ResponseWriter, r *http.Request) {
 	user, ok := s.authenticateRequest(r)

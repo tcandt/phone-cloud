@@ -112,6 +112,13 @@ func TestGateC_DifferentialParity(t *testing.T) {
 		{"Login_Empty", "POST", "/api/login", `{"username":"","password":""}`},
 		{"Login_Invalid", "POST", "/api/login", `{"username":"fake","password":"wrong"}`},
 		{"NotFound_Handler", "GET", "/api/nonexistent_test_endpoint", ""},
+		{"Share_List", "GET", "/api/share/list", ""},
+		{"Share_Info_Empty", "GET", "/api/share/info?token=invalid_token_123", ""},
+		{"Tasks_Details_Empty", "GET", "/api/tasks/details?task_id=nonexistent", ""},
+		{"Server_Addresses", "GET", "/api/server/addresses", ""},
+		{"Shortcuts_List", "GET", "/api/shortcuts", ""},
+		{"Tags_List", "GET", "/api/tags", ""},
+		{"Method_Not_Allowed_Delete_Version", "DELETE", "/api/version", ""},
 	}
 
 	type DiffResult struct {
