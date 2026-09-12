@@ -1,0 +1,34 @@
+ScrcpyOverWebRTC / Phone-Cloud
+Copyright (c) 2024-2026 tcandt and upstream contributors.
+
+This project incorporates and builds upon software from:
+
+1. Upstream ScrcpyOverWebRTC:
+   - Original author: hqw700 (https://github.com/hqw700/ScrcpyOverWebRTC)
+   - License: Apache License 2.0 / MIT
+
+2. Genymobile/scrcpy:
+   - Copyright (C) 2018 Genymobile
+   - License: Apache License 2.0 (http://www.apache.org/licenses/LICENSE-2.0)
+   - Component: Android display/audio/touch capture and control protocol
+
+3. Pion WebRTC:
+   - Copyright (c) 2018 Pion
+   - License: MIT License (https://github.com/pion/webrtc)
+   - Component: Pure Go WebRTC implementation (ICE, DTLS, SCTP, RTP)
+
+4. ya-webadb / WebADB:
+   - Copyright (c) 2020 Simon Chan
+   - License: MIT License (https://github.com/yume-chan/ya-webadb)
+   - Component: Web ADB transport and terminal protocol
+
+5. Shizuku API:
+   - Copyright (c) Rikka
+   - License: Apache License 2.0 (https://github.com/RikkaApps/Shizuku-API)
+   - Component: Android Binder privilege elevation (UID 2000)
+
+Reconstructed Modules:
+- webrtc-signaling: Pure Go backend signaling, persistence, and WebSocket hub
+- cloudphone-agent: Native Go agent bridge for Android (WebRTC + Scrcpy server)
+- android-helper: Android Java display/audio encoder and input injection daemon (libsys_core.so)
+- android-app: Android Kotlin management host app & controller client

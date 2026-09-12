@@ -72,6 +72,7 @@ jobs:
   build-android:
     name: Build Android Components
     runs-on: ubuntu-latest
+    needs: build-go-binaries
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-java@v4
@@ -79,11 +80,39 @@ jobs:
           distribution: 'temurin'
           java-version: '17'
 
-      - name: Verify Android Helper & App
+      - name: Download Multi-Arch Core Binaries
+        uses: actions/download-artifact@v4
+        with:
+          name: core-binaries
+          path: /tmp/core-binaries
+
+      - name: Stage Fresh Binaries for App Assets Bundling
+        run: |
+          mkdir -p recovered_source/cloudphone-agent recovered_source/webrtc-signaling
+          if [ -f /tmp/core-binaries/cloudphone-agent-arm64 ]; then
+            cp /tmp/core-binaries/cloudphone-agent-arm64 recovered_source/cloudphone-agent/cloudphone-agent-arm64
+          fi
+          if [ -f /tmp/core-binaries/webrtc-signaling-linux-arm64 ]; then
+            cp /tmp/core-binaries/webrtc-signaling-linux-arm64 recovered_source/webrtc-signaling/webrtc-signaling-linux-arm64
+          fi
+
+      - name: Build Android Helper (libsys_core.so)
         run: |
           cd recovered_source/android-helper
           chmod +x gradlew
-          ./gradlew --version
-          cd ../android-app
+          ./gradlew clean assembleHelper
+
+      - name: Build Android App (Debug & Release APKs)
+        run: |
+          cd recovered_source/android-app
           chmod +x gradlew
-          ./gradlew --version
+          ./gradlew clean assembleDebug assembleRelease
+
+      - name: Upload Android Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: android-packages
+          path: |
+            cloudphone-v0.3.6/agentd/libsys_core.so
+            recovered_source/android-app/app/build/outputs/apk/debug/app-debug.apk
+            recovered_source/android-app/app/build/outputs/apk/release/app-release-unsigned.apk

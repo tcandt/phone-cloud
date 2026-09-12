@@ -256,3 +256,18 @@ The frontend source code is fully open-source and located in the `web-app` direc
    The build artifacts will be outputted to the root `assets/` directory by default.
 
 > 💡 For detailed directory structure, development parameters, and Docker mount debugging instructions, please check the document: [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md).
+
+---
+
+## 5. License & Provenance
+
+This project is licensed under the [Apache License 2.0](LICENSE).
+
+### Acknowledgments & Upstream Dependencies
+- [ScrcpyOverWebRTC (Upstream)](https://github.com/hqw700/ScrcpyOverWebRTC) by hqw700 (Apache-2.0 / MIT)
+- [Genymobile/scrcpy](https://github.com/Genymobile/scrcpy) (Apache-2.0)
+- [Pion WebRTC](https://github.com/pion/webrtc) (MIT)
+- [ya-webadb](https://github.com/yume-chan/ya-webadb) (MIT)
+- [Shizuku-API](https://github.com/RikkaApps/Shizuku-API) (Apache-2.0)
+
+Full copyright and individual component notices are documented in [NOTICE](NOTICE).

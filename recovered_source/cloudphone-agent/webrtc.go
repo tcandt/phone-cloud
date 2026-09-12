@@ -3,6 +3,7 @@ package main
 import (
 	"encoding/json"
 	"log"
+	"strings"
 
 	"github.com/pion/webrtc/v3"
 )
@@ -17,7 +18,33 @@ type WebRTCSession struct {
 	cameraDC   *webrtc.DataChannel
 }
 
-func NewWebRTCSession(ctrl *ControlWriter) (*WebRTCSession, error) {
+func parseICEServers(raw string) []webrtc.ICEServer {
+	if raw == "" {
+		return []webrtc.ICEServer{
+			{URLs: []string{"stun:stun.l.google.com:19302"}},
+		}
+	}
+	var servers []webrtc.ICEServer
+	if err := json.Unmarshal([]byte(raw), &servers); err == nil && len(servers) > 0 {
+		return servers
+	}
+	urls := strings.Split(raw, ",")
+	var cleanURLs []string
+	for _, u := range urls {
+		u = strings.TrimSpace(u)
+		if u != "" {
+			cleanURLs = append(cleanURLs, u)
+		}
+	}
+	if len(cleanURLs) > 0 {
+		return []webrtc.ICEServer{{URLs: cleanURLs}}
+	}
+	return []webrtc.ICEServer{
+		{URLs: []string{"stun:stun.l.google.com:19302"}},
+	}
+}
+
+func NewWebRTCSession(ctrl *ControlWriter, iceServersRaw string) (*WebRTCSession, error) {
 	m := &webrtc.MediaEngine{}
 	if err := m.RegisterCodec(webrtc.RTPCodecParameters{
 		RTPCodecCapability: webrtc.RTPCodecCapability{
@@ -47,9 +74,7 @@ func NewWebRTCSession(ctrl *ControlWriter) (*WebRTCSession, error) {
 
 	api := webrtc.NewAPI(webrtc.WithMediaEngine(m))
 	pc, err := api.NewPeerConnection(webrtc.Configuration{
-		ICEServers: []webrtc.ICEServer{
-			{URLs: []string{"stun:stun.l.google.com:19302"}},
-		},
+		ICEServers: parseICEServers(iceServersRaw),
 	})
 	if err != nil {
 		return nil, err

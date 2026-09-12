@@ -363,7 +363,13 @@ class ControllerActivity : AppCompatActivity(), TextureView.SurfaceTextureListen
             }
 
             override fun onMessage(ws: WebSocket, bytes: ByteString) {
-                handleBinaryPreview(bytes.toByteArray())
+                val data = bytes.toByteArray()
+                if (data.size >= 4 && data[0] == 'A'.code.toByte() && data[1] == 'U'.code.toByte() &&
+                    data[2] == 'D'.code.toByte() && data[3] == 'O'.code.toByte()) {
+                    handleBinaryAudio(data)
+                } else {
+                    handleBinaryPreview(data)
+                }
             }
 
             override fun onFailure(ws: WebSocket, t: Throwable, response: Response?) {
@@ -409,6 +415,22 @@ class ControllerActivity : AppCompatActivity(), TextureView.SurfaceTextureListen
             }
         } catch (e: Throwable) {
             Log.w(TAG, "Error parsing signaling JSON: ${e.message}")
+        }
+    }
+
+    private fun handleBinaryAudio(data: ByteArray) {
+        if (data.size < 4) return
+        val pcm = ByteArray(data.size - 4)
+        System.arraycopy(data, 4, pcm, 0, pcm.size)
+        feedAudio(pcm)
+    }
+
+    private fun feedAudio(pcmData: ByteArray) {
+        val track = audioTrack ?: return
+        try {
+            track.write(pcmData, 0, pcmData.size)
+        } catch (e: Throwable) {
+            Log.w(TAG, "AudioTrack write failed: ${e.message}")
         }
     }
 

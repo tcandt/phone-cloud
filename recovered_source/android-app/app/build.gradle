@@ -70,3 +70,62 @@ dependencies {
     androidTestImplementation 'androidx.test.ext:junit:1.1.5'
     androidTestImplementation 'androidx.test.espresso:espresso-core:3.5.1'
 }
+
+tasks.register('bundleHostBinaries') {
+    doLast {
+        def assetsDir = file("src/main/assets")
+        assetsDir.mkdirs()
+
+        // 1. Android Helper (libsys_core.so)
+        def helperFile = file("../../android-helper/build/outputs/apk/release/android-helper-release-unsigned.apk")
+        if (!helperFile.exists()) {
+            helperFile = file("../../../cloudphone-v0.3.6/agentd/libsys_core.so")
+        }
+        if (!helperFile.exists()) {
+            helperFile = file("../../../cloudphone-v0.3.6/android/libsys_core.so")
+        }
+        if (helperFile.exists()) {
+            copy {
+                from helperFile
+                into assetsDir
+                rename { "libsys_core.so" }
+            }
+            println "[bundleHostBinaries] Bundled helper from: ${helperFile.path}"
+        }
+
+        // 2. CloudPhone Agent (cloudphone-agent arm64)
+        def agentFile = file("../../cloudphone-agent/cloudphone-agent-arm64")
+        if (!agentFile.exists()) {
+            agentFile = file("../../../cloudphone-v0.3.6/agentd/cloudphone-agent-arm64")
+        }
+        if (!agentFile.exists()) {
+            agentFile = file("../../../cloudphone-v0.3.6/android/cloudphone-agent")
+        }
+        if (agentFile.exists()) {
+            copy {
+                from agentFile
+                into assetsDir
+                rename { "cloudphone-agent" }
+            }
+            println "[bundleHostBinaries] Bundled agent from: ${agentFile.path}"
+        }
+
+        // 3. WebRTC Signaling Server (webrtc-signaling arm64)
+        def sigFile = file("../../webrtc-signaling/webrtc-signaling-linux-arm64")
+        if (!sigFile.exists()) {
+            sigFile = file("../../../cloudphone-v0.3.6/bin/linux_arm64/webrtc-signaling")
+        }
+        if (!sigFile.exists()) {
+            sigFile = file("../../../cloudphone-v0.3.6/android/webrtc-signaling")
+        }
+        if (sigFile.exists()) {
+            copy {
+                from sigFile
+                into assetsDir
+                rename { "webrtc-signaling" }
+            }
+            println "[bundleHostBinaries] Bundled signaling from: ${sigFile.path}"
+        }
+    }
+}
+preBuild.dependsOn 'bundleHostBinaries'

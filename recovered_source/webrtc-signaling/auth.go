@@ -60,6 +60,15 @@ func (a *AuthManager) Authenticate(username, password string) (string, *User, bo
 		return "", nil, false
 	}
 
+	// Enforce user account expiration
+	if user.ExpiresAt != "" {
+		if expTime, err := time.Parse(time.RFC3339, user.ExpiresAt); err == nil {
+			if time.Now().After(expTime) {
+				return "", nil, false
+			}
+		}
+	}
+
 	if err := bcrypt.CompareHashAndPassword([]byte(user.PasswordHash), []byte(password)); err != nil {
 		return "", nil, false
 	}
@@ -82,9 +91,24 @@ func (a *AuthManager) ValidateToken(token string) (*User, bool) {
 	}
 
 	a.mu.RLock()
-	defer a.mu.RUnlock()
 	user, exists := a.tokens[token]
-	return user, exists
+	a.mu.RUnlock()
+
+	if !exists {
+		return nil, false
+	}
+
+	// Enforce token validity against user expiration
+	if user.ExpiresAt != "" {
+		if expTime, err := time.Parse(time.RFC3339, user.ExpiresAt); err == nil {
+			if time.Now().After(expTime) {
+				a.InvalidateToken(token)
+				return nil, false
+			}
+		}
+	}
+
+	return user, true
 }
 
 func (a *AuthManager) InvalidateToken(token string) {

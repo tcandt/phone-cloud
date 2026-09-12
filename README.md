@@ -198,3 +198,18 @@ docker run -d \
 
 > 💡 详细的前端目录结构、开发参数调优和 Docker 挂载联调说明，请直接查阅文档：[docs/DEVELOPMENT.md](docs/DEVELOPMENT.md)。
 
+---
+
+## 5. 开源协议与版权声明 ( License & Provenance )
+
+本项目基于 [Apache License 2.0](LICENSE) 开源发布。
+
+### 致谢与依赖开源项目
+- [ScrcpyOverWebRTC (Upstream)](https://github.com/hqw700/ScrcpyOverWebRTC) by hqw700 (Apache-2.0 / MIT)
+- [Genymobile/scrcpy](https://github.com/Genymobile/scrcpy) (Apache-2.0)
+- [Pion WebRTC](https://github.com/pion/webrtc) (MIT)
+- [ya-webadb](https://github.com/yume-chan/ya-webadb) (MIT)
+- [Shizuku-API](https://github.com/RikkaApps/Shizuku-API) (Apache-2.0)
+
+完整版权及各组件协议详见 [NOTICE](NOTICE)。
+

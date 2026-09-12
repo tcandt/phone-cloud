@@ -43,28 +43,31 @@ func sanitizeFilePath(rawPath string) (string, error) {
 		return "/sdcard", nil
 	}
 
-	clean := filepath.Clean(rawPath)
-
-	// Block any path that escapes upward via ../
-	if strings.HasPrefix(clean, "..") || strings.Contains(rawPath, "/../") || strings.Contains(rawPath, "\\..\\") {
+	// Check traversal across Unix and Windows notations regardless of current GOOS
+	norm := strings.ReplaceAll(rawPath, "\\", "/")
+	if strings.Contains(norm, "../") || strings.HasSuffix(norm, "..") || strings.Contains(rawPath, "..") {
 		return "", fmt.Errorf("directory traversal forbidden: %s", rawPath)
 	}
 
+	clean := filepath.Clean(rawPath)
 	return clean, nil
 }
 
 // isCriticalSystemPath checks if a path points to sensitive root filesystems or system trees that must not be deleted or corrupted
 func isCriticalSystemPath(path string) bool {
-	clean := filepath.Clean(path)
-	slashClean := filepath.ToSlash(clean)
+	norm := strings.ReplaceAll(path, "\\", "/")
+	for strings.Contains(norm, "//") {
+		norm = strings.ReplaceAll(norm, "//", "/")
+	}
+	normLower := strings.ToLower(norm)
 
 	// Root directories that must NEVER be wiped or deleted in their entirety
 	exactForbidden := []string{
 		"/", "/data", "/sdcard", "/storage", "/storage/emulated", "/storage/emulated/0",
-		"C:", "C:/",
+		"c:", "c:/",
 	}
 	for _, f := range exactForbidden {
-		if slashClean == f {
+		if normLower == f || strings.TrimSuffix(normLower, "/") == strings.TrimSuffix(f, "/") {
 			return true
 		}
 	}
@@ -81,12 +84,12 @@ func isCriticalSystemPath(path string) bool {
 		"/boot",
 		"/recovery",
 		"/data/system",
-		"C:/Windows",
-		"C:/Program Files",
-		"C:/Program Files (x86)",
+		"c:/windows",
+		"c:/program files",
+		"c:/program files (x86)",
 	}
 	for _, tree := range criticalTrees {
-		if slashClean == tree || strings.HasPrefix(slashClean, tree+"/") {
+		if normLower == tree || strings.HasPrefix(normLower, tree+"/") {
 			return true
 		}
 	}

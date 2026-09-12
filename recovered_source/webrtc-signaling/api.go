@@ -132,10 +132,22 @@ func (s *APIServer) handleConnectClient(w http.ResponseWriter, r *http.Request) 
 	shareToken := r.URL.Query().Get("share_token")
 
 	user, authenticated := s.auth.ValidateToken(token)
-	if !authenticated && shareToken == "" && !s.auth.noAuth {
+
+	// Validate share link if provided
+	var activeShare *ShareRecord
+	if shareToken != "" && s.store != nil {
+		activeShare = s.store.GetShare(shareToken)
+		if activeShare != nil && !activeShare.ExpiresAt.IsZero() {
+			if time.Now().After(activeShare.ExpiresAt) {
+				activeShare = nil // Expired share link
+			}
+		}
+	}
+
+	if !authenticated && activeShare == nil && !s.auth.noAuth {
 		_ = conn.WriteJSON(SignalingMessage{
 			MessageType: "error",
-			Error:       "Unauthorized access: valid token or share link required",
+			Error:       "Unauthorized access: valid session token or active share link required",
 		})
 		conn.Close()
 		return
@@ -188,6 +200,26 @@ func (s *APIServer) handleConnectClient(w http.ResponseWriter, r *http.Request) 
 		}
 		deviceID, _ := msg["device_id"].(string)
 
+		// Enforce device access permission for targeted device operations
+		if deviceID != "" && !canAccessDevice(user, activeShare, s.auth.noAuth, deviceID) {
+			_ = conn.WriteJSON(SignalingMessage{
+				MessageType: "error",
+				Error:       "Access denied: device not assigned to your account",
+			})
+			continue
+		}
+
+		// Enforce view-only restrictions on share links
+		if activeShare != nil && activeShare.ViewOnly {
+			if msgType == "command" || msgType == "group_control_event" {
+				_ = conn.WriteJSON(SignalingMessage{
+					MessageType: "error",
+					Error:       "Action forbidden: share link is in view-only mode",
+				})
+				continue
+			}
+		}
+
 		switch msgType {
 		case "connect":
 			client.ActiveDevice = deviceID
@@ -235,10 +267,12 @@ func (s *APIServer) handleConnectClient(w http.ResponseWriter, r *http.Request) 
 			targets, _ := msg["target_device_ids"].([]interface{})
 			for _, t := range targets {
 				if devID, ok := t.(string); ok {
-					s.hub.ForwardToAgent(devID, map[string]interface{}{
-						"action":  "group_control_event",
-						"payload": msg["event"],
-					})
+					if canAccessDevice(user, activeShare, s.auth.noAuth, devID) {
+						s.hub.ForwardToAgent(devID, map[string]interface{}{
+							"action":  "group_control_event",
+							"payload": msg["event"],
+						})
+					}
 				}
 			}
 		case "screenshot_request":
@@ -252,6 +286,33 @@ func (s *APIServer) handleConnectClient(w http.ResponseWriter, r *http.Request) 
 	}
 }
 
+func canAccessDevice(user *User, share *ShareRecord, noAuth bool, targetDeviceID string) bool {
+	if noAuth {
+		return true
+	}
+	if share != nil {
+		if share.DeviceID != "" && share.DeviceID != targetDeviceID {
+			return false
+		}
+		return true
+	}
+	if user == nil {
+		return false
+	}
+	if user.Role == "admin" {
+		return true
+	}
+	if len(user.AssignedDevices) == 0 {
+		return true
+	}
+	for _, id := range user.AssignedDevices {
+		if id == targetDeviceID {
+			return true
+		}
+	}
+	return false
+}
+
 // handleRegisterAgent handles incoming WebSocket connections from cloudphone-agent on Android
 func (s *APIServer) handleRegisterAgent(w http.ResponseWriter, r *http.Request) {
 	conn, err := upgrader.Upgrade(w, r, nil)
@@ -263,6 +324,20 @@ func (s *APIServer) handleRegisterAgent(w http.ResponseWriter, r *http.Request) 
 	deviceID := r.URL.Query().Get("id")
 	if deviceID == "" {
 		deviceID = "android-" + uuid.New().String()[:8]
+	}
+
+	agentSecret := os.Getenv("AGENT_SECRET")
+	if agentSecret != "" && !s.auth.noAuth {
+		token := r.URL.Query().Get("token")
+		if token == "" {
+			token = r.URL.Query().Get("secret")
+		}
+		if token != agentSecret {
+			log.Printf("[Agent] Unauthorized registration attempt for device: %s", deviceID)
+			_ = conn.WriteControl(websocket.CloseMessage, websocket.FormatCloseMessage(websocket.ClosePolicyViolation, "Unauthorized agent secret"), time.Now().Add(time.Second))
+			conn.Close()
+			return
+		}
 	}
 
 	dev := s.hub.RegisterAgent(deviceID, nil, conn)

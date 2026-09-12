@@ -12,6 +12,14 @@ services:
       - "49152-49252:49152-49252/udp"
     volumes:
       - ./coturn/turnserver.conf:/etc/coturn/turnserver.conf:ro
+    command:
+      - -n
+      - --log-file=stdout
+      - --min-port=49152
+      - --max-port=49252
+      - --realm=cloudphone
+      - --user=${TURN_USER:-cloudphone_user}:${TURN_PASSWORD:-cloudphone_secure_password}
+      - --external-ip=${PUBLIC_IP:-127.0.0.1}
     logging:
       driver: "json-file"
       options:

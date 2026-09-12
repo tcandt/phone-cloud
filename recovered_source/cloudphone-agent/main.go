@@ -170,7 +170,7 @@ func main() {
 					}
 
 					ctrl := scrcpy.GetControlWriter()
-					session, err := NewWebRTCSession(ctrl)
+					session, err := NewWebRTCSession(ctrl, cfg.IceServers)
 					if err != nil {
 						log.Printf("[Agent] Failed to create WebRTC session: %v", err)
 						continue
