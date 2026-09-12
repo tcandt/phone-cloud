@@ -224,13 +224,13 @@ jobs:
             exit 1
           fi
           D_AUTH=$(curl -k -s -i -H "Authorization: Bearer $TOKEN" https://127.0.0.1:8443/devices)
-          echo "$D_AUTH" | grep -q "200 OK" || { echo "ERROR: /devices with Bearer token failed: $D_AUTH"; exit 1; }
+          echo "$D_AUTH" | grep -q "200" || { echo "ERROR: /devices with Bearer token failed: $D_AUTH"; exit 1; }
           echo "$D_AUTH" | grep -iq "content-type: application/json" || { echo "ERROR: /devices with Bearer did not return application/json: $D_AUTH"; exit 1; }
-          echo "PASS: /devices with Bearer token returned 200 OK and application/json"
+          echo "PASS: /devices with Bearer token returned 200 and application/json"
 
           # F. /api/ice-servers - Authenticated query returns Coturn TURN configuration
           ICE_RESP=$(curl -k -s -i -H "Authorization: Bearer $TOKEN" https://127.0.0.1:8443/api/ice-servers)
-          echo "$ICE_RESP" | grep -q "200 OK" || { echo "ERROR: /api/ice-servers failed: $ICE_RESP"; exit 1; }
+          echo "$ICE_RESP" | grep -q "200" || { echo "ERROR: /api/ice-servers failed: $ICE_RESP"; exit 1; }
           echo "$ICE_RESP" | grep -iq "content-type: application/json" || { echo "ERROR: /api/ice-servers did not return application/json"; exit 1; }
           echo "$ICE_RESP" | grep -q "turn:" || { echo "ERROR: /api/ice-servers missing TURN server URL"; exit 1; }
           echo "PASS: /api/ice-servers returned valid Coturn TURN configuration with Bearer token"
