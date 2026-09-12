@@ -431,7 +431,8 @@ func deepCompareJSON(path string, valOrig, valRec interface{}) []string {
 			strings.HasSuffix(lower, "updated_at") ||
 			strings.HasSuffix(lower, "days_remaining") ||
 			strings.HasSuffix(lower, "first_seen") ||
-			strings.HasSuffix(lower, "last_seen")
+			strings.HasSuffix(lower, "last_seen") ||
+			strings.HasSuffix(lower, "machine_id")
 	}
 
 	if isDynamicField(path) {
