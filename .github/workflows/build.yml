@@ -171,17 +171,7 @@ jobs:
           echo "=== 2. Healthcheck & Active STUN/TURN Probe for Coturn ==="
           docker compose ps coturn | grep -q "Up" || { echo "Coturn container not running!"; exit 1; }
           # Test STUN Binding Request directly over UDP to Coturn port 3478
-          python3 -c "
-import socket, os
-s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-s.settimeout(5)
-tid = os.urandom(12)
-req = b'\x00\x01\x00\x00\x21\x12\xa4\x42' + tid
-s.sendto(req, ('127.0.0.1', 3478))
-resp, _ = s.recvfrom(1024)
-assert resp[:2] == b'\x01\x01', f'STUN error, expected 0x0101, got {resp[:2].hex()}'
-print('STUN Binding Verification: SUCCESS (Coturn port 3478 responsive to UDP binding probes)')
-"
+          python3 -c "import socket, os; s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM); s.settimeout(5); tid = os.urandom(12); req = b'\x00\x01\x00\x00\x21\x12\xa4\x42' + tid; s.sendto(req, ('127.0.0.1', 3478)); resp, _ = s.recvfrom(1024); assert resp[:2] == b'\x01\x01'; print('STUN Binding Verification: SUCCESS (Coturn port 3478 responsive to UDP binding probes)')"
           # Test TURN Allocation & Relay via turnutils_uclient inside coturn container
           docker compose exec -T coturn turnutils_uclient -u cloudphone_user -w cloudphone_secure_password -p 3478 -m 1 -y 127.0.0.1 || true
 
