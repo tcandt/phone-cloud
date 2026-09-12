@@ -3,6 +3,7 @@ name: Build & Release Pipeline
 on:
   push:
     branches: [ master, main ]
+    tags: [ 'v*' ]
   pull_request:
     branches: [ master, main ]
 
@@ -126,6 +127,8 @@ jobs:
           cd recovered_source/android-app
           chmod +x gradlew
           ./gradlew clean assembleDebug assembleRelease
+          cp app/build/outputs/apk/release/app-release-unsigned.apk app/build/outputs/apk/release/cloudphone-v1.0.0.apk
+          cp app/build/outputs/apk/debug/app-debug.apk app/build/outputs/apk/debug/cloudphone-v1.0.0-debug.apk
 
       - name: Upload Android Artifacts
         uses: actions/upload-artifact@v4
@@ -135,6 +138,8 @@ jobs:
             cloudphone-v0.3.6/agentd/libsys_core.so
             recovered_source/android-app/app/build/outputs/apk/debug/app-debug.apk
             recovered_source/android-app/app/build/outputs/apk/release/app-release-unsigned.apk
+            recovered_source/android-app/app/build/outputs/apk/release/cloudphone-v1.0.0.apk
+            recovered_source/android-app/app/build/outputs/apk/debug/cloudphone-v1.0.0-debug.apk
 
   validate-docker:
     name: Docker Deployment Validation & Smoke Gate
@@ -236,4 +241,50 @@ jobs:
           echo "PASS: /api/turn returned valid Coturn TURN configuration with Bearer token"
           echo "=== 4. Docker Compose Down ==="
           docker compose down -v
+
+  publish-release:
+    name: Publish Official GitHub Release
+    runs-on: ubuntu-latest
+    needs: [ build-go-binaries, build-web-app, build-android, validate-docker ]
+    if: startsWith(github.ref, 'refs/tags/v')
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Download Core Binaries
+        uses: actions/download-artifact@v4
+        with:
+          name: core-binaries
+          path: release-assets/binaries
+
+      - name: Download Web Dist
+        uses: actions/download-artifact@v4
+        with:
+          name: web-dist
+          path: release-assets/web-dist
+
+      - name: Download Android Packages
+        uses: actions/download-artifact@v4
+        with:
+          name: android-packages
+          path: release-assets/android
+
+      - name: Package Web Distribution Archive
+        run: |
+          tar -czf release-assets/web-dist.tar.gz -C release-assets/web-dist .
+
+      - name: Publish GitHub Release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release create ${{ github.ref_name }} \
+            --title "ScrcpyOverWebRTC ${{ github.ref_name }}" \
+            --notes-file RELEASE_NOTES.md \
+            release-assets/android/cloudphone-v1.0.0.apk \
+            release-assets/android/cloudphone-v1.0.0-debug.apk \
+            release-assets/android/libsys_core.so \
+            release-assets/binaries/* \
+            release-assets/web-dist.tar.gz
 
