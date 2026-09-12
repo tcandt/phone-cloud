@@ -1,0 +1,64 @@
+plugins {
+    id 'com.android.application' version '8.2.2'
+}
+
+android {
+    namespace 'com.android.helper'
+    compileSdk 34
+
+    defaultConfig {
+        applicationId 'com.android.helper'
+        minSdk 21
+        targetSdk 34
+        versionCode 30304
+        versionName '3.3.4-2af7ccc1'
+    }
+
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_17
+        targetCompatibility JavaVersion.VERSION_17
+    }
+
+    buildTypes {
+        release {
+            minifyEnabled false
+            proguardFiles getDefaultProguardFile('proguard-android-optimize.txt'), 'proguard-rules.pro'
+        }
+        debug {
+            minifyEnabled false
+        }
+    }
+
+    lint {
+        checkReleaseBuilds false
+        abortOnError false
+    }
+}
+
+dependencies {
+    // Internal Android framework AIDL stubs are self-contained in src/main/java/android/
+}
+
+// Task to package the generated classes.dex as libsys_core.so (standard format expected by cloudphone-agent)
+tasks.register('assembleHelper') {
+    dependsOn 'assembleRelease'
+    doLast {
+        def apkFile = file("${layout.buildDirectory.get()}/outputs/apk/release/android-helper-release-unsigned.apk")
+        if (!apkFile.exists()) {
+            apkFile = file("${layout.buildDirectory.get()}/outputs/apk/release/android-helper-release.apk")
+        }
+        if (apkFile.exists()) {
+            def outputDir = file("${projectDir}/../../cloudphone-v0.3.6/agentd")
+            outputDir.mkdirs()
+            def targetFile = file("${outputDir}/libsys_core.so")
+            
+            // The APK itself can directly serve as the CLASSPATH container or we copy it as libsys_core.so
+            copy {
+                from apkFile
+                into outputDir
+                rename { 'libsys_core.so' }
+            }
+            println "Successfully generated libsys_core.so at: ${targetFile.absolutePath}"
+        }
+    }
+}

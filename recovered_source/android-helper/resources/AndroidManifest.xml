@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    android:versionCode="30304"
+    android:versionName="3.3.4-2af7ccc1"
+    android:compileSdkVersion="36"
+    android:compileSdkVersionCodename="16"
+    package="com.android.helper"
+    platformBuildVersionCode="36"
+    platformBuildVersionName="16">
+    <uses-sdk
+        android:minSdkVersion="21"
+        android:targetSdkVersion="36"/>
+    <application android:extractNativeLibs="true"/>
+</manifest>

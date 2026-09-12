@@ -256,18 +256,3 @@ The frontend source code is fully open-source and located in the `web-app` direc
    The build artifacts will be outputted to the root `assets/` directory by default.
 
 > 💡 For detailed directory structure, development parameters, and Docker mount debugging instructions, please check the document: [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md).
-
-> [!IMPORTANT]
-> **Release Package Notice**:
-> This open-source repository only hosts the frontend `web-app` source code. If you need the standalone non-Docker binary deployment package for physical servers, or the server-free deployment package (running entirely inside the Android phone), please download the official pre-packaged releases directly from the [Releases](https://github.com/hqw700/ScrcpyOverWebRTC/releases) page.
-
-## 📄 License & Disclaimer
-
-* **Frontend Source License**: The frontend `web-app` source code in this repository is licensed under the [MIT License](LICENSE). You are free to modify and perform secondary development.
-* **Third-Party Open-Source Projects & Components**:
-  * [scrcpy](https://github.com/Genymobile/scrcpy): Core audio/video capture and screen streaming engine (licensed under Apache-2.0).
-  * [Tango / ya-webadb](https://github.com/yume-chan/ya-webadb) (`@yume-chan/adb`): Native browser-based WebUSB / WebADB driverless debugging and Agent onboarding (licensed under MIT).
-  * [Pion WebRTC](https://github.com/pion/webrtc) / [xterm.js](https://github.com/xtermjs/xterm.js): WebRTC audio/video/data transport and web terminal Shell reverse proxy (licensed under MIT).
-* **Terms of Use & Disclaimer**:
-  1. Official pre-compiled binary components (including binary server, Agent deployment packages, and APK runtime) are provided strictly for **personal learning, technical research, and non-commercial testing** purposes.
-  2. Do NOT use this project or its derived versions for illegal activities, unauthorized automated risk-control evasion, or commercial resale services. The developers hold no legal liability for any non-compliant actions by users.

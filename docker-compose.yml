@@ -1,0 +1,58 @@
+version: '3.8'
+
+services:
+  # COTURN Relay Service: STUN NAT discovery & TURN media relay for WebRTC
+  coturn:
+    image: coturn/coturn:latest
+    container_name: scrcpy-coturn
+    restart: unless-stopped
+    ports:
+      - "3478:3478/tcp"
+      - "3478:3478/udp"
+      - "49152-49252:49152-49252/udp"
+    volumes:
+      - ./coturn/turnserver.conf:/etc/coturn/turnserver.conf:ro
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  # WebRTC Signaling & Web Management Platform
+  signaling:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: scrcpy-signaling
+    restart: unless-stopped
+    ports:
+      - "${SIGNALING_PORT:-8443}:8443"
+      - "8000:8000"
+    environment:
+      - PORT=8443
+      - HOST=0.0.0.0
+      - ASSETS=/app/assets
+      - DATA_DIR=/app/data
+      - DOWNLOADS_DIR=/app/downloads
+      - USE_TLS=${USE_TLS:-true}
+      - TLS_CERT=/app/certs/server.crt
+      - TLS_KEY=/app/certs/server.key
+      - ICE_SERVERS=turn:${TURN_USER:-cloudphone_user}:${TURN_PASSWORD:-cloudphone_secure_password}@${PUBLIC_IP:-127.0.0.1}:3478?transport=udp,stun:${PUBLIC_IP:-127.0.0.1}:3478
+      - DEFAULT_SETTINGS={"maxBitrate":4,"minBitrate":1,"fps":30,"size":1920,"bitrate":4}
+    volumes:
+      - ./data:/app/data
+      - ./downloads:/app/downloads
+      - ./cloudphone-v0.3.6/certs:/app/certs:ro
+    depends_on:
+      - coturn
+    healthcheck:
+      test: ["CMD", "wget", "--quiet", "--tries=1", "--no-check-certificate", "--spider", "https://127.0.0.1:8443/api/version"]
+      interval: 15s
+      timeout: 3s
+      retries: 3
+      start_period: 5s
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"

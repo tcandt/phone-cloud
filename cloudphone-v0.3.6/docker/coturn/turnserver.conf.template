@@ -1,0 +1,26 @@
+# Coturn TURN Server 配置文件模板
+# 部署脚本 deploy_cloud.sh 将会自动读取并渲染此文件
+
+listening-port=3478
+fingerprint
+lt-cred-mech
+
+# 使用静态用户凭证 (简化与信令服务器的集成)
+user={{TURN_USER}}:{{TURN_PASSWORD}}
+realm=cloudphone
+
+# 绑定网关与公网映射 IP
+# 在云服务器部署中，必须显式指明公网 IP，否则 ICE 协商中转的 candidate 均会带有容器内网段 IP
+external-ip={{PUBLIC_IP}}
+
+# 中转媒体流的 UDP 动态分配端口段 (请在服务器防火墙/安全组中开放此范围内的 UDP 访问)
+min-port=49152
+max-port=65535
+
+# 安全与优化参数
+stale-nonce=600
+no-multicast-peers
+no-cli
+simple-log
+syslog
+verbose

@@ -198,17 +198,3 @@ docker run -d \
 
 > 💡 详细的前端目录结构、开发参数调优和 Docker 挂载联调说明，请直接查阅文档：[docs/DEVELOPMENT.md](docs/DEVELOPMENT.md)。
 
-> [!IMPORTANT]
-> **发布介质说明**：
-> 本开源仓库仅托管前端 `web-app` 的全部源码。如果您需要免 Docker 的物理服务器部署版本，或免服务器版本（全套服务运行在 Android 手机内），请直接前往 [releases](https://github.com/hqw700/ScrcpyOverWebRTC/releases) 页面下载官方打包好的完整发布包。
-
-## 📄 开源许可与免责声明 (License & Disclaimer)
-
-* **前端源码许可**：本项目前端 `web-app` 源代码遵循 [MIT License](LICENSE) 许可协议开源，您可以自由进行二次开发与修改。
-* **第三方开源项目与组件**：
-  * [scrcpy](https://github.com/Genymobile/scrcpy)：音视频采集与投屏核心（遵循 Apache-2.0 协议）。
-  * [Tango / ya-webadb](https://github.com/yume-chan/ya-webadb) (`@yume-chan/adb`)：WebUSB / WebADB 原生浏览器端免驱调试与 Agent 初始化（遵循 MIT 协议）。
-  * [Pion WebRTC](https://github.com/pion/webrtc) / [xterm.js](https://github.com/xtermjs/xterm.js)：WebRTC 音视频/数据传输与网页终端 Shell 反代（遵循 MIT 协议）。
-* **使用规范与免责声明**：
-  1. 官方提供的二进制核心组件（包括二进制服务端、Agent 部署包及 APK 运行环境）仅供**个人学习交流、技术研究与非商业测试**使用。
-  2. 请勿将本项目及其衍生版本用于任何非法用途、未经授权的自动化黑产风控规避或商业化转售服务。开发者不对使用者的任何违规行为承担法律责任。

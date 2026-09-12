@@ -45,8 +45,8 @@ export default defineConfig(({ mode }) => {
       }
     },
     build: {
-      outDir: isDemo ? 'dist' : '../assets',
-      emptyOutDir: isDemo ? true : false
+      outDir: process.env.VITE_OUT_DIR || (isDemo ? 'dist' : '../assets'),
+      emptyOutDir: process.env.VITE_OUT_DIR ? true : (isDemo ? true : false)
     }
   }
 })

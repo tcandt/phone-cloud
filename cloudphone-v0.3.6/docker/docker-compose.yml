@@ -1,0 +1,45 @@
+version: '3.8'
+
+services:
+  # coturn 中转服务：提供 STUN 探测和 TURN 媒体中转，确保 NAT 穿透
+  coturn:
+    image: coturn/coturn:latest
+    container_name: cloudphone-coturn
+    # 使用 host 模式网络以避免 Docker 网桥在分配大段 UDP 端口（49152-65535）时的性能灾难与极大的内存开销
+    network_mode: host
+    restart: always
+    volumes:
+      - ./coturn/turnserver.conf:/etc/coturn/turnserver.conf:ro
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  # signaling 服务：集成信令路由和前端静态网页托管
+  signaling:
+    image: cloudphone-all-in-one:latest
+    container_name: cloudphone-signaling
+    restart: always
+    ports:
+      - "${SIGNALING_PORT:-8443}:8443"
+    environment:
+      - PORT=8443
+      - HOST=0.0.0.0
+      - ASSETS=/app/assets
+      - DATA_DIR=/app/data
+      - USE_TLS=${USE_TLS:-true}
+      - TLS_CERT=/app/certs/server.crt
+      - TLS_KEY=/app/certs/server.key
+      # 将部署的 TURN 服务静态凭据动态透传至信令服务器，使其能在 WebRTC 建立阶段分发至网页端
+      - ICE_SERVERS=turn:${TURN_USER:-cloudphone_user}:${TURN_PASSWORD:-cloudphone_secure_password}@${PUBLIC_IP:-127.0.0.1}:3478?transport=udp,stun:${PUBLIC_IP:-127.0.0.1}:3478
+      - DEFAULT_SETTINGS=${DEFAULT_SETTINGS:-{"maxBitrate":4,"minBitrate":1,"fps":30,"size":1920,"bitrate":4}}
+    volumes:
+      - ./data:/app/data
+    depends_on:
+      - coturn
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"

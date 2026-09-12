@@ -1,9 +1,21 @@
 # Dependencies
 node_modules/
 
-# Build output
-dist/
-/assets/
+# Android build outputs & caches
+.gradle/
+**/build/
+!build_all.*
+*.apk.idsig
+
+# Go test binaries & temporary files
+*.tmp
+*.bak
+recovered_source/webrtc-signaling/*.exe
+recovered_source/cloudphone-agent/*.exe
+
+# GitHub file size limit protection (>100MB)
+*.zip
+*.tar.gz
 
 # IDE
 .idea/
