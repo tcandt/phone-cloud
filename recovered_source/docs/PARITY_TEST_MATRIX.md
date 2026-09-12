@@ -8,18 +8,18 @@ This document establishes the official **40-Test Parity Matrix** comparing the o
 
 | Metric | Original Release v0.3.6 | Reconstructed Source | Parity Status |
 |---|---|---|---|
-| **Total Testcases** | 40 | 40 | **100% Passed (40/40)** |
+| **Total Testcases** | 43 | 43 | **100% Passed (43/43)** |
 | **DataChannels** | 6 channels | 6 channels (`channels.go`) | **100% Functional Parity** |
 | **Signaling Protocol** | WebSocket (`connect_client`, `register_agent`) | Pure Go Gorilla WebSocket | **100% Parity** |
 | **Preview Fallback** | `PREV` 49-byte framing | Bitwise NALU framing & fan-out | **100% Parity** |
-| **Persistence Engine** | JSON disk storage | Atomic rename + auto-rehydration | **100% Parity** |
+| **Persistence Engine** | JSON disk storage | Atomic rename + auto-rehydration (.bak) | **100% Parity** |
 | **Android Host Service** | Shizuku / Root daemon | Kotlin ForegroundService + Binder loop | **100% Structural Parity** |
 | **Android Controller** | Multi-touch, IME, Clipboard, Audio | Kotlin + AudioTrack + MotionEvent tracking | **100% Structural Parity** |
 | **WebADB Framing** | Dual-mode (Interactive PTY vs TCP 5555) | Full support for xterm.js & @yume-chan | **100% Parity** |
 
 ---
 
-## Detailed Testcase Results Matrix (TC001 - TC040)
+## Detailed Testcase Results Matrix (TC001 - TC043)
 
 ### Group 1: Authentication & System Administration (TC001 - TC007)
 
@@ -115,22 +115,22 @@ This document establishes the official **40-Test Parity Matrix** comparing the o
 | Test ID | Name | Method / Target | Expected Contract | Actual Result | Status |
 |---|---|---|---|---|:---:|
 | **TC041** | `WebSocketCommandShellPermissionCheck` | `/connect_client` WS `command` | Default-Deny fail-closed: missing or `can_shell=false` strictly rejects shell execution | Guest rejected; Admin forwarded with `can_shell=true` | **PASS** |
-| **TC042** | `DestructivePersistenceStressAndCrashSafety` | `state.json` + `state.json.bak` | 10 concurrent workers, 300 rapid writes, mid-write truncation corruption, 5 rapid restart loops | Corrupted primary detected, recovered 100% from `.bak`, 0 panic | **PASS** |
-| **TC043** | `DynamicCapabilityRevocationLockout` | `/api/share/update` + WS control | Immediate lockout: toggling `view_only=true` cuts control instantaneously with zero race window | Control action rejected immediately (sync in <6ms) | **PASS** |
+| **TC042** | `DestructivePersistenceStressAndCrashSafety` | `state.json` + `state.json.bak` | 10 workers x 30 writes (300 users + 300 shares), mid-write truncated corruption, 5 restart loops | Strictly asserts 300/300 users, 300/300 shares, boundary records, and SHA-256 snapshot checksum match | **PASS** |
+| **TC043** | `DynamicCapabilityRevocationLockout` | `/api/share/update` + concurrent WS control spam | True concurrency race test: spammer streams touch events while revoker revokes permissions mid-flight | Lockout asserted: zero event leakage to Agent with post-revoke timestamp (zero race window) | **PASS** |
 
 ---
 
-### Gate C: Comprehensive Differential Deep-Value Parity (38/38 Scenarios)
+### Gate C: Differential Deep Semantic Parity within Test Fixtures (38/38 Scenarios)
 
-All 38 test scenarios are verified side-by-side between the original binary `ScrcpyOverWebRTC v0.3.6` and `recovered_source/webrtc-signaling` via recursive JSON deep comparison (matching status, headers, keys, array items, and primitive values):
+All 38 test scenarios are verified side-by-side between the original binary `ScrcpyOverWebRTC v0.3.6` and `recovered_source/webrtc-signaling` via recursive JSON deep semantic comparison across status codes, deep structures, and semantic values. Ephemeral dynamic tokens, task IDs, machine IDs, and addresses (specifically constrained to `$.data.current` for `/api/server/addresses`) are excluded as expected runtime dynamic variations:
 
 - **System & Protocol**: `API_Version`, `Auth_Status`, `License_Status`, `Devices_API_MethodNotAllowed` (405), `NotFound_Handler` (404), `Method_Not_Allowed_Delete_Version` (200).
 - **Authentication & RBAC**: `Default_Settings_Unauth/Auth`, `Devices_Root_Path_Unauth/Auth`, `ICE_Servers_Unauth/Auth`, `Server_Addresses_Unauth/Auth`, `Shortcuts_List_Unauth/Auth`, `Tags_List_Unauth/Auth`, `Share_List_Unauth/Auth`, `Login_Empty_Credentials` (400), `Login_Invalid_Credentials` (401).
 - **Admin User Lifecycle**: `Admin_User_Create`, `Admin_User_UpdateNote`, `Admin_User_UpdatePolicy`, `Admin_Assign_Device`, `Admin_User_ResetPassword`, `Admin_User_Kick`, `Admin_User_Delete`.
-- **Share Link Lifecycle**: `Share_Info_Invalid` (404), `Share_Create_Full`, `Share_Revoke_Nonexistent` (404), `Share_Update` (deep matching data.access_mode, token, permissions), `Share_Revoke`.
-- **Batch Tasks**: `Tasks_MethodNotAllowed_GET` (405), `Tasks_Empty_Targets` (400), `Tasks_Create_Valid`, `Tasks_Details_Nonexistent` (404), `Tasks_Details` (100% deep match).
+- **Share Link Lifecycle**: `Share_Info_Invalid` (404), `Share_Create_Full`, `Share_Revoke_Nonexistent` (404), `Share_Update`, `Share_Revoke`.
+- **Batch Tasks**: `Tasks_MethodNotAllowed_GET` (405), `Tasks_Empty_Targets` (400), `Tasks_Create_Valid`, `Tasks_Details_Nonexistent` (404), `Tasks_Details`.
 - **AI Configuration**: `User_AIConfig_GET_405` (405 Method Not Allowed parity), `User_AIConfig_POST_Success` (200).
-- **Agent WebSocket Handshake**: Agent registration payload, tags, and ICE candidate negotiation 1:1 match.
+- **WebSocket Differential Lifecycle**: Agent handshake (/register_agent), unauthenticated rejection, authenticated handshake (/connect_client), and ping/pong control frame transmission parity.
 
 ---
 

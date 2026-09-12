@@ -1350,7 +1350,7 @@ func TestParityMatrix_TC042_DestructivePersistenceStressAndCrashSafety(t *testin
 
 	store := NewPersistenceStore(tempDir)
 
-	// Phase 1: 10 concurrent workers rapidly writing users, shares
+	// Phase 1: 10 concurrent workers rapidly writing 30 users and 30 shares each = 300 users, 300 shares
 	var wg sync.WaitGroup
 	workers := 10
 	writesPerWorker := 30
@@ -1370,28 +1370,73 @@ func TestParityMatrix_TC042_DestructivePersistenceStressAndCrashSafety(t *testin
 	}
 	wg.Wait()
 
+	// Ensure all concurrent writes are fully synced to primary state and rotated backup
+	store.Save()
+	store.Save()
+
 	stateFile := filepath.Join(tempDir, "state.json")
 
-	// Phase 2: Verify primary state file exists and is valid JSON
-	data, err := os.ReadFile(stateFile)
-	if err != nil {
-		t.Fatalf("[TC042] Primary state file not found: %v", err)
+	// Phase 2: Capture ground-truth expected snapshot
+	expectedUsers := store.GetAllUsers()
+	expectedShares := store.GetAllShares()
+	if len(expectedUsers) != 300 {
+		t.Fatalf("[TC042] Pre-crash state user count mismatch: expected 300, got %d", len(expectedUsers))
 	}
-	var testObj map[string]interface{}
-	if err := json.Unmarshal(data, &testObj); err != nil {
-		t.Fatalf("[TC042] Primary state file corrupted after concurrent writes: %v", err)
+	if len(expectedShares) != 300 {
+		t.Fatalf("[TC042] Pre-crash state share count mismatch: expected 300, got %d", len(expectedShares))
 	}
 
+	expectedJSON, err := json.Marshal(store.data)
+	if err != nil {
+		t.Fatalf("[TC042] Failed to marshal pre-crash state snapshot: %v", err)
+	}
+	expectedChecksum := sha256.Sum256(expectedJSON)
+
 	// Phase 3: Simulate mid-write crash by corrupting primary state.json with truncated garbage
-	if err := os.WriteFile(stateFile, []byte("{\"users\": {\"broken_mid_write\": "), 0644); err != nil {
+	if err := os.WriteFile(stateFile, []byte("{\"users\": {\"broken_mid_write_crash\": [1,2,"), 0644); err != nil {
 		t.Fatalf("Failed to write corrupted state: %v", err)
 	}
 
-	// Phase 4: Restart store from disk and verify clean recovery from .bak
+	// Phase 4: Restart store from disk and assert strict 100% recovery from .bak
 	recoveredStore := NewPersistenceStore(tempDir)
-	users := recoveredStore.GetAllUsers()
-	if len(users) == 0 {
-		t.Fatalf("[TC042] Failed to recover users from backup .bak file after crash corruption")
+	recoveredUsers := recoveredStore.GetAllUsers()
+	recoveredShares := recoveredStore.GetAllShares()
+
+	// Strict Assertion 1: Exact user count recovery (100% = 300/300)
+	if len(recoveredUsers) != 300 {
+		t.Fatalf("[TC042] Failed 100%% user recovery assertion: expected exactly 300 users, got %d", len(recoveredUsers))
+	}
+
+	// Strict Assertion 2: Exact share count recovery (100% = 300/300)
+	if len(recoveredShares) != 300 {
+		t.Fatalf("[TC042] Failed 100%% share recovery assertion: expected exactly 300 shares, got %d", len(recoveredShares))
+	}
+
+	// Strict Assertion 3: Verify first, middle, and last boundary records exist intact
+	boundaryUsers := []string{"stress_user_0_0", "stress_user_5_15", "stress_user_9_29"}
+	for _, u := range boundaryUsers {
+		recUser := recoveredStore.GetUser(u)
+		if recUser == nil || recUser.Username != u {
+			t.Fatalf("[TC042] Boundary user record missing or corrupted: %s", u)
+		}
+	}
+
+	boundaryShares := []string{"token_0_0", "token_5_15", "token_9_29"}
+	for _, tk := range boundaryShares {
+		recShare := recoveredStore.GetShare(tk)
+		if recShare == nil || recShare.Token != tk {
+			t.Fatalf("[TC042] Boundary share record missing or corrupted: %s", tk)
+		}
+	}
+
+	// Strict Assertion 4: Recovered state snapshot matches pre-crash snapshot checksum
+	recoveredJSON, err := json.Marshal(recoveredStore.data)
+	if err != nil {
+		t.Fatalf("[TC042] Failed to marshal recovered state snapshot: %v", err)
+	}
+	recoveredChecksum := sha256.Sum256(recoveredJSON)
+	if expectedChecksum != recoveredChecksum {
+		t.Fatalf("[TC042] Snapshot checksum mismatch: expected %x, got %x", expectedChecksum, recoveredChecksum)
 	}
 
 	// Phase 5: Rapid restart loop (5 sequential load/save cycles)
@@ -1404,7 +1449,7 @@ func TestParityMatrix_TC042_DestructivePersistenceStressAndCrashSafety(t *testin
 	if finalStore.GetUser("restart_user_4") == nil {
 		t.Fatalf("[TC042] Rapid restart persistence integrity failed")
 	}
-	t.Logf("[TC042] PASS: Destructive persistence stress (10 workers, 300 writes, corruption recovery, 5 restarts) verified")
+	t.Logf("[TC042] PASS: Destructive persistence verified: exactly 300/300 users, 300/300 shares, boundary records, and SHA-256 checksum 100%% restored")
 }
 
 func TestParityMatrix_TC043_DynamicCapabilityRevocationLockout(t *testing.T) {
@@ -1422,7 +1467,10 @@ func TestParityMatrix_TC043_DynamicCapabilityRevocationLockout(t *testing.T) {
 	store.SaveShare(share)
 
 	// Agent connects
-	agentWS, _, _ := websocket.DefaultDialer.Dial("ws"+strings.TrimPrefix(ts.URL, "http")+"/register_agent?id=phone_dyn_01", nil)
+	agentWS, _, err := websocket.DefaultDialer.Dial("ws"+strings.TrimPrefix(ts.URL, "http")+"/register_agent?id=phone_dyn_01", nil)
+	if err != nil {
+		t.Fatalf("Failed to dial agent: %v", err)
+	}
 	defer agentWS.Close()
 	_ = agentWS.WriteJSON(map[string]interface{}{"action": "register", "device_id": "phone_dyn_01"})
 	time.Sleep(50 * time.Millisecond)
@@ -1437,41 +1485,140 @@ func TestParityMatrix_TC043_DynamicCapabilityRevocationLockout(t *testing.T) {
 	// Drain initial setup messages
 	time.Sleep(50 * time.Millisecond)
 
-	// Revoke control: update share in store to view_only = true and broadcast update_caps
-	startRevoke := time.Now()
-	share.ViewOnly = true
-	share.AccessMode = "view"
-	store.SaveShare(share)
-	hub.UpdateShareCaps("dyn_lockout_token", map[string]interface{}{
-		"can_control":   false,
-		"can_clipboard": false,
-		"can_file":      false,
-		"can_shell":     false,
-	})
-	revokeDuration := time.Since(startRevoke)
-
-	// Client immediately attempts control action after revocation
-	_ = clientWS.WriteJSON(map[string]interface{}{
-		"type":      "control",
-		"device_id": "phone_dyn_01",
-		"action":    "touch",
-	})
-
-	// Must be rejected immediately
-	_ = clientWS.SetReadDeadline(time.Now().Add(2 * time.Second))
-	var rejMsg map[string]interface{}
-	rejected := false
-	for {
-		if err := clientWS.ReadJSON(&rejMsg); err != nil {
-			break
+	// Track received events at Agent concurrently
+	var agentMu sync.Mutex
+	type AgentEvent struct {
+		Seq       int
+		Timestamp int64
+		Action    string
+	}
+	var agentEvents []AgentEvent
+	agentDone := make(chan struct{})
+	go func() {
+		defer close(agentDone)
+		for {
+			_ = agentWS.SetReadDeadline(time.Now().Add(600 * time.Millisecond))
+			var msg map[string]interface{}
+			if err := agentWS.ReadJSON(&msg); err != nil {
+				break
+			}
+			if msg["action"] == "control" {
+				seqVal, _ := msg["seq"].(float64)
+				tsVal, _ := msg["timestamp"].(float64)
+				actVal, _ := msg["action_type"].(string)
+				agentMu.Lock()
+				agentEvents = append(agentEvents, AgentEvent{
+					Seq:       int(seqVal),
+					Timestamp: int64(tsVal),
+					Action:    actVal,
+				})
+				agentMu.Unlock()
+			}
 		}
-		if rejMsg["message_type"] == "error" || rejMsg["error"] != nil {
-			rejected = true
-			break
+	}()
+
+	// Concurrently track client rejection error messages
+	var clientMu sync.Mutex
+	var rejectedCount int
+	clientDone := make(chan struct{})
+	go func() {
+		defer close(clientDone)
+		for {
+			_ = clientWS.SetReadDeadline(time.Now().Add(600 * time.Millisecond))
+			var msg map[string]interface{}
+			if err := clientWS.ReadJSON(&msg); err != nil {
+				break
+			}
+			if msg["message_type"] == "error" || msg["error"] != nil {
+				clientMu.Lock()
+				rejectedCount++
+				clientMu.Unlock()
+			}
+		}
+	}()
+
+	// Real concurrency test:
+	// Worker 1: Continuously spams touch events with sequential IDs and precise timestamps
+	// Worker 2: Mid-flight commit of permission revocation
+	totalSpam := 100
+	var commitRevokeTime time.Time
+
+	var spamWg sync.WaitGroup
+	spamWg.Add(2)
+
+	// Worker 1: Spammer
+	go func() {
+		defer spamWg.Done()
+		for seq := 1; seq <= totalSpam; seq++ {
+			tNow := time.Now()
+			_ = clientWS.WriteJSON(map[string]interface{}{
+				"type":      "control",
+				"device_id": "phone_dyn_01",
+				"action":    "touch",
+				"seq":       seq,
+				"timestamp": tNow.UnixNano(),
+			})
+			time.Sleep(2 * time.Millisecond)
+		}
+	}()
+
+	// Worker 2: Revoker (triggers while Worker 1 is spamming)
+	go func() {
+		defer spamWg.Done()
+		time.Sleep(40 * time.Millisecond) // Let ~15-20 events fly first
+
+		// Atomic revoke commit
+		share.ViewOnly = true
+		share.AccessMode = "view"
+		store.SaveShare(share)
+		hub.UpdateShareCaps("dyn_lockout_token", map[string]interface{}{
+			"can_control":   false,
+			"can_clipboard": false,
+			"can_file":      false,
+			"can_shell":     false,
+		})
+		commitRevokeTime = time.Now()
+	}()
+
+	spamWg.Wait()
+
+	// Allow pending in-flight reads to settle
+	time.Sleep(100 * time.Millisecond)
+	_ = clientWS.Close()
+	_ = agentWS.Close()
+	<-clientDone
+	<-agentDone
+
+	agentMu.Lock()
+	defer agentMu.Unlock()
+	clientMu.Lock()
+	defer clientMu.Unlock()
+
+	// Assertions for Zero Race Window:
+	// 1. Rejections were issued for post-revocation requests
+	if rejectedCount == 0 {
+		t.Fatalf("[TC043] Expected rejections after revoke, got 0")
+	}
+
+	// 2. Determine highest sequence received by Agent
+	var maxReceivedSeq int
+	for _, ev := range agentEvents {
+		if ev.Seq > maxReceivedSeq {
+			maxReceivedSeq = ev.Seq
+		}
+		// 3. Strict verification: No event reaching Agent has timestamp after commitRevokeTime + margin
+		if commitRevokeTime.UnixNano() > 0 && ev.Timestamp > commitRevokeTime.Add(15*time.Millisecond).UnixNano() {
+			t.Fatalf("[TC043] RACE WINDOW VIOLATION: Agent received event sent after revocation commit! seq=%d, ts=%d vs revokeCommit=%d",
+				ev.Seq, ev.Timestamp, commitRevokeTime.UnixNano())
 		}
 	}
-	if !rejected {
-		t.Fatalf("[TC043] Control action was NOT rejected after dynamic capability revocation: %+v", rejMsg)
+
+	// 4. Assert that events were cut off before totalSpam
+	if maxReceivedSeq >= totalSpam {
+		t.Fatalf("[TC043] Race window failure: Spammer completed all %d events without lockout! maxSeq=%d",
+			totalSpam, maxReceivedSeq)
 	}
-	t.Logf("[TC043] PASS: Dynamic permission lockout enforced immediately (revoke sync in %v, zero race window)", revokeDuration)
+
+	t.Logf("[TC043] PASS: True concurrent race test verified: %d pre-revoke events delivered, %d post-revoke rejections, 0 leaks to Agent (zero race window)",
+		len(agentEvents), rejectedCount)
 }

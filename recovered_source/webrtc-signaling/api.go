@@ -410,6 +410,18 @@ func (s *APIServer) handleConnectClient(w http.ResponseWriter, r *http.Request) 
 					"device_id": deviceID,
 				})
 			}
+		case "control":
+			if deviceID != "" {
+				s.hub.ForwardToAgent(deviceID, map[string]interface{}{
+					"action":      "control",
+					"device_id":   deviceID,
+					"client_id":   client.ID,
+					"action_type": msg["action"],
+					"seq":         msg["seq"],
+					"timestamp":   msg["timestamp"],
+					"payload":     msg["payload"],
+				})
+			}
 		case "group_control_event":
 			targets, _ := msg["target_device_ids"].([]interface{})
 			for _, t := range targets {

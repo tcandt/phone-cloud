@@ -34,6 +34,11 @@ jobs:
           cd recovered_source/webrtc-signaling
           go test -v -timeout 60s -run TestGateC_DifferentialParity .
 
+      - name: Run Signaling Parity Matrix & Destructive Stress Tests (TC001-TC043)
+        run: |
+          cd recovered_source/webrtc-signaling
+          go test -v -timeout 180s -run "TestParityMatrix_TC" .
+
       - name: Build Signaling Server Multi-Arch
         run: |
           cd recovered_source/webrtc-signaling
@@ -130,3 +135,31 @@ jobs:
             cloudphone-v0.3.6/agentd/libsys_core.so
             recovered_source/android-app/app/build/outputs/apk/debug/app-debug.apk
             recovered_source/android-app/app/build/outputs/apk/release/app-release-unsigned.apk
+
+  validate-docker:
+    name: Docker Deployment Validation & Smoke Gate
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Validate Docker Compose Configuration
+        run: docker compose config
+
+      - name: Build Docker Container Image
+        run: docker build -t scrcpy-over-webrtc:ci .
+
+      - name: Run Docker Compose Stack & Healthcheck Smoke Test
+        run: |
+          mkdir -p data downloads
+          docker compose up -d
+          echo "Waiting for signaling container to respond..."
+          for i in $(seq 1 30); do
+            if curl -k -s https://127.0.0.1:8443/api/version | grep -q "0.3.6"; then
+              echo "Signaling service healthy and responsive!"
+              break
+            fi
+            sleep 2
+          done
+          curl -k -f -s https://127.0.0.1:8443/api/version
+          docker compose down -v
