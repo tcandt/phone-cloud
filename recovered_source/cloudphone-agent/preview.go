@@ -112,3 +112,18 @@ func (p *PreviewStreamer) SendFrame(nalu []byte, isKey bool, ptsUs uint64) error
 	packet := p.BuildPrevFrame(nalu, isKey, ptsUs)
 	return p.ws.WriteMessage(websocket.BinaryMessage, packet)
 }
+
+// SendAudio sends a binary AUDO frame [4B 'AUDO'][payload] over the WebSocket connection
+func (p *PreviewStreamer) SendAudio(payload []byte) error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	if !p.active || p.ws == nil {
+		return nil
+	}
+
+	packet := make([]byte, 4+len(payload))
+	copy(packet[0:4], []byte("AUDO"))
+	copy(packet[4:], payload)
+	return p.ws.WriteMessage(websocket.BinaryMessage, packet)
+}

@@ -403,14 +403,17 @@ class ControllerActivity : AppCompatActivity(), TextureView.SurfaceTextureListen
             val json = Gson().fromJson(text, JsonObject::class.java)
             val msgType = json.get("message_type")?.asString ?: json.get("type")?.asString
 
-            if (msgType == "device_list" && targetDeviceId.isEmpty()) {
+            if ((msgType == "device_list" || msgType == "device_list_update") && targetDeviceId.isEmpty()) {
                 val devices = json.getAsJsonArray("devices")
                 if (devices != null && devices.size() > 0) {
-                    targetDeviceId = devices.get(0).asJsonObject.get("device_id")?.asString ?: ""
-                    runOnUiThread {
-                        binding.tvTargetDevice.text = "Target: $targetDeviceId"
+                    val firstDev = devices.get(0).asJsonObject
+                    targetDeviceId = firstDev.get("device_id")?.asString ?: firstDev.get("id")?.asString ?: ""
+                    if (targetDeviceId.isNotEmpty()) {
+                        runOnUiThread {
+                            binding.tvTargetDevice.text = "Target: $targetDeviceId"
+                        }
+                        requestStream(targetDeviceId)
                     }
-                    requestStream(targetDeviceId)
                 }
             }
         } catch (e: Throwable) {

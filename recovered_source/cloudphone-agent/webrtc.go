@@ -3,6 +3,7 @@ package main
 import (
 	"encoding/json"
 	"log"
+	"net/url"
 	"strings"
 
 	"github.com/pion/webrtc/v3"
@@ -16,6 +17,13 @@ type WebRTCSession struct {
 	inputDC    *webrtc.DataChannel
 	clipDC     *webrtc.DataChannel
 	cameraDC   *webrtc.DataChannel
+	caps       SessionCapabilities
+}
+
+func (s *WebRTCSession) SetCapabilities(caps SessionCapabilities) {
+	s.caps = caps
+	log.Printf("[Agent] Session capabilities applied: Control=%v, Clip=%v, File=%v, Shell=%v",
+		caps.CanControl, caps.CanClipboard, caps.CanFile, caps.CanShell)
 }
 
 func parseICEServers(raw string) []webrtc.ICEServer {
@@ -28,16 +36,34 @@ func parseICEServers(raw string) []webrtc.ICEServer {
 	if err := json.Unmarshal([]byte(raw), &servers); err == nil && len(servers) > 0 {
 		return servers
 	}
-	urls := strings.Split(raw, ",")
-	var cleanURLs []string
-	for _, u := range urls {
-		u = strings.TrimSpace(u)
-		if u != "" {
-			cleanURLs = append(cleanURLs, u)
+	tokens := strings.Split(raw, ",")
+	for _, tok := range tokens {
+		tok = strings.TrimSpace(tok)
+		if tok == "" {
+			continue
 		}
+		if strings.HasPrefix(tok, "turn:") || strings.HasPrefix(tok, "turns:") {
+			u, err := url.Parse(tok)
+			if err == nil && u.User != nil {
+				username := u.User.Username()
+				password, _ := u.User.Password()
+				u.User = nil
+				cleanURL := u.String()
+				servers = append(servers, webrtc.ICEServer{
+					URLs:           []string{cleanURL},
+					Username:       username,
+					Credential:     password,
+					CredentialType: webrtc.ICECredentialTypePassword,
+				})
+				continue
+			}
+		}
+		servers = append(servers, webrtc.ICEServer{
+			URLs: []string{tok},
+		})
 	}
-	if len(cleanURLs) > 0 {
-		return []webrtc.ICEServer{{URLs: cleanURLs}}
+	if len(servers) > 0 {
+		return servers
 	}
 	return []webrtc.ICEServer{
 		{URLs: []string{"stun:stun.l.google.com:19302"}},
@@ -128,7 +154,7 @@ func NewWebRTCSession(ctrl *ControlWriter, iceServersRaw string) (*WebRTCSession
 	// Pre-create file and command channels for direct readiness
 	fileDC, _ := pc.CreateDataChannel("file-channel", nil)
 	if fileDC != nil {
-		setupFileChannel(fileDC)
+		setupFileChannel(fileDC, session)
 	}
 	aiCmdDC, _ := pc.CreateDataChannel("ai-command-channel", nil)
 	if aiCmdDC != nil {
@@ -141,11 +167,11 @@ func NewWebRTCSession(ctrl *ControlWriter, iceServersRaw string) (*WebRTCSession
 		log.Printf("[WebRTC] Remote DataChannel opened: %s", label)
 		switch label {
 		case "file-channel":
-			setupFileChannel(dc)
+			setupFileChannel(dc, session)
 		case "ai-command-channel":
 			setupAiCommandChannel(dc)
 		case "adb-channel":
-			setupAdbChannel(dc)
+			setupAdbChannel(dc, session)
 		case "input-channel":
 			session.setupInputChannel(dc)
 		case "clipboard-channel":
@@ -161,6 +187,10 @@ func (s *WebRTCSession) setupInputChannel(dc *webrtc.DataChannel) {
 		return
 	}
 	dc.OnMessage(func(msg webrtc.DataChannelMessage) {
+		if !s.caps.CanControl {
+			log.Printf("[Agent] Input rejected: session does not have CanControl permission (view-only)")
+			return
+		}
 		if s.ctrl == nil {
 			return
 		}
@@ -201,6 +231,10 @@ func (s *WebRTCSession) setupClipboardChannel(dc *webrtc.DataChannel) {
 		return
 	}
 	dc.OnMessage(func(msg webrtc.DataChannelMessage) {
+		if !s.caps.CanClipboard {
+			log.Printf("[Agent] Clipboard rejected: session does not have CanClipboard permission")
+			return
+		}
 		var clip ClipboardMessage
 		if err := json.Unmarshal(msg.Data, &clip); err == nil && clip.Type == "set_clipboard" {
 			if s.ctrl != nil {

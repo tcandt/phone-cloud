@@ -270,4 +270,8 @@ This project is licensed under the [Apache License 2.0](LICENSE).
 - [ya-webadb](https://github.com/yume-chan/ya-webadb) (MIT)
 - [Shizuku-API](https://github.com/RikkaApps/Shizuku-API) (Apache-2.0)
 
+### Commercial Rights & Scope
+- Upstream frontend (`web-app`) is licensed under MIT. Reconstructed source modules are provided under Apache-2.0.
+- Upstream original binaries were distributed under non-commercial testing terms. For commercial operations or paid public rentals, users are advised to seek written licensing with the upstream author.
+
 Full copyright and individual component notices are documented in [NOTICE](NOTICE).

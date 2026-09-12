@@ -100,9 +100,9 @@ class CloudPhoneHostService : Service() {
         val cmd = StringBuilder()
         cmd.append("chmod 755 $agentBin\n")
         cmd.append("export CLOUDPHONE_DEVICE_ID=\"$deviceId\"\n")
-        cmd.append("$agentBin -signaling \"$serverUrl\" -device-id \"$deviceId\" -helper \"$helperJar\"")
+        cmd.append("$agentBin -signaling \"$serverUrl\" -id \"$deviceId\" -device-id \"$deviceId\" -jar \"$helperJar\" -helper \"$helperJar\"")
         if (token.isNotEmpty()) {
-            cmd.append(" -token \"$token\"")
+            cmd.append(" -agent-secret \"$token\" -secret \"$token\" -token \"$token\"")
         }
         if (standalone) {
             cmd.append(" -standalone")
@@ -159,7 +159,19 @@ class CloudPhoneHostService : Service() {
             if (destFile.exists() && destFile.length() > 0) {
                 return // Already present
             }
-            assets.open(assetName).use { input ->
+            var stream: java.io.InputStream? = null
+            for (abi in Build.SUPPORTED_ABIS) {
+                try {
+                    val abiAsset = "bin/$abi/$assetName"
+                    stream = assets.open(abiAsset)
+                    Log.i(TAG, "Selected ABI asset for device: $abiAsset")
+                    break
+                } catch (ignored: Throwable) {}
+            }
+            if (stream == null) {
+                stream = assets.open(assetName)
+            }
+            stream.use { input ->
                 FileOutputStream(destFile).use { output ->
                     input.copyTo(output)
                 }

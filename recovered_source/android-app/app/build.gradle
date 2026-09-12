@@ -76,7 +76,7 @@ tasks.register('bundleHostBinaries') {
         def assetsDir = file("src/main/assets")
         assetsDir.mkdirs()
 
-        // 1. Android Helper (libsys_core.so)
+        // 1. Android Helper (libsys_core.so) - Architecture-independent DEX bytecode
         def helperFile = file("../../android-helper/build/outputs/apk/release/android-helper-release-unsigned.apk")
         if (!helperFile.exists()) {
             helperFile = file("../../../cloudphone-v0.3.6/agentd/libsys_core.so")
@@ -93,38 +93,68 @@ tasks.register('bundleHostBinaries') {
             println "[bundleHostBinaries] Bundled helper from: ${helperFile.path}"
         }
 
-        // 2. CloudPhone Agent (cloudphone-agent arm64)
-        def agentFile = file("../../cloudphone-agent/cloudphone-agent-arm64")
-        if (!agentFile.exists()) {
-            agentFile = file("../../../cloudphone-v0.3.6/agentd/cloudphone-agent-arm64")
-        }
-        if (!agentFile.exists()) {
-            agentFile = file("../../../cloudphone-v0.3.6/android/cloudphone-agent")
-        }
-        if (agentFile.exists()) {
-            copy {
-                from agentFile
-                into assetsDir
-                rename { "cloudphone-agent" }
+        // Helper closure to bundle ABI files
+        def bundleAbi = { String abi, String agentSrc, String sigSrc ->
+            def abiDir = file("src/main/assets/bin/${abi}")
+            abiDir.mkdirs()
+
+            // Agent
+            def aFile = file("../../cloudphone-agent/${agentSrc}")
+            if (!aFile.exists()) {
+                aFile = file("../../../cloudphone-v0.3.6/agentd/${agentSrc}")
             }
-            println "[bundleHostBinaries] Bundled agent from: ${agentFile.path}"
+            if (!aFile.exists()) {
+                aFile = file("../../../cloudphone-v0.3.6/android/cloudphone-agent")
+            }
+            if (aFile.exists()) {
+                copy {
+                    from aFile
+                    into abiDir
+                    rename { "cloudphone-agent" }
+                }
+                println "[bundleHostBinaries] Bundled [${abi}] agent from: ${aFile.path}"
+            }
+
+            // Signaling
+            if (sigSrc != null) {
+                def sFile = file("../../webrtc-signaling/${sigSrc}")
+                if (!sFile.exists()) {
+                    def archDir = abi == "arm64-v8a" ? "linux_arm64" : "linux_amd64"
+                    sFile = file("../../../cloudphone-v0.3.6/bin/${archDir}/webrtc-signaling")
+                }
+                if (!sFile.exists()) {
+                    sFile = file("../../../cloudphone-v0.3.6/android/webrtc-signaling")
+                }
+                if (sFile.exists()) {
+                    copy {
+                        from sFile
+                        into abiDir
+                        rename { "webrtc-signaling" }
+                    }
+                    println "[bundleHostBinaries] Bundled [${abi}] signaling from: ${sFile.path}"
+                }
+            }
         }
 
-        // 3. WebRTC Signaling Server (webrtc-signaling arm64)
-        def sigFile = file("../../webrtc-signaling/webrtc-signaling-linux-arm64")
-        if (!sigFile.exists()) {
-            sigFile = file("../../../cloudphone-v0.3.6/bin/linux_arm64/webrtc-signaling")
-        }
-        if (!sigFile.exists()) {
-            sigFile = file("../../../cloudphone-v0.3.6/android/webrtc-signaling")
-        }
-        if (sigFile.exists()) {
+        // 2. Multi-ABI Matrix Bundling
+        bundleAbi("arm64-v8a", "cloudphone-agent-arm64", "webrtc-signaling-linux-arm64")
+        bundleAbi("armeabi-v7a", "cloudphone-agent-armeabi-v7a", null)
+        bundleAbi("x86_64", "cloudphone-agent-amd64", "webrtc-signaling-linux-amd64")
+
+        // 3. Root Fallback Binaries (Default ARM64)
+        def defaultAgent = file("src/main/assets/bin/arm64-v8a/cloudphone-agent")
+        if (defaultAgent.exists()) {
             copy {
-                from sigFile
+                from defaultAgent
                 into assetsDir
-                rename { "webrtc-signaling" }
             }
-            println "[bundleHostBinaries] Bundled signaling from: ${sigFile.path}"
+        }
+        def defaultSig = file("src/main/assets/bin/arm64-v8a/webrtc-signaling")
+        if (defaultSig.exists()) {
+            copy {
+                from defaultSig
+                into assetsDir
+            }
         }
     }
 }

@@ -98,10 +98,14 @@ func isCriticalSystemPath(path string) bool {
 }
 
 // setupFileChannel sets up message handlers for 'file-channel'
-func setupFileChannel(dc *webrtc.DataChannel) {
+func setupFileChannel(dc *webrtc.DataChannel, s *WebRTCSession) {
 	var currentUpload *UploadSession
 
 	dc.OnMessage(func(msg webrtc.DataChannelMessage) {
+		if s != nil && !s.caps.CanFile {
+			log.Printf("[FileChannel] Action rejected: session does not have CanFile permission")
+			return
+		}
 		if !msg.IsString {
 			// Binary chunk for upload
 			if currentUpload == nil || currentUpload.File == nil {
@@ -428,7 +432,7 @@ func handleApkInstall(dc *webrtc.DataChannel, apkPath string, requestID string) 
 }
 
 // setupAdbChannel bridges WebRTC DataChannel to either local interactive shell (useAdb.js) or local ADB daemon (127.0.0.1:5555)
-func setupAdbChannel(dc *webrtc.DataChannel) {
+func setupAdbChannel(dc *webrtc.DataChannel, s *WebRTCSession) {
 	log.Printf("[AdbChannel] Setting up ADB channel handler...")
 
 	var isInitialized bool
@@ -438,6 +442,10 @@ func setupAdbChannel(dc *webrtc.DataChannel) {
 	var adbConn net.Conn
 
 	dc.OnMessage(func(msg webrtc.DataChannelMessage) {
+		if s != nil && !s.caps.CanShell {
+			log.Printf("[AdbChannel] Action rejected: session does not have CanShell permission")
+			return
+		}
 		initMu.Lock()
 		defer initMu.Unlock()
 

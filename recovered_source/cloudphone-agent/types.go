@@ -50,6 +50,16 @@ type AgentConfig struct {
 	Debug              bool
 	CameraAddr         string
 	ForceCamera        bool
+	AgentSecret        string
+	Standalone         bool
+}
+
+// SessionCapabilities defines permissions granted to a client session
+type SessionCapabilities struct {
+	CanControl   bool `json:"can_control"`
+	CanClipboard bool `json:"can_clipboard"`
+	CanFile      bool `json:"can_file"`
+	CanShell     bool `json:"can_shell"`
 }
 
 // Input JSON structures received from WebRTC 'input-channel' (useWebRTC.js)

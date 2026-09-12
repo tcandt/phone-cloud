@@ -89,6 +89,10 @@ class MainActivity : AppCompatActivity(), ShizukuManager.StatusListener {
             val intent = Intent(this, ControllerActivity::class.java).apply {
                 putExtra(CloudPhoneHostService.EXTRA_SERVER_URL, binding.etServerUrl.text.toString().trim())
                 putExtra(CloudPhoneHostService.EXTRA_TOKEN, binding.etAuthToken.text.toString().trim())
+                val targetId = binding.etDeviceId.text.toString().trim()
+                if (targetId.isNotEmpty()) {
+                    putExtra(CloudPhoneHostService.EXTRA_DEVICE_ID, targetId)
+                }
             }
             startActivity(intent)
         }

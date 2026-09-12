@@ -65,11 +65,18 @@ func main() {
 		Debug:             getEnvBool("CP_AGENT_DEBUG", false),
 		CameraAddr:        getEnvStr("CP_AGENT_CAMERA_ADDR", ""),
 		ForceCamera:       getEnvBool("CP_AGENT_FORCE_CAMERA", false),
+		AgentSecret:       getEnvStr("AGENT_SECRET", getEnvStr("CP_AGENT_SECRET", "")),
 	}
 
 	flag.StringVar(&cfg.SignalingURL, "signaling", cfg.SignalingURL, "Signaling server URL")
 	flag.StringVar(&cfg.DeviceID, "id", cfg.DeviceID, "Device unique ID")
+	flag.StringVar(&cfg.DeviceID, "device-id", cfg.DeviceID, "Device unique ID (alias)")
 	flag.StringVar(&cfg.JarPath, "jar", cfg.JarPath, "Path to libsys_core.so (scrcpy-server JAR)")
+	flag.StringVar(&cfg.JarPath, "helper", cfg.JarPath, "Path to libsys_core.so (scrcpy-server JAR) (alias)")
+	flag.StringVar(&cfg.AgentSecret, "agent-secret", cfg.AgentSecret, "Agent authentication secret")
+	flag.StringVar(&cfg.AgentSecret, "secret", cfg.AgentSecret, "Agent authentication secret (alias)")
+	flag.StringVar(&cfg.AgentSecret, "token", cfg.AgentSecret, "Agent authentication secret (alias)")
+	flag.BoolVar(&cfg.Standalone, "standalone", cfg.Standalone, "Run in standalone mode")
 	flag.IntVar(&cfg.MaxSize, "max-size", cfg.MaxSize, "Maximum video resolution limit")
 	flag.IntVar(&cfg.Bitrate, "bitrate", cfg.Bitrate, "Video streaming bitrate in bps")
 	flag.IntVar(&cfg.MaxFPS, "max-fps", cfg.MaxFPS, "Maximum video frame rate")
@@ -104,12 +111,15 @@ func main() {
 			continue
 		}
 
-		// Connect to /register_agent
+		// Connect to /register_agent with secret authentication
 		wsScheme := "ws"
 		if u.Scheme == "https" || u.Scheme == "wss" {
 			wsScheme = "wss"
 		}
 		agentEndpoint := fmt.Sprintf("%s://%s/register_agent?id=%s", wsScheme, u.Host, url.QueryEscape(cfg.DeviceID))
+		if cfg.AgentSecret != "" {
+			agentEndpoint += fmt.Sprintf("&secret=%s&token=%s", url.QueryEscape(cfg.AgentSecret), url.QueryEscape(cfg.AgentSecret))
+		}
 
 		ws, _, err := websocket.DefaultDialer.Dial(agentEndpoint, nil)
 		if err != nil {
@@ -123,18 +133,17 @@ func main() {
 
 		// Report device hardware metadata
 		hwInfo := map[string]interface{}{
-			"android_model":   getAndroidProp("ro.product.model"),
-			"android_serial":  getAndroidProp("ro.serialno"),
-			"android_version": getAndroidProp("ro.build.version.release"),
-			"app_version":     "0.3.6",
-			"displays": []map[string]interface{}{
-				{"id": 0, "x_res": 1080, "y_res": 1920},
-			},
+			"brand":        getAndroidProp("ro.product.brand"),
+			"model":        getAndroidProp("ro.product.model"),
+			"os_version":   getAndroidProp("ro.build.version.release"),
+			"sdk":          getAndroidProp("ro.build.version.sdk"),
+			"serial":       getAndroidProp("ro.serialno"),
+			"manufacturer": getAndroidProp("ro.product.manufacturer"),
 		}
-
 		_ = ws.WriteJSON(map[string]interface{}{
-			"action": "register",
-			"info":   hwInfo,
+			"action":    "register",
+			"device_id": cfg.DeviceID,
+			"hw_info":   hwInfo,
 		})
 
 		// Message handling loop
@@ -175,6 +184,25 @@ func main() {
 						log.Printf("[Agent] Failed to create WebRTC session: %v", err)
 						continue
 					}
+
+					// Apply session capabilities forwarded by signaling
+					if capsMap, ok := msg["capabilities"].(map[string]interface{}); ok && capsMap != nil {
+						var caps SessionCapabilities
+						if v, ok := capsMap["can_control"].(bool); ok {
+							caps.CanControl = v
+						}
+						if v, ok := capsMap["can_clipboard"].(bool); ok {
+							caps.CanClipboard = v
+						}
+						if v, ok := capsMap["can_file"].(bool); ok {
+							caps.CanFile = v
+						}
+						if v, ok := capsMap["can_shell"].(bool); ok {
+							caps.CanShell = v
+						}
+						session.SetCapabilities(caps)
+					}
+
 					activeSession = session
 
 					// Start streaming tracks
@@ -182,7 +210,7 @@ func main() {
 						streamer = NewStreamerBridge(session.videoTrack, session.audioTrack, ctrl, cfg.MaxFPS)
 						go streamer.StreamVideo(scrcpy.videoConn)
 						if scrcpy.audioConn != nil {
-							go streamer.StreamAudio(scrcpy.audioConn)
+							go streamer.StreamAudio(scrcpy.audioConn, previewStreamer)
 						}
 					}
 

@@ -211,5 +211,9 @@ docker run -d \
 - [ya-webadb](https://github.com/yume-chan/ya-webadb) (MIT)
 - [Shizuku-API](https://github.com/RikkaApps/Shizuku-API) (Apache-2.0)
 
+### 商业授权与使用边界
+- 上游前端 (`web-app`) 基于 MIT 协议开源。本仓库重构源码基于 Apache-2.0 协议。
+- 上游官方预编译二进制组件原发布于非商业学习与测试条款。若计划用于商业化云真机托管、付费出租等商业运营，建议直接联系上游作者获得正式书面授权。
+
 完整版权及各组件协议详见 [NOTICE](NOTICE)。
 

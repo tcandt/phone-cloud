@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -18,16 +19,26 @@ import (
 
 // TestGateC_DifferentialParity runs the Original v0.3.6 binary side-by-side with
 // the Recovered Signaling Server, feeding identical inputs and performing differential
-// schema & status comparison.
+// schema, status and deterministic value comparison.
 func TestGateC_DifferentialParity(t *testing.T) {
-	origBinPath := filepath.Join("..", "..", "cloudphone-v0.3.6", "bin", "windows_amd64", "webrtc-signaling.exe")
+	var origBinPath string
+	if runtime.GOOS == "windows" {
+		origBinPath = filepath.Join("..", "..", "cloudphone-v0.3.6", "bin", "windows_amd64", "webrtc-signaling.exe")
+	} else {
+		origBinPath = filepath.Join("..", "..", "cloudphone-v0.3.6", "bin", "linux_amd64", "webrtc-signaling")
+		_ = os.Chmod(origBinPath, 0755)
+	}
 	if _, err := os.Stat(origBinPath); os.IsNotExist(err) {
 		t.Skipf("Original binary not found at %s, skipping differential parity test", origBinPath)
 		return
 	}
 
 	// 1. Build fresh recovered signaling server binary
-	recBinPath := filepath.Join(os.TempDir(), "recovered-signaling-test.exe")
+	recBinName := "recovered-signaling-test"
+	if runtime.GOOS == "windows" {
+		recBinName += ".exe"
+	}
+	recBinPath := filepath.Join(os.TempDir(), recBinName)
 	buildCmd := exec.Command("go", "build", "-o", recBinPath, ".")
 	if out, err := buildCmd.CombinedOutput(); err != nil {
 		t.Fatalf("Failed to build recovered signaling binary: %v\nOutput: %s", err, string(out))
@@ -159,9 +170,26 @@ func TestGateC_DifferentialParity(t *testing.T) {
 				for k := range jsonRec {
 					diff.RecKeys = append(diff.RecKeys, k)
 					if _, ok := jsonOrig[k]; !ok {
+						diff.SchemaMatch = false
 						diff.Discrepancies = append(diff.Discrepancies, fmt.Sprintf("Recovered extra key: %q", k))
 					}
 				}
+				for k, vOrig := range jsonOrig {
+					if vRec, ok := jsonRec[k]; ok {
+						if k == "version" || k == "status" || k == "license_source" || k == "activated" {
+							strOrig := fmt.Sprintf("%v", vOrig)
+							strRec := fmt.Sprintf("%v", vRec)
+							if strOrig != strRec {
+								diff.SchemaMatch = false
+								diff.Discrepancies = append(diff.Discrepancies, fmt.Sprintf("Value mismatch on %q: orig=%s, rec=%s", k, strOrig, strRec))
+							}
+						}
+					}
+				}
+			}
+
+			if !diff.StatusMatch || !diff.SchemaMatch {
+				t.Errorf("Differential parity mismatch on %s: %v", tc.path, diff.Discrepancies)
 			}
 
 			results = append(results, diff)

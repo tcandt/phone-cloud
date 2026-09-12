@@ -99,8 +99,8 @@ func (sb *StreamerBridge) StreamVideo(conn net.Conn) {
 	}
 }
 
-// StreamAudio reads Opus audio packets from scrcpy audio socket and pushes them to WebRTC
-func (sb *StreamerBridge) StreamAudio(conn net.Conn) {
+// StreamAudio reads Opus/audio packets from scrcpy audio socket and pushes them to WebRTC and preview streamer
+func (sb *StreamerBridge) StreamAudio(conn net.Conn, preview *PreviewStreamer) {
 	defer conn.Close()
 
 	// 1. Read Audio Codec Header: CodecID (4B)
@@ -126,6 +126,9 @@ func (sb *StreamerBridge) StreamAudio(conn net.Conn) {
 				Data:     payload,
 				Duration: 20 * time.Millisecond,
 			})
+		}
+		if preview != nil && preview.IsActive() {
+			_ = preview.SendAudio(payload)
 		}
 	}
 }

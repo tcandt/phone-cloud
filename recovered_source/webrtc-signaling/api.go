@@ -4,7 +4,9 @@ import (
 	"encoding/json"
 	"io"
 	"log"
+	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -20,21 +22,41 @@ var upgrader = websocket.Upgrader{
 		if origin == "" {
 			return true // Non-browser clients (Go Agent, Android App, curl)
 		}
-		// Allow local development, LAN farm IP ranges, or authenticated requests
-		if strings.HasPrefix(origin, "http://localhost") ||
-			strings.HasPrefix(origin, "https://localhost") ||
-			strings.HasPrefix(origin, "http://127.0.0.1") ||
-			strings.HasPrefix(origin, "https://127.0.0.1") ||
-			strings.Contains(origin, "192.168.") ||
-			strings.Contains(origin, "10.") ||
-			strings.Contains(origin, "172.") {
+
+		// 1. If ALLOWED_ORIGINS env is explicitly configured, enforce strict whitelist
+		allowedEnv := os.Getenv("ALLOWED_ORIGINS")
+		if allowedEnv != "" {
+			if allowedEnv == "*" {
+				return true
+			}
+			parts := strings.Split(allowedEnv, ",")
+			for _, p := range parts {
+				p = strings.TrimSpace(p)
+				if p != "" && (origin == p || strings.HasPrefix(origin, p)) {
+					return true
+				}
+			}
+			return false // Reject if not in explicit ALLOWED_ORIGINS
+		}
+
+		// 2. Default whitelist: Localhost, loopback, LAN RFC1918 subnets
+		u, err := url.Parse(origin)
+		if err != nil {
+			return false
+		}
+		host := u.Hostname()
+		if host == "localhost" || host == "127.0.0.1" || host == "::1" {
 			return true
 		}
-		// If query has session token or share link token, allow connection
-		if r.URL.Query().Get("token") != "" || r.URL.Query().Get("share_token") != "" {
-			return true
+		ip := net.ParseIP(host)
+		if ip != nil {
+			if ip.IsLoopback() || ip.IsPrivate() {
+				return true
+			}
 		}
-		return true // Fallback to preserve interoperability with custom web hosts
+
+		// Reject untrusted cross-origin requests
+		return false
 	},
 }
 
@@ -144,6 +166,22 @@ func (s *APIServer) handleConnectClient(w http.ResponseWriter, r *http.Request) 
 		}
 	}
 
+	// Verify share link password/PIN if required
+	if activeShare != nil && activeShare.RequirePassword {
+		reqPass := r.URL.Query().Get("password")
+		if reqPass == "" {
+			reqPass = r.URL.Query().Get("pin")
+		}
+		if reqPass != activeShare.Password {
+			_ = conn.WriteJSON(SignalingMessage{
+				MessageType: "error",
+				Error:       "Unauthorized access: valid password or PIN required for this share link",
+			})
+			conn.Close()
+			return
+		}
+	}
+
 	if !authenticated && activeShare == nil && !s.auth.noAuth {
 		_ = conn.WriteJSON(SignalingMessage{
 			MessageType: "error",
@@ -164,6 +202,38 @@ func (s *APIServer) handleConnectClient(w http.ResponseWriter, r *http.Request) 
 		client.Role = user.Role
 	}
 
+	// Compute session capabilities
+	var clientCaps map[string]interface{}
+	if activeShare != nil {
+		clientCaps = map[string]interface{}{
+			"can_view":      true,
+			"can_control":   !activeShare.ViewOnly,
+			"can_clipboard": activeShare.AllowClipboard,
+			"can_file":      activeShare.AllowFileTx,
+			"can_shell":     false,
+			"expires_at":    activeShare.ExpiresAt,
+			"session_id":    clientID,
+		}
+	} else if user != nil {
+		clientCaps = map[string]interface{}{
+			"can_view":      true,
+			"can_control":   true,
+			"can_clipboard": true,
+			"can_file":      true,
+			"can_shell":     user.Role == "admin",
+			"session_id":    clientID,
+		}
+	} else {
+		clientCaps = map[string]interface{}{
+			"can_view":      true,
+			"can_control":   true,
+			"can_clipboard": true,
+			"can_file":      true,
+			"can_shell":     false,
+			"session_id":    clientID,
+		}
+	}
+
 	s.hub.RegisterClient(client)
 	defer func() {
 		s.hub.UnregisterClient(client)
@@ -176,11 +246,12 @@ func (s *APIServer) handleConnectClient(w http.ResponseWriter, r *http.Request) 
 		IceServers:  s.hub.iceServers,
 	})
 
-	// Send initial device list
+	// Send filtered device list according to user RBAC or share binding
+	filteredDevices := s.filterDevicesForClient(user, activeShare)
 	_ = conn.WriteJSON(SignalingMessage{
 		MessageType: "device_list_update",
 		Type:        "device_list_update",
-		Devices:     s.hub.GetAllDevices(),
+		Devices:     filteredDevices,
 	})
 
 	for {
@@ -232,9 +303,49 @@ func (s *APIServer) handleConnectClient(w http.ResponseWriter, r *http.Request) 
 		case "forward":
 			if deviceID != "" {
 				s.hub.ForwardToAgent(deviceID, map[string]interface{}{
-					"type":      "client_msg",
-					"client_id": client.ID,
-					"payload":   msg["payload"],
+					"type":         "client_msg",
+					"client_id":    client.ID,
+					"payload":      msg["payload"],
+					"capabilities": clientCaps,
+				})
+			}
+		case "inject_data":
+			channel, _ := msg["channel"].(string)
+			if activeShare != nil && activeShare.ViewOnly && channel == "input-channel" {
+				_ = conn.WriteJSON(SignalingMessage{
+					MessageType: "error",
+					Error:       "Action forbidden: share link is in view-only mode",
+				})
+				continue
+			}
+			if activeShare != nil && !activeShare.AllowClipboard && channel == "clipboard-channel" {
+				_ = conn.WriteJSON(SignalingMessage{
+					MessageType: "error",
+					Error:       "Action forbidden: clipboard synchronization is disabled for this share link",
+				})
+				continue
+			}
+
+			targets, _ := msg["target_device_ids"].([]interface{})
+			if len(targets) > 0 {
+				for _, t := range targets {
+					if devID, ok := t.(string); ok {
+						if canAccessDevice(user, activeShare, s.auth.noAuth, devID) {
+							s.hub.ForwardToAgent(devID, map[string]interface{}{
+								"type":    "inject_data",
+								"action":  "inject_data",
+								"channel": channel,
+								"payload": msg["payload"],
+							})
+						}
+					}
+				}
+			} else if deviceID != "" && canAccessDevice(user, activeShare, s.auth.noAuth, deviceID) {
+				s.hub.ForwardToAgent(deviceID, map[string]interface{}{
+					"type":    "inject_data",
+					"action":  "inject_data",
+					"channel": channel,
+					"payload": msg["payload"],
 				})
 			}
 		case "command":
@@ -286,6 +397,41 @@ func (s *APIServer) handleConnectClient(w http.ResponseWriter, r *http.Request) 
 	}
 }
 
+func (s *APIServer) filterDevicesForClient(user *User, share *ShareRecord) []*Device {
+	all := s.hub.GetAllDevices()
+	if s.auth.noAuth {
+		return all
+	}
+	if share != nil {
+		var res []*Device
+		for _, d := range all {
+			if d.ID == share.DeviceID {
+				res = append(res, d)
+			}
+		}
+		return res
+	}
+	if user == nil {
+		return nil
+	}
+	if user.Role == "admin" {
+		return all
+	}
+	if len(user.AssignedDevices) == 0 {
+		return nil // Default deny
+	}
+	var res []*Device
+	for _, d := range all {
+		for _, aid := range user.AssignedDevices {
+			if d.ID == aid {
+				res = append(res, d)
+				break
+			}
+		}
+	}
+	return res
+}
+
 func canAccessDevice(user *User, share *ShareRecord, noAuth bool, targetDeviceID string) bool {
 	if noAuth {
 		return true
@@ -303,7 +449,7 @@ func canAccessDevice(user *User, share *ShareRecord, noAuth bool, targetDeviceID
 		return true
 	}
 	if len(user.AssignedDevices) == 0 {
-		return true
+		return false // Default deny: empty assigned devices means ZERO devices
 	}
 	for _, id := range user.AssignedDevices {
 		if id == targetDeviceID {
@@ -432,7 +578,28 @@ func (s *APIServer) authenticateRequest(r *http.Request) (*User, bool) {
 
 // GET /devices - returns format expected by web-app/src/stores/devices.js
 func (s *APIServer) handleDevicesRoot(w http.ResponseWriter, r *http.Request) {
-	devices := s.hub.GetAllDevices()
+	token := r.URL.Query().Get("token")
+	if token == "" {
+		token = r.Header.Get("Authorization")
+		token = strings.TrimPrefix(token, "Bearer ")
+	}
+	shareToken := r.URL.Query().Get("share_token")
+
+	user, authenticated := s.auth.ValidateToken(token)
+	var activeShare *ShareRecord
+	if shareToken != "" && s.store != nil {
+		activeShare = s.store.GetShare(shareToken)
+		if activeShare != nil && !activeShare.ExpiresAt.IsZero() && time.Now().After(activeShare.ExpiresAt) {
+			activeShare = nil
+		}
+	}
+
+	if !authenticated && activeShare == nil && !s.auth.noAuth {
+		http.Error(w, "Unauthorized: valid session token or active share link required", http.StatusUnauthorized)
+		return
+	}
+
+	devices := s.filterDevicesForClient(user, activeShare)
 	type DeviceListItem struct {
 		DeviceID    string              `json:"device_id"`
 		DeviceInfo  *DeviceHardwareInfo `json:"device_info"`

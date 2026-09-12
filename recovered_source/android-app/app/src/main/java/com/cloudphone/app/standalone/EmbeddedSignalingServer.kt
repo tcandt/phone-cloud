@@ -24,7 +24,17 @@ object EmbeddedSignalingServer {
         try {
             val destFile = File(targetPath)
             if (!destFile.exists() || destFile.length() == 0L) {
-                context.assets.open("webrtc-signaling").use { input ->
+                var stream: java.io.InputStream? = null
+                for (abi in android.os.Build.SUPPORTED_ABIS) {
+                    try {
+                        stream = context.assets.open("bin/$abi/webrtc-signaling")
+                        break
+                    } catch (ignored: Throwable) {}
+                }
+                if (stream == null) {
+                    stream = context.assets.open("webrtc-signaling")
+                }
+                stream.use { input ->
                     FileOutputStream(destFile).use { output ->
                         input.copyTo(output)
                     }

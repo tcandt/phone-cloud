@@ -32,3 +32,8 @@ Reconstructed Modules:
 - cloudphone-agent: Native Go agent bridge for Android (WebRTC + Scrcpy server)
 - android-helper: Android Java display/audio encoder and input injection daemon (libsys_core.so)
 - android-app: Android Kotlin management host app & controller client
+
+Commercial Use & Licensing Scope:
+- The web frontend (web-app) is licensed under the MIT License by the upstream author.
+- The reconstructed backend, agent, helper, and host app source code in this repository are provided for interoperability, security auditing, and research testing under the Apache License 2.0.
+- Upstream official pre-compiled server, agent, and APK binaries were originally published under non-commercial testing/research terms. If you plan to deploy this project for commercial multi-tenant cloud phone hosting or paid device rentals, you are strongly advised to contact the upstream author (hqw700) to obtain written commercial licensing agreements.

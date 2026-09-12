@@ -29,6 +29,11 @@ jobs:
           cd recovered_source/cloudphone-agent
           go test -v -timeout 60s -run TestAgentConformance .
 
+      - name: Run Differential Parity Tests (Original vs Recovered)
+        run: |
+          cd recovered_source/webrtc-signaling
+          go test -v -timeout 60s -run TestGateC_DifferentialParity .
+
       - name: Build Signaling Server Multi-Arch
         run: |
           cd recovered_source/webrtc-signaling
@@ -92,8 +97,17 @@ jobs:
           if [ -f /tmp/core-binaries/cloudphone-agent-arm64 ]; then
             cp /tmp/core-binaries/cloudphone-agent-arm64 recovered_source/cloudphone-agent/cloudphone-agent-arm64
           fi
+          if [ -f /tmp/core-binaries/cloudphone-agent-armeabi-v7a ]; then
+            cp /tmp/core-binaries/cloudphone-agent-armeabi-v7a recovered_source/cloudphone-agent/cloudphone-agent-armeabi-v7a
+          fi
+          if [ -f /tmp/core-binaries/cloudphone-agent-amd64 ]; then
+            cp /tmp/core-binaries/cloudphone-agent-amd64 recovered_source/cloudphone-agent/cloudphone-agent-amd64
+          fi
           if [ -f /tmp/core-binaries/webrtc-signaling-linux-arm64 ]; then
             cp /tmp/core-binaries/webrtc-signaling-linux-arm64 recovered_source/webrtc-signaling/webrtc-signaling-linux-arm64
+          fi
+          if [ -f /tmp/core-binaries/webrtc-signaling-linux-amd64 ]; then
+            cp /tmp/core-binaries/webrtc-signaling-linux-amd64 recovered_source/webrtc-signaling/webrtc-signaling-linux-amd64
           fi
 
       - name: Build Android Helper (libsys_core.so)
