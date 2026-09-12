@@ -56,10 +56,14 @@ type AgentConfig struct {
 
 // SessionCapabilities defines permissions granted to a client session
 type SessionCapabilities struct {
-	CanControl   bool `json:"can_control"`
-	CanClipboard bool `json:"can_clipboard"`
-	CanFile      bool `json:"can_file"`
-	CanShell     bool `json:"can_shell"`
+	CanControl    bool `json:"can_control"`
+	CanClipboard  bool `json:"can_clipboard"`
+	CanFile       bool `json:"can_file"`
+	CanShell      bool `json:"can_shell"`
+	CanCamera     bool `json:"can_camera"`
+	CanAudio      bool `json:"can_audio"`
+	CanRecord     bool `json:"can_record"`
+	CanInstallAPK bool `json:"can_install_apk"`
 }
 
 // Input JSON structures received from WebRTC 'input-channel' (useWebRTC.js)

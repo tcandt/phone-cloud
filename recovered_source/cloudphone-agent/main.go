@@ -3,9 +3,7 @@ package main
 import (
 	"encoding/json"
 	"flag"
-	"fmt"
 	"log"
-	"net/url"
 	"os"
 	"os/exec"
 	"strconv"
@@ -13,7 +11,6 @@ import (
 	"sync"
 	"time"
 
-	"github.com/gorilla/websocket"
 	"github.com/pion/webrtc/v3"
 )
 
@@ -111,33 +108,29 @@ func main() {
 		}
 	}
 
-	// 2. Persistent Signaling Loop
+	signalingDialer := NewSignalingDialer(getEnvBool("CP_AGENT_INSECURE_TLS", false))
+	backoff := NewBackoffTracker()
+
+	// 2. Persistent Signaling Loop with Custom DNS Resolver & TLS SNI
 	for {
 		log.Printf("[Agent] Connecting to signaling server: %s", cfg.SignalingURL)
-		u, err := url.Parse(cfg.SignalingURL)
+		targetEndpoint, sniHost, err := ParseSignalingURL(cfg.SignalingURL, cfg.DeviceID, cfg.AgentSecret)
 		if err != nil {
-			log.Printf("[Agent] Invalid signaling URL: %v", err)
-			time.Sleep(3 * time.Second)
+			wait := backoff.NextWait()
+			log.Printf("[Agent] Invalid signaling URL: %v, retrying in %v...", err, wait)
+			time.Sleep(wait)
 			continue
 		}
 
-		// Connect to /register_agent with secret authentication
-		wsScheme := "ws"
-		if u.Scheme == "https" || u.Scheme == "wss" {
-			wsScheme = "wss"
-		}
-		agentEndpoint := fmt.Sprintf("%s://%s/register_agent?id=%s", wsScheme, u.Host, url.QueryEscape(cfg.DeviceID))
-		if cfg.AgentSecret != "" {
-			agentEndpoint += fmt.Sprintf("&secret=%s&token=%s", url.QueryEscape(cfg.AgentSecret), url.QueryEscape(cfg.AgentSecret))
-		}
-
-		ws, _, err := websocket.DefaultDialer.Dial(agentEndpoint, nil)
+		ws, err := signalingDialer.Dial(targetEndpoint, sniHost)
 		if err != nil {
-			log.Printf("[Agent] Connection failed: %v, retrying in 3s...", err)
-			time.Sleep(3 * time.Second)
+			wait := backoff.NextWait()
+			log.Printf("[Agent] Connection failed: %v, retrying in %v...", err, wait)
+			time.Sleep(wait)
 			continue
 		}
 
+		backoff.OnConnected()
 		log.Printf("[Agent] Successfully connected to signaling server")
 		previewStreamer.SetWebSocket(ws)
 
@@ -196,6 +189,23 @@ func main() {
 					}
 					session.ClientID = clientID
 
+					// Forward locally gathered ICE candidates via trickle to client
+					session.SetOnLocalCandidate(func(c *webrtc.ICECandidate) {
+						if c == nil {
+							return
+						}
+						candJSON := c.ToJSON()
+						_ = ws.WriteJSON(map[string]interface{}{
+							"type":      "ice-candidate",
+							"client_id": clientID,
+							"candidate": map[string]interface{}{
+								"candidate":     candJSON.Candidate,
+								"sdpMid":        candJSON.SDPMid,
+								"sdpMLineIndex": candJSON.SDPMLineIndex,
+							},
+						})
+					})
+
 					// Apply session capabilities forwarded by signaling
 					if capsMap, ok := msg["capabilities"].(map[string]interface{}); ok && capsMap != nil {
 						var caps SessionCapabilities
@@ -211,6 +221,18 @@ func main() {
 						if v, ok := capsMap["can_shell"].(bool); ok {
 							caps.CanShell = v
 						}
+						if v, ok := capsMap["can_camera"].(bool); ok {
+							caps.CanCamera = v
+						}
+						if v, ok := capsMap["can_audio"].(bool); ok {
+							caps.CanAudio = v
+						}
+						if v, ok := capsMap["can_record"].(bool); ok {
+							caps.CanRecord = v
+						}
+						if v, ok := capsMap["can_install_apk"].(bool); ok {
+							caps.CanInstallAPK = v
+						}
 						session.SetCapabilities(caps)
 					}
 
@@ -223,6 +245,7 @@ func main() {
 						if state == webrtc.PeerConnectionStateFailed || state == webrtc.PeerConnectionStateClosed {
 							sessionsMu.Lock()
 							if cur, exists := sessions[clientID]; exists && cur == session {
+								session.Close()
 								delete(sessions, clientID)
 								streamer.UnregisterSession(clientID)
 							}
@@ -291,6 +314,18 @@ func main() {
 					}
 					if v, ok := capsMap["can_shell"].(bool); ok {
 						caps.CanShell = v
+					}
+					if v, ok := capsMap["can_camera"].(bool); ok {
+						caps.CanCamera = v
+					}
+					if v, ok := capsMap["can_audio"].(bool); ok {
+						caps.CanAudio = v
+					}
+					if v, ok := capsMap["can_record"].(bool); ok {
+						caps.CanRecord = v
+					}
+					if v, ok := capsMap["can_install_apk"].(bool); ok {
+						caps.CanInstallAPK = v
 					}
 					sessionsMu.RLock()
 					if sess, ok := sessions[targetClientID]; ok {

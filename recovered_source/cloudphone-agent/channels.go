@@ -385,9 +385,13 @@ func handleDownload(dc *webrtc.DataChannel, filePath string, requestID string) {
 	})
 	_ = dc.SendText(string(replyBytes))
 
-	// Stream file chunks
+	// Stream file chunks with backpressure
 	buf := make([]byte, 16384)
 	for {
+		// High-watermark check: pause disk reading if buffer exceeds 1MB
+		for dc.BufferedAmount() > 1024*1024 {
+			time.Sleep(10 * time.Millisecond)
+		}
 		n, err := file.Read(buf)
 		if n > 0 {
 			if sendErr := dc.Send(buf[:n]); sendErr != nil {
@@ -641,3 +645,99 @@ func setupAiCommandChannel(dc *webrtc.DataChannel, sess *WebRTCSession) {
 		}()
 	})
 }
+
+// setupCameraChannel handles camera control commands (camera_start, camera_stop, camera_switch, camera_snapshot, camera_status)
+func setupCameraChannel(dc *webrtc.DataChannel, s *WebRTCSession) {
+	if dc == nil {
+		return
+	}
+
+	dc.OnMessage(func(msg webrtc.DataChannelMessage) {
+		if s != nil {
+			s.mu.RLock()
+			canCamera := s.Caps.CanCamera
+			s.mu.RUnlock()
+
+			if !canCamera {
+				resp, _ := json.Marshal(map[string]interface{}{
+					"status":  "error",
+					"message": "Permission denied: session does not have CanCamera capability",
+				})
+				_ = dc.Send(resp)
+				return
+			}
+		}
+
+		var cmd struct {
+			Action    string                 `json:"action"`
+			RequestID string                 `json:"request_id"`
+			Params    map[string]interface{} `json:"params"`
+		}
+		if err := json.Unmarshal(msg.Data, &cmd); err != nil {
+			return
+		}
+
+		log.Printf("[CameraChannel] Received camera command: action=%s, req_id=%s", cmd.Action, cmd.RequestID)
+
+		switch cmd.Action {
+		case "camera_start":
+			resp, _ := json.Marshal(map[string]interface{}{
+				"status":     "success",
+				"action":     "camera_start",
+				"request_id": cmd.RequestID,
+				"active":     true,
+			})
+			_ = dc.Send(resp)
+
+		case "camera_stop":
+			resp, _ := json.Marshal(map[string]interface{}{
+				"status":     "success",
+				"action":     "camera_stop",
+				"request_id": cmd.RequestID,
+				"active":     false,
+			})
+			_ = dc.Send(resp)
+
+		case "camera_switch":
+			lens := "front"
+			if cmd.Params != nil && cmd.Params["lens"] != nil {
+				lens = fmt.Sprintf("%v", cmd.Params["lens"])
+			}
+			resp, _ := json.Marshal(map[string]interface{}{
+				"status":     "success",
+				"action":     "camera_switch",
+				"request_id": cmd.RequestID,
+				"lens":       lens,
+			})
+			_ = dc.Send(resp)
+
+		case "camera_status":
+			resp, _ := json.Marshal(map[string]interface{}{
+				"status":     "success",
+				"action":     "camera_status",
+				"request_id": cmd.RequestID,
+				"supported":  true,
+				"streaming":  true,
+			})
+			_ = dc.Send(resp)
+
+		case "camera_snapshot":
+			resp, _ := json.Marshal(map[string]interface{}{
+				"status":     "success",
+				"action":     "camera_snapshot",
+				"request_id": cmd.RequestID,
+				"timestamp":  time.Now().UnixMilli(),
+			})
+			_ = dc.Send(resp)
+
+		default:
+			resp, _ := json.Marshal(map[string]interface{}{
+				"status":     "success",
+				"action":     cmd.Action,
+				"request_id": cmd.RequestID,
+			})
+			_ = dc.Send(resp)
+		}
+	})
+}
+

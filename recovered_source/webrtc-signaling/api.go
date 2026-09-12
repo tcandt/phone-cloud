@@ -3,6 +3,7 @@ package main
 import (
 	"encoding/json"
 	"flag"
+	"fmt"
 	"io"
 	"log"
 	"net"
@@ -331,7 +332,9 @@ func (s *APIServer) handleConnectClient(w http.ResponseWriter, r *http.Request) 
 				client.ActiveDevice = deviceID
 				s.hub.ForwardToAgent(deviceID, map[string]interface{}{
 					"type":         "client_msg",
+					"message_type": "forward",
 					"client_id":    client.ID,
+					"device_id":    deviceID,
 					"payload":      msg["payload"],
 					"capabilities": clientCaps,
 				})
@@ -580,7 +583,7 @@ func (s *APIServer) handleRegisterAgent(w http.ResponseWriter, r *http.Request) 
 		action, _ := payload["action"].(string)
 		msgType, _ := payload["type"].(string)
 
-		if action == "register" || msgType == "register" {
+		if action == "register" || msgType == "register" || action == "agent_register" || msgType == "agent_register" {
 			if idVal, ok := payload["device_id"].(string); ok && idVal != "" {
 				s.hub.mu.Lock()
 				if dev.ID != idVal {
@@ -601,19 +604,44 @@ func (s *APIServer) handleRegisterAgent(w http.ResponseWriter, r *http.Request) 
 			dev.Info = &hwInfo
 			s.hub.BroadcastDeviceList()
 			_ = conn.WriteJSON(map[string]interface{}{
-				"action":    "registered",
-				"type":      "registered",
-				"device_id": dev.ID,
+				"message_type": "agent_register_ok",
+				"status":       "valid",
+				"action":       "registered",
+				"type":         "registered",
+				"device_id":    dev.ID,
 			})
 		} else if action == "snapshot" || msgType == "snapshot" {
 			// Snapshot update
 		} else if action == "command_result" || msgType == "command_result" {
 			clientID, _ := payload["client_id"].(string)
+			if clientID == "" {
+				if cidNum, ok := payload["client_id"].(float64); ok {
+					clientID = fmt.Sprintf("%.0f", cidNum)
+				}
+			}
 			if clientID != "" {
 				s.hub.ForwardToClient(clientID, SignalingMessage{
 					MessageType: "command_result",
 					DeviceID:    deviceID,
 					Payload:     payload,
+				})
+			}
+		} else if msgType == "forward" || action == "forward" {
+			clientID, _ := payload["client_id"].(string)
+			if clientID == "" {
+				if cidNum, ok := payload["client_id"].(float64); ok {
+					clientID = fmt.Sprintf("%.0f", cidNum)
+				}
+			}
+			fwdPayload := payload["payload"]
+			if fwdPayload == nil {
+				fwdPayload = payload
+			}
+			if clientID != "" {
+				s.hub.ForwardToClient(clientID, SignalingMessage{
+					MessageType: "device_msg",
+					DeviceID:    deviceID,
+					Payload:     fwdPayload,
 				})
 			}
 		} else if msgType == "offer" || msgType == "ice-candidate" || msgType == "answer" {

@@ -6,21 +6,79 @@ import (
 	"net/url"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/pion/webrtc/v3"
+	"github.com/pion/webrtc/v3/pkg/media"
 )
 
 type WebRTCSession struct {
-	ClientID   string
-	pc         *webrtc.PeerConnection
-	videoTrack *webrtc.TrackLocalStaticSample
-	audioTrack *webrtc.TrackLocalStaticSample
-	ctrl       *ControlWriter
-	inputDC    *webrtc.DataChannel
-	clipDC     *webrtc.DataChannel
-	cameraDC   *webrtc.DataChannel
-	Caps       SessionCapabilities
-	mu         sync.RWMutex
+	ClientID         string
+	pc               *webrtc.PeerConnection
+	videoTrack       *webrtc.TrackLocalStaticSample
+	audioTrack       *webrtc.TrackLocalStaticSample
+	ctrl             *ControlWriter
+	inputDC          *webrtc.DataChannel
+	clipDC           *webrtc.DataChannel
+	cameraDC         *webrtc.DataChannel
+	Caps             SessionCapabilities
+	mu               sync.RWMutex
+
+	// Media queues for non-blocking distribution
+	videoQueue       chan media.Sample
+	audioQueue       chan media.Sample
+	closed           bool
+	closeOnce        sync.Once
+
+	// ICE Candidate Trickle Callback
+	onLocalCandidate func(candidate *webrtc.ICECandidate)
+
+	// PLI Throttling
+	lastPliTime      time.Time
+	pliMu            sync.Mutex
+}
+
+func (s *WebRTCSession) SetOnLocalCandidate(cb func(candidate *webrtc.ICECandidate)) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.onLocalCandidate = cb
+}
+
+func (s *WebRTCSession) EnqueueVideoSample(sample media.Sample, isKeyFrame bool) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if s.closed || s.videoTrack == nil {
+		return
+	}
+	select {
+	case s.videoQueue <- sample:
+	default:
+		// Queue is full: if keyframe or config, drop oldest from queue and push
+		if isKeyFrame || sample.Duration == 0 {
+			select {
+			case <-s.videoQueue: // drop oldest stale delta frame
+			default:
+			}
+			select {
+			case s.videoQueue <- sample:
+			default:
+			}
+		}
+		// Otherwise, drop this delta frame to avoid latency buildup
+	}
+}
+
+func (s *WebRTCSession) EnqueueAudioSample(sample media.Sample) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if s.closed || s.audioTrack == nil {
+		return
+	}
+	select {
+	case s.audioQueue <- sample:
+	default:
+		// Drop audio packet on congested network to avoid audio lag
+	}
 }
 
 func (s *WebRTCSession) SetCapabilities(caps SessionCapabilities) {
@@ -123,19 +181,6 @@ func NewWebRTCSession(ctrl *ControlWriter, iceServersRaw string) (*WebRTCSession
 		return nil, err
 	}
 
-	// Listen for RTCP PLI (Picture Loss Indication) from browser to request IDR keyframe
-	go func() {
-		rtcpBuf := make([]byte, 1500)
-		for {
-			if _, _, rtcpErr := vSender.Read(rtcpBuf); rtcpErr != nil {
-				return
-			}
-			if ctrl != nil {
-				_ = ctrl.RequestKeyframe()
-			}
-		}
-	}()
-
 	aTrack, err := webrtc.NewTrackLocalStaticSample(webrtc.RTPCodecCapability{MimeType: webrtc.MimeTypeOpus}, "audio", "cloudphone-audio")
 	if err == nil {
 		_, _ = pc.AddTrack(aTrack)
@@ -146,7 +191,66 @@ func NewWebRTCSession(ctrl *ControlWriter, iceServersRaw string) (*WebRTCSession
 		videoTrack: vTrack,
 		audioTrack: aTrack,
 		ctrl:       ctrl,
+		videoQueue: make(chan media.Sample, 60),
+		audioQueue: make(chan media.Sample, 60),
 	}
+
+	// Non-blocking worker goroutine for video dispatch
+	go func() {
+		for sample := range session.videoQueue {
+			session.mu.RLock()
+			vt := session.videoTrack
+			closed := session.closed
+			session.mu.RUnlock()
+			if !closed && vt != nil {
+				_ = vt.WriteSample(sample)
+			}
+		}
+	}()
+
+	// Non-blocking worker goroutine for audio dispatch
+	go func() {
+		for sample := range session.audioQueue {
+			session.mu.RLock()
+			at := session.audioTrack
+			closed := session.closed
+			session.mu.RUnlock()
+			if !closed && at != nil {
+				_ = at.WriteSample(sample)
+			}
+		}
+	}()
+
+	// Listen for RTCP PLI (Picture Loss Indication) from browser to request IDR keyframe (throttled to max 1 / 500ms)
+	go func() {
+		rtcpBuf := make([]byte, 1500)
+		for {
+			if _, _, rtcpErr := vSender.Read(rtcpBuf); rtcpErr != nil {
+				return
+			}
+			session.pliMu.Lock()
+			now := time.Now()
+			if now.Sub(session.lastPliTime) >= 500*time.Millisecond {
+				session.lastPliTime = now
+				session.pliMu.Unlock()
+				if ctrl != nil {
+					_ = ctrl.RequestKeyframe()
+				}
+			} else {
+				session.pliMu.Unlock()
+			}
+		}
+	}()
+
+	// ICE Candidate Trickle handler
+	pc.OnICECandidate(func(c *webrtc.ICECandidate) {
+		session.mu.RLock()
+		cb := session.onLocalCandidate
+		session.mu.RUnlock()
+		if cb != nil {
+			cb(c)
+		}
+	})
 
 	// Create channels that web-app expects from agent (pc.ondatachannel)
 	session.inputDC, _ = pc.CreateDataChannel("input-channel", nil)
@@ -155,6 +259,7 @@ func NewWebRTCSession(ctrl *ControlWriter, iceServersRaw string) (*WebRTCSession
 
 	session.setupInputChannel(session.inputDC)
 	session.setupClipboardChannel(session.clipDC)
+	setupCameraChannel(session.cameraDC, session)
 
 	// Pre-create file and command channels for direct readiness
 	fileDC, _ := pc.CreateDataChannel("file-channel", nil)
@@ -166,7 +271,7 @@ func NewWebRTCSession(ctrl *ControlWriter, iceServersRaw string) (*WebRTCSession
 		setupAiCommandChannel(aiCmdDC, session)
 	}
 
-	// Listen for browser-created DataChannels (file-channel, ai-command-channel, adb-channel)
+	// Listen for browser-created DataChannels (file-channel, ai-command-channel, adb-channel, camera-channel)
 	pc.OnDataChannel(func(dc *webrtc.DataChannel) {
 		label := dc.Label()
 		log.Printf("[WebRTC] Remote DataChannel opened: %s", label)
@@ -181,6 +286,8 @@ func NewWebRTCSession(ctrl *ControlWriter, iceServersRaw string) (*WebRTCSession
 			session.setupInputChannel(dc)
 		case "clipboard-channel":
 			session.setupClipboardChannel(dc)
+		case "camera-channel":
+			setupCameraChannel(dc, session)
 		}
 	})
 
@@ -278,7 +385,16 @@ func (s *WebRTCSession) AddIceCandidate(cand webrtc.ICECandidateInit) error {
 }
 
 func (s *WebRTCSession) Close() {
-	if s.pc != nil {
-		_ = s.pc.Close()
-	}
+	s.closeOnce.Do(func() {
+		s.mu.Lock()
+		s.closed = true
+		s.mu.Unlock()
+
+		if s.pc != nil {
+			_ = s.pc.Close()
+		}
+		close(s.videoQueue)
+		close(s.audioQueue)
+	})
 }
+

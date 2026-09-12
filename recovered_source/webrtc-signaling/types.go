@@ -16,11 +16,11 @@ type DisplayInfo struct {
 
 // DeviceHardwareInfo represents device metadata reported by the Agent
 type DeviceHardwareInfo struct {
-	AndroidModel   string        `json:"android_model"`
-	AndroidSerial  string        `json:"android_serial"`
-	AndroidVersion string        `json:"android_version"`
-	AppVersion     string        `json:"app_version"`
-	Displays       []DisplayInfo `json:"displays"`
+	AndroidModel   string        `json:"android_model,omitempty"`
+	AndroidSerial  string        `json:"android_serial,omitempty"`
+	AndroidVersion string        `json:"android_version,omitempty"`
+	AppVersion     string        `json:"app_version,omitempty"`
+	Displays       []DisplayInfo `json:"displays,omitempty"`
 }
 
 // Device represents a registered Android agent device

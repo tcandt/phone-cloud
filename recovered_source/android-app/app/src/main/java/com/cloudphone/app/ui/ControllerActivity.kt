@@ -19,17 +19,18 @@ import android.widget.EditText
 import android.widget.Toast
 import androidx.appcompat.app.AlertDialog
 import androidx.appcompat.app.AppCompatActivity
-import androidx.lifecycle.lifecycleScope
+import com.cloudphone.app.audio.OpusAudioDecoder
 import com.cloudphone.app.databinding.ActivityControllerBinding
 import com.cloudphone.app.service.CloudPhoneHostService
+import com.cloudphone.app.webrtc.WebRTCConnectionState
+import com.cloudphone.app.webrtc.WebRTCManager
 import com.google.gson.Gson
 import com.google.gson.JsonObject
-import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.launch
 import okhttp3.*
 import okio.ByteString
+import org.webrtc.EglBase
+import org.webrtc.VideoTrack
 import java.nio.ByteBuffer
-import java.nio.ByteOrder
 
 class ControllerActivity : AppCompatActivity(), TextureView.SurfaceTextureListener {
 
@@ -41,11 +42,19 @@ class ControllerActivity : AppCompatActivity(), TextureView.SurfaceTextureListen
     private lateinit var binding: ActivityControllerBinding
     private val client = OkHttpClient()
     private var webSocket: WebSocket? = null
-    private var decoder: MediaCodec? = null
-    private var surface: Surface? = null
-    private var isDecoderConfigured = false
+
+    // Fallback TextureView & MediaCodec for WebSocket PREV
+    private var fallbackDecoder: MediaCodec? = null
+    private var fallbackSurface: Surface? = null
+    private var isFallbackDecoderConfigured = false
+
+    // Audio Engine for WebSocket AUDO fallback
     private var audioTrack: AudioTrack? = null
-    private var audioDecoder: MediaCodec? = null
+    private lateinit var opusAudioDecoder: OpusAudioDecoder
+
+    // WebRTC Engine
+    private var rootEglBase: EglBase? = null
+    private var webRTCManager: WebRTCManager? = null
 
     private var targetDeviceId: String = ""
     private var serverUrl: String = ""
@@ -65,8 +74,10 @@ class ControllerActivity : AppCompatActivity(), TextureView.SurfaceTextureListen
         setupQuickActions()
         setupTouchControl()
         initAudioEngine()
+        initWebRTC()
 
         binding.remoteVideoView.surfaceTextureListener = this
+        connectWebSocket()
     }
 
     private fun setupToolbar() {
@@ -83,6 +94,7 @@ class ControllerActivity : AppCompatActivity(), TextureView.SurfaceTextureListen
     private fun setupQuickActions() {
         binding.btnText.setOnClickListener { showTextInputDialog() }
         binding.btnClipboard.setOnClickListener { showClipboardSyncDialog() }
+        binding.btnCamera.setOnClickListener { showCameraControlDialog() }
         binding.btnVolUp.setOnClickListener { sendKeycode(24) }
         binding.btnVolDown.setOnClickListener { sendKeycode(25) }
         binding.btnPower.setOnClickListener { sendKeycode(26) }
@@ -104,48 +116,99 @@ class ControllerActivity : AppCompatActivity(), TextureView.SurfaceTextureListen
                 .setBufferSizeInBytes(Math.max(minBuf * 2, 4096))
                 .build()
             audioTrack?.play()
-            initAudioDecoder()
+            opusAudioDecoder = OpusAudioDecoder(48000, 2)
+            Log.i(TAG, "AudioTrack and OpusAudioDecoder initialized")
         } catch (e: Throwable) {
             Log.w(TAG, "AudioTrack init deferred: ${e.message}")
         }
     }
 
-    private fun initAudioDecoder() {
+    private fun initWebRTC() {
         try {
-            val format = MediaFormat.createAudioFormat(MediaFormat.MIMETYPE_AUDIO_OPUS, 48000, 2)
-            // Opus identification header (19 bytes RFC 7845)
-            val csd0 = ByteBuffer.allocate(19).order(ByteOrder.nativeOrder())
-            csd0.put("OpusHead".toByteArray(Charsets.US_ASCII))
-            csd0.put(1.toByte())
-            csd0.put(2.toByte())
-            csd0.putShort(0.toShort())
-            csd0.putInt(48000)
-            csd0.putShort(0.toShort())
-            csd0.put(0.toByte())
-            csd0.flip()
-            format.setByteBuffer("csd-0", csd0)
+            rootEglBase = EglBase.create()
+            binding.webrtcVideoView.init(rootEglBase?.eglBaseContext, null)
+            binding.webrtcVideoView.setEnableHardwareScaler(true)
+            binding.webrtcVideoView.setZOrderMediaOverlay(true)
 
-            val csd1 = ByteBuffer.allocate(8).order(ByteOrder.nativeOrder()).putLong(0L)
-            csd1.flip()
-            format.setByteBuffer("csd-1", csd1)
+            webRTCManager = WebRTCManager(this, rootEglBase!!, object : WebRTCManager.WebRTCListener {
+                override fun onStateChanged(newState: WebRTCConnectionState) {
+                    runOnUiThread { handleConnectionStateChanged(newState) }
+                }
 
-            val csd2 = ByteBuffer.allocate(8).order(ByteOrder.nativeOrder()).putLong(80000000L)
-            csd2.flip()
-            format.setByteBuffer("csd-2", csd2)
+                override fun onSendSignaling(msg: JsonObject) {
+                    webSocket?.send(msg.toString())
+                }
 
-            val codec = MediaCodec.createDecoderByType(MediaFormat.MIMETYPE_AUDIO_OPUS)
-            codec.configure(format, null, null, 0)
-            codec.start()
-            audioDecoder = codec
-            Log.i(TAG, "Audio MediaCodec (Opus) initialized successfully")
+                override fun onClipboardReceived(text: String) {
+                    runOnUiThread {
+                        val clipboard = getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+                        clipboard.setPrimaryClip(ClipData.newPlainText("Remote Clipboard", text))
+                        Toast.makeText(this@ControllerActivity, "Remote clipboard synced", Toast.LENGTH_SHORT).show()
+                    }
+                }
+
+                override fun onCameraResponse(response: JsonObject) {
+                    runOnUiThread {
+                        val action = response.get("action")?.asString ?: "camera"
+                        val status = response.get("status")?.asString ?: "ok"
+                        Toast.makeText(this@ControllerActivity, "Camera $action: $status", Toast.LENGTH_SHORT).show()
+                    }
+                }
+
+                override fun onVideoTrackReady(track: VideoTrack) {
+                    runOnUiThread {
+                        binding.connectingOverlay.visibility = View.GONE
+                    }
+                }
+            })
+            webRTCManager?.attachRenderer(binding.webrtcVideoView)
+            Log.i(TAG, "WebRTCManager and SurfaceViewRenderer initialized")
         } catch (e: Throwable) {
-            audioDecoder = null
-            Log.w(TAG, "Opus MediaCodec decoder initialization failed: ${e.message}. Audio playback disabled to avoid noise.")
+            Log.e(TAG, "Failed to initialize WebRTCManager: ${e.message}", e)
+        }
+    }
+
+    private fun handleConnectionStateChanged(state: WebRTCConnectionState) {
+        when (state) {
+            WebRTCConnectionState.DISCONNECTED -> {
+                binding.tvStreamStats.text = "Disconnected"
+            }
+            WebRTCConnectionState.SIGNALING -> {
+                binding.tvStreamStats.text = "Signaling..."
+                binding.tvConnectingMessage.text = "Establishing signaling connection..."
+            }
+            WebRTCConnectionState.NEGOTIATING -> {
+                binding.tvStreamStats.text = "SDP Offer/Answer..."
+                binding.tvConnectingMessage.text = "Negotiating WebRTC PeerConnection..."
+            }
+            WebRTCConnectionState.ICE_CONNECTING -> {
+                binding.tvStreamStats.text = "ICE Trickle..."
+                binding.tvConnectingMessage.text = "Connecting ICE candidates..."
+            }
+            WebRTCConnectionState.CONNECTED -> {
+                binding.tvStreamStats.text = "WebRTC P2P (Direct)"
+                binding.connectingOverlay.visibility = View.GONE
+                binding.webrtcVideoView.visibility = View.VISIBLE
+                binding.remoteVideoView.visibility = View.GONE
+                Toast.makeText(this, "WebRTC P2P Connected", Toast.LENGTH_SHORT).show()
+            }
+            WebRTCConnectionState.FALLBACK_WS -> {
+                binding.tvStreamStats.text = "WebSocket Fallback (TCP)"
+                binding.webrtcVideoView.visibility = View.GONE
+                binding.remoteVideoView.visibility = View.VISIBLE
+                if (targetDeviceId.isNotEmpty()) {
+                    requestWsPreviewStream(targetDeviceId)
+                }
+                Toast.makeText(this, "WebRTC failed, fell back to WebSocket PREV", Toast.LENGTH_SHORT).show()
+            }
+            WebRTCConnectionState.RECONNECTING -> {
+                binding.tvStreamStats.text = "Reconnecting..."
+            }
         }
     }
 
     private fun setupTouchControl() {
-        binding.remoteVideoView.setOnTouchListener { v, event ->
+        binding.touchOverlayView.setOnTouchListener { v, event ->
             val w = v.width
             val h = v.height
             if (w <= 0 || h <= 0) return@setOnTouchListener false
@@ -158,13 +221,13 @@ class ControllerActivity : AppCompatActivity(), TextureView.SurfaceTextureListen
                     val id = event.getPointerId(pointerIndex)
                     val x = event.getX(pointerIndex).toInt().coerceIn(0, w)
                     val y = event.getY(pointerIndex).toInt().coerceIn(0, h)
-                    sendTouchEvent(0, x, y, w, h, id.toLong())
+                    dispatchTouchEvent(0, x, y, w, h, id.toLong())
                 }
                 MotionEvent.ACTION_UP, MotionEvent.ACTION_POINTER_UP -> {
                     val id = event.getPointerId(pointerIndex)
                     val x = event.getX(pointerIndex).toInt().coerceIn(0, w)
                     val y = event.getY(pointerIndex).toInt().coerceIn(0, h)
-                    sendTouchEvent(1, x, y, w, h, id.toLong())
+                    dispatchTouchEvent(1, x, y, w, h, id.toLong())
                 }
                 MotionEvent.ACTION_MOVE -> {
                     val pointerCount = event.pointerCount
@@ -172,7 +235,7 @@ class ControllerActivity : AppCompatActivity(), TextureView.SurfaceTextureListen
                         val id = event.getPointerId(p)
                         val x = event.getX(p).toInt().coerceIn(0, w)
                         val y = event.getY(p).toInt().coerceIn(0, h)
-                        sendTouchEvent(2, x, y, w, h, id.toLong())
+                        dispatchTouchEvent(2, x, y, w, h, id.toLong())
                     }
                 }
                 MotionEvent.ACTION_CANCEL -> {
@@ -181,7 +244,7 @@ class ControllerActivity : AppCompatActivity(), TextureView.SurfaceTextureListen
                         val id = event.getPointerId(p)
                         val x = event.getX(p).toInt().coerceIn(0, w)
                         val y = event.getY(p).toInt().coerceIn(0, h)
-                        sendTouchEvent(1, x, y, w, h, id.toLong())
+                        dispatchTouchEvent(1, x, y, w, h, id.toLong())
                     }
                 }
                 else -> return@setOnTouchListener false
@@ -190,7 +253,18 @@ class ControllerActivity : AppCompatActivity(), TextureView.SurfaceTextureListen
         }
     }
 
-    private fun sendTouchEvent(action: Int, x: Int, y: Int, w: Int, h: Int, pointerId: Long = 0) {
+    private fun dispatchTouchEvent(action: Int, x: Int, y: Int, w: Int, h: Int, pointerId: Long = 0) {
+        val rtc = webRTCManager
+        if (rtc != null && rtc.currentState == WebRTCConnectionState.CONNECTED) {
+            val sent = rtc.sendTouch(action, x, y, w, h, pointerId)
+            if (sent) return
+        }
+
+        // WebSocket Fallback Path
+        sendWsTouchEvent(action, x, y, w, h, pointerId)
+    }
+
+    private fun sendWsTouchEvent(action: Int, x: Int, y: Int, w: Int, h: Int, pointerId: Long = 0) {
         if (targetDeviceId.isEmpty() || webSocket == null) return
 
         val touchEvent = JsonObject().apply {
@@ -216,6 +290,14 @@ class ControllerActivity : AppCompatActivity(), TextureView.SurfaceTextureListen
     }
 
     private fun sendKeycode(keycode: Int) {
+        val rtc = webRTCManager
+        if (rtc != null && rtc.currentState == WebRTCConnectionState.CONNECTED) {
+            rtc.sendKeycode(keycode, 0)
+            binding.root.postDelayed({ rtc.sendKeycode(keycode, 1) }, 50)
+            return
+        }
+
+        // WebSocket Fallback Path
         if (targetDeviceId.isEmpty() || webSocket == null) return
 
         val keyEvent = JsonObject().apply {
@@ -236,7 +318,6 @@ class ControllerActivity : AppCompatActivity(), TextureView.SurfaceTextureListen
 
         webSocket?.send(groupControlMsg.toString())
 
-        // KeyUp after 50ms
         binding.root.postDelayed({
             keyEvent.addProperty("action", 1) // KeyUp
             webSocket?.send(groupControlMsg.toString())
@@ -244,6 +325,12 @@ class ControllerActivity : AppCompatActivity(), TextureView.SurfaceTextureListen
     }
 
     fun sendInjectText(text: String) {
+        val rtc = webRTCManager
+        if (rtc != null && rtc.currentState == WebRTCConnectionState.CONNECTED) {
+            rtc.sendText(text)
+            return
+        }
+
         if (targetDeviceId.isEmpty() || webSocket == null || text.isEmpty()) return
 
         val textEvent = JsonObject().apply {
@@ -263,6 +350,12 @@ class ControllerActivity : AppCompatActivity(), TextureView.SurfaceTextureListen
     }
 
     fun sendClipboard(text: String, paste: Boolean = true) {
+        val rtc = webRTCManager
+        if (rtc != null && rtc.currentState == WebRTCConnectionState.CONNECTED) {
+            rtc.sendClipboard(text, paste)
+            return
+        }
+
         if (targetDeviceId.isEmpty() || webSocket == null) return
 
         val clipPayload = JsonObject().apply {
@@ -331,44 +424,66 @@ class ControllerActivity : AppCompatActivity(), TextureView.SurfaceTextureListen
             .show()
     }
 
+    private fun showCameraControlDialog() {
+        val options = arrayOf(
+            "Switch Camera (Front / Back)",
+            "Capture Snapshot",
+            "Start Camera Stream",
+            "Stop Camera Stream",
+            "Camera Status"
+        )
+        AlertDialog.Builder(this)
+            .setTitle("Camera Remote Control")
+            .setItems(options) { _, which ->
+                when (which) {
+                    0 -> webRTCManager?.sendCameraCommand("camera_switch")
+                    1 -> webRTCManager?.sendCameraCommand("camera_snapshot")
+                    2 -> webRTCManager?.sendCameraCommand("camera_start")
+                    3 -> webRTCManager?.sendCameraCommand("camera_stop")
+                    4 -> webRTCManager?.sendCameraCommand("camera_status")
+                }
+            }
+            .setNegativeButton("Close", null)
+            .show()
+    }
+
     override fun onSurfaceTextureAvailable(surfaceTexture: SurfaceTexture, width: Int, height: Int) {
-        surface = Surface(surfaceTexture)
-        initMediaCodec(surface!!)
-        connectWebSocket()
+        fallbackSurface = Surface(surfaceTexture)
+        initFallbackMediaCodec(fallbackSurface!!)
     }
 
     override fun onSurfaceTextureSizeChanged(surfaceTexture: SurfaceTexture, width: Int, height: Int) {}
     override fun onSurfaceTextureDestroyed(surfaceTexture: SurfaceTexture): Boolean {
-        releaseMediaCodec()
-        surface?.release()
-        surface = null
+        releaseFallbackMediaCodec()
+        fallbackSurface?.release()
+        fallbackSurface = null
         return true
     }
     override fun onSurfaceTextureUpdated(surfaceTexture: SurfaceTexture) {}
 
-    private fun initMediaCodec(outputSurface: Surface) {
+    private fun initFallbackMediaCodec(outputSurface: Surface) {
         try {
             val codec = MediaCodec.createDecoderByType("video/avc")
             val format = MediaFormat.createVideoFormat("video/avc", 1080, 1920)
             codec.configure(format, outputSurface, null, 0)
             codec.start()
-            decoder = codec
-            isDecoderConfigured = true
-            Log.i(TAG, "Hardware MediaCodec decoder initialized successfully")
+            fallbackDecoder = codec
+            isFallbackDecoderConfigured = true
+            Log.i(TAG, "Fallback Hardware MediaCodec decoder initialized")
         } catch (e: Throwable) {
-            Log.e(TAG, "Failed to configure hardware MediaCodec: ${e.message}", e)
+            Log.e(TAG, "Failed to configure fallback MediaCodec: ${e.message}", e)
         }
     }
 
-    private fun releaseMediaCodec() {
+    private fun releaseFallbackMediaCodec() {
         try {
-            decoder?.stop()
-            decoder?.release()
+            fallbackDecoder?.stop()
+            fallbackDecoder?.release()
         } catch (e: Throwable) {
-            Log.w(TAG, "Error releasing MediaCodec", e)
+            Log.w(TAG, "Error releasing fallback MediaCodec", e)
         }
-        decoder = null
-        isDecoderConfigured = false
+        fallbackDecoder = null
+        isFallbackDecoderConfigured = false
     }
 
     private fun connectWebSocket() {
@@ -387,11 +502,13 @@ class ControllerActivity : AppCompatActivity(), TextureView.SurfaceTextureListen
             override fun onOpen(ws: WebSocket, response: Response) {
                 Log.i(TAG, "Signaling WebSocket connected")
                 runOnUiThread {
-                    binding.tvConnectingMessage.text = "Signaling connected. Subscribing to stream..."
+                    binding.tvConnectingMessage.text = "Signaling connected. Starting WebRTC..."
                 }
 
                 if (targetDeviceId.isNotEmpty()) {
-                    requestStream(targetDeviceId)
+                    runOnUiThread {
+                        webRTCManager?.startConnection(targetDeviceId)
+                    }
                 }
             }
 
@@ -422,7 +539,7 @@ class ControllerActivity : AppCompatActivity(), TextureView.SurfaceTextureListen
         })
     }
 
-    private fun requestStream(deviceId: String) {
+    private fun requestWsPreviewStream(deviceId: String) {
         val startPreviewMsg = JsonObject().apply {
             addProperty("message_type", "start_preview")
             addProperty("device_id", deviceId)
@@ -432,7 +549,7 @@ class ControllerActivity : AppCompatActivity(), TextureView.SurfaceTextureListen
             addProperty("stay_awake", true)
         }
         webSocket?.send(startPreviewMsg.toString())
-        Log.i(TAG, "Requested preview stream for $deviceId")
+        Log.i(TAG, "Requested WebSocket preview stream for $deviceId")
     }
 
     private fun handleSignalingText(text: String) {
@@ -448,9 +565,39 @@ class ControllerActivity : AppCompatActivity(), TextureView.SurfaceTextureListen
                     if (targetDeviceId.isNotEmpty()) {
                         runOnUiThread {
                             binding.tvTargetDevice.text = "Target: $targetDeviceId"
+                            webRTCManager?.startConnection(targetDeviceId)
                         }
-                        requestStream(targetDeviceId)
                     }
+                }
+                return
+            }
+
+            // WebRTC signaling messages forwarded from agent
+            if (msgType == "device_msg" || msgType == "forward") {
+                val payload = json.getAsJsonObject("payload")
+                if (payload != null) {
+                    val pType = payload.get("type")?.asString
+                    if (pType == "offer") {
+                        val sdp = payload.get("sdp")?.asString ?: ""
+                        if (sdp.isNotEmpty()) {
+                            runOnUiThread { webRTCManager?.handleRemoteOffer(sdp) }
+                        }
+                    } else if (pType == "candidate") {
+                        val candObj = payload.getAsJsonObject("candidate")
+                        if (candObj != null) {
+                            runOnUiThread { webRTCManager?.handleRemoteCandidate(candObj) }
+                        }
+                    }
+                }
+            } else if (msgType == "offer") {
+                val sdp = json.get("sdp")?.asString ?: ""
+                if (sdp.isNotEmpty()) {
+                    runOnUiThread { webRTCManager?.handleRemoteOffer(sdp) }
+                }
+            } else if (msgType == "candidate") {
+                val candObj = json.getAsJsonObject("candidate")
+                if (candObj != null) {
+                    runOnUiThread { webRTCManager?.handleRemoteCandidate(candObj) }
                 }
             }
         } catch (e: Throwable) {
@@ -462,44 +609,8 @@ class ControllerActivity : AppCompatActivity(), TextureView.SurfaceTextureListen
         if (data.size < 4) return
         val payload = ByteArray(data.size - 4)
         System.arraycopy(data, 4, payload, 0, payload.size)
-        feedOpusDecoder(payload)
-    }
-
-    private fun feedOpusDecoder(opusPacket: ByteArray) {
-        val codec = audioDecoder
-        if (codec == null) {
-            // Never feed compressed Opus packets directly to AudioTrack (PCM16) - that produces extreme noise/distortion
-            Log.w(TAG, "Dropping audio packet: MediaCodec Opus decoder unavailable on this device")
-            return
-        }
-
-        try {
-            val inIndex = codec.dequeueInputBuffer(5000L)
-            if (inIndex >= 0) {
-                val inBuf = codec.getInputBuffer(inIndex)
-                if (inBuf != null) {
-                    inBuf.clear()
-                    inBuf.put(opusPacket)
-                    codec.queueInputBuffer(inIndex, 0, opusPacket.size, System.nanoTime() / 1000, 0)
-                }
-            }
-
-            val bufferInfo = MediaCodec.BufferInfo()
-            var outIndex = codec.dequeueOutputBuffer(bufferInfo, 0L)
-            while (outIndex >= 0) {
-                val outBuf = codec.getOutputBuffer(outIndex)
-                if (outBuf != null && bufferInfo.size > 0) {
-                    outBuf.position(bufferInfo.offset)
-                    outBuf.limit(bufferInfo.offset + bufferInfo.size)
-                    val pcmBytes = ByteArray(bufferInfo.size)
-                    outBuf.get(pcmBytes)
-                    feedAudio(pcmBytes)
-                }
-                codec.releaseOutputBuffer(outIndex, false)
-                outIndex = codec.dequeueOutputBuffer(bufferInfo, 0L)
-            }
-        } catch (e: Throwable) {
-            Log.w(TAG, "Opus decoding error, dropping corrupted frame: ${e.message}")
+        opusAudioDecoder.decode(payload) { pcm ->
+            feedAudio(pcm)
         }
     }
 
@@ -528,11 +639,11 @@ class ControllerActivity : AppCompatActivity(), TextureView.SurfaceTextureListen
         val nalu = ByteArray(payloadLen)
         System.arraycopy(data, PREV_HEADER_LEN, nalu, 0, payloadLen)
 
-        feedDecoder(nalu, isKey)
+        feedFallbackDecoder(nalu, isKey)
     }
 
-    private fun feedDecoder(nalu: ByteArray, isKey: Boolean) {
-        val codec = decoder ?: return
+    private fun feedFallbackDecoder(nalu: ByteArray, isKey: Boolean) {
+        val codec = fallbackDecoder ?: return
         try {
             val inputBufferIndex = codec.dequeueInputBuffer(10000L)
             if (inputBufferIndex >= 0) {
@@ -553,12 +664,24 @@ class ControllerActivity : AppCompatActivity(), TextureView.SurfaceTextureListen
                 outputBufferIndex = codec.dequeueOutputBuffer(bufferInfo, 0L)
             }
         } catch (e: Throwable) {
-            Log.e(TAG, "Decoder feed error", e)
+            Log.e(TAG, "Fallback Decoder feed error", e)
         }
     }
 
     override fun onDestroy() {
         super.onDestroy()
+        webRTCManager?.close()
+        webRTCManager = null
+
+        try {
+            binding.webrtcVideoView.release()
+        } catch (e: Throwable) {}
+
+        try {
+            rootEglBase?.release()
+        } catch (e: Throwable) {}
+        rootEglBase = null
+
         if (targetDeviceId.isNotEmpty()) {
             val stopPreviewMsg = JsonObject().apply {
                 addProperty("message_type", "stop_preview")
@@ -567,13 +690,12 @@ class ControllerActivity : AppCompatActivity(), TextureView.SurfaceTextureListen
             webSocket?.send(stopPreviewMsg.toString())
         }
         webSocket?.close(1000, "Activity closed")
-        releaseMediaCodec()
+
+        releaseFallbackMediaCodec()
 
         try {
-            audioDecoder?.stop()
-            audioDecoder?.release()
+            opusAudioDecoder.release()
         } catch (e: Throwable) {}
-        audioDecoder = null
 
         try {
             audioTrack?.stop()

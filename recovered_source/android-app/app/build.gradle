@@ -66,6 +66,12 @@ dependencies {
     // QR Code Scanning
     implementation 'com.google.zxing:core:3.5.3'
 
+    // Native WebRTC for Android Controller
+    implementation 'io.getstream:stream-webrtc-android:1.2.1'
+
+    // Software Opus Audio Decoder Fallback (libopus JNI)
+    implementation 'com.github.axet:opus:1.0.6'
+
     testImplementation 'junit:junit:4.13.2'
     androidTestImplementation 'androidx.test.ext:junit:1.1.5'
     androidTestImplementation 'androidx.test.espresso:espresso-core:3.5.1'

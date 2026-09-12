@@ -217,3 +217,37 @@ func TestAgentConformance_CommandFailClosed(t *testing.T) {
 		t.Errorf("FAIL: Active session with can_shell=true must be allowed")
 	}
 }
+
+func TestAgentConformance_SignalingURLParser(t *testing.T) {
+	// 1. Standard ws:// with domain
+	u1, sni1, err1 := ParseSignalingURL("ws://cloudphone.example.com:8443", "dev-01", "secret123")
+	if err1 != nil || sni1 != "cloudphone.example.com" || !stringsContains(u1, "ws://cloudphone.example.com:8443/register_agent") {
+		t.Errorf("FAIL Test 1: %s, sni: %s, err: %v", u1, sni1, err1)
+	}
+
+	// 2. HTTPS/WSS with subpath
+	u2, sni2, err2 := ParseSignalingURL("https://gateway.cloud.io/proxy", "dev-02", "")
+	if err2 != nil || sni2 != "gateway.cloud.io" || !stringsContains(u2, "wss://gateway.cloud.io/proxy/register_agent") {
+		t.Errorf("FAIL Test 2: %s, sni: %s, err: %v", u2, sni2, err2)
+	}
+
+	// 3. IPv6 format
+	u3, sni3, err3 := ParseSignalingURL("wss://[::1]:8443", "dev-03", "tokenA")
+	if err3 != nil || sni3 != "::1" || !stringsContains(u3, "wss://[::1]:8443/register_agent") {
+		t.Errorf("FAIL Test 3: %s, sni: %s, err: %v", u3, sni3, err3)
+	}
+}
+
+func stringsContains(s, substr string) bool {
+	return len(s) >= len(substr) && (s == substr || filepath.Base(s) != "" && stringsIndex(s, substr) >= 0)
+}
+
+func stringsIndex(s, substr string) int {
+	for i := 0; i+len(substr) <= len(s); i++ {
+		if s[i:i+len(substr)] == substr {
+			return i
+		}
+	}
+	return -1
+}
+

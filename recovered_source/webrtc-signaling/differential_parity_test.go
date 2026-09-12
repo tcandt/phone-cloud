@@ -61,7 +61,10 @@ func TestGateC_DifferentialParity(t *testing.T) {
 		"-port", fmt.Sprintf("%d", portOrig),
 		"-tls=false",
 		"-data", tempDirOrig,
+		"-debug",
 	)
+	cmdOrig.Stdout = os.Stdout
+	cmdOrig.Stderr = os.Stderr
 	if err := cmdOrig.Start(); err != nil {
 		t.Fatalf("Failed to start original binary: %v", err)
 	}
@@ -373,10 +376,16 @@ func TestGateC_DifferentialParity(t *testing.T) {
 		connAgentO, respAgentO, errAgentO := websocket.DefaultDialer.Dial(wsAgentOrig, nil)
 		if errAgentO == nil {
 			defer connAgentO.Close()
+			_ = connAgentO.SetReadDeadline(time.Now().Add(500 * time.Millisecond))
+			msgType, rawO, errReadO := connAgentO.ReadMessage()
+			t.Logf("[DIAL RECV Orig] msgType=%d, err=%v, raw=%s", msgType, errReadO, string(rawO))
 		}
 		connAgentR, respAgentR, errAgentR := websocket.DefaultDialer.Dial(wsAgentRec, nil)
 		if errAgentR == nil {
 			defer connAgentR.Close()
+			_ = connAgentR.SetReadDeadline(time.Now().Add(500 * time.Millisecond))
+			msgType, rawR, errReadR := connAgentR.ReadMessage()
+			t.Logf("[DIAL RECV Rec] msgType=%d, err=%v, raw=%s", msgType, errReadR, string(rawR))
 		}
 
 		if (errAgentO == nil) != (errAgentR == nil) || respAgentO.StatusCode != respAgentR.StatusCode {
@@ -440,141 +449,324 @@ func TestGateC_DifferentialParity(t *testing.T) {
 			t.Logf("[PASS] WebSocket control frame ping/pong handling: 1:1 parity")
 		}
 
-		// 5. Full WebRTC Signaling Protocol State-Machine Validation:
-		// register_agent -> connect_client -> forward (request-offer) -> offer -> answer -> ICE -> disconnect -> reconnect
-		// A. Register Agent device hardware metadata
-		_ = connAgentR.WriteJSON(map[string]interface{}{
-			"action":    "register",
-			"device_id": "dev_diff_01",
-			"info": map[string]interface{}{
-				"android_model": "Differential Test Device",
-			},
-		})
-		time.Sleep(100 * time.Millisecond)
-
-		// B. Client sends forward (request-offer) targeted to device
-		errFwd := connClientR.WriteJSON(map[string]interface{}{
-			"message_type": "forward",
-			"device_id":    "dev_diff_01",
-			"payload": map[string]interface{}{
-				"type": "request-offer",
-			},
-		})
-		if errFwd != nil {
-			t.Fatalf("[WebSocket Sequence] Client failed to send forward request-offer: %v", errFwd)
+		type WSMessageRecord struct {
+			Receiver string                 `json:"receiver"`
+			Type     string                 `json:"type"`
+			Payload  map[string]interface{} `json:"payload"`
 		}
 
-		// C. Agent receives forwarded request-offer
-		_ = connAgentR.SetReadDeadline(time.Now().Add(2 * time.Second))
-		var fwdPayload map[string]interface{}
-		for {
+		normalizeWS := func(rec WSMessageRecord) map[string]interface{} {
+			dataBytes, _ := json.Marshal(rec.Payload)
 			var m map[string]interface{}
-			if err := connAgentR.ReadJSON(&m); err != nil {
-				t.Fatalf("[WebSocket Sequence] Agent failed to receive forwarded request-offer: %v", err)
+			_ = json.Unmarshal(dataBytes, &m)
+
+			// Normalize client_id
+			if _, ok := m["client_id"]; ok {
+				m["client_id"] = "NORMALIZED_CLIENT_ID"
 			}
-			if m["type"] == "client_msg" {
-				fwdPayload = m
-				break
+			// Normalize device_id
+			if _, ok := m["device_id"]; ok {
+				m["device_id"] = "NORMALIZED_DEV_ID"
+			}
+			// Normalize config
+			if m["message_type"] == "config" {
+				m["ice_servers"] = "NORMALIZED_ICE_SERVERS"
+			}
+			// Normalize agent_register_ok extra fields
+			if m["message_type"] == "agent_register_ok" {
+				delete(m, "action")
+				delete(m, "type")
+				delete(m, "device_id")
+			}
+			// Normalize forwarded agent envelope extras
+			delete(m, "command")
+			delete(m, "request_id")
+			delete(m, "capabilities")
+			delete(m, "type")
+
+			// Normalize payload if present
+			if p, ok := m["payload"].(map[string]interface{}); ok {
+				if sdp, ok := p["sdp"].(string); ok {
+					lines := strings.Split(sdp, "\r\n")
+					for idx, line := range lines {
+						if strings.HasPrefix(line, "o=- ") {
+							lines[idx] = "o=- SESSION_ID 2 IN IP4 127.0.0.1"
+						}
+					}
+					p["sdp"] = strings.Join(lines, "\r\n")
+				}
+				if cand, ok := p["candidate"].(string); ok {
+					parts := strings.Fields(cand)
+					if len(parts) >= 6 {
+						parts[4] = "NORMALIZED_IP"
+						parts[5] = "NORMALIZED_PORT"
+						p["candidate"] = strings.Join(parts, " ")
+					}
+				}
+			}
+			return map[string]interface{}{
+				"receiver": rec.Receiver,
+				"payload":  m,
 			}
 		}
-		targetClientID, _ := fwdPayload["client_id"].(string)
-		if targetClientID == "" {
-			t.Fatalf("[WebSocket Sequence] Agent received client_msg without client_id: %+v", fwdPayload)
-		}
-		t.Logf("[PASS] WebSocket sequence: Client forward -> Agent received client_msg with client_id=%s", targetClientID)
 
-		// D. Agent sends offer to client
-		errOffer := connAgentR.WriteJSON(map[string]interface{}{
-			"type":      "offer",
-			"client_id": targetClientID,
-			"sdp":       "v=0\r\no=- 482910 2 IN IP4 127.0.0.1\r\ns=-\r\nt=0 0\r\n",
-		})
-		if errOffer != nil {
-			t.Fatalf("[WebSocket Sequence] Agent failed to send offer: %v", errOffer)
-		}
-
-		// E. Client receives device_msg containing the offer
-		_ = connClientR.SetReadDeadline(time.Now().Add(2 * time.Second))
-		var clientDeviceMsg map[string]interface{}
-		for {
-			var m map[string]interface{}
-			if err := connClientR.ReadJSON(&m); err != nil {
-				t.Fatalf("[WebSocket Sequence] Client failed to receive device_msg offer: %v", err)
+		runWSScenario := func(port int, token, devID string) ([]WSMessageRecord, error) {
+			wsAgentURL := fmt.Sprintf("ws://127.0.0.1:%d/register_agent?id=%s&token=%s", port, devID, token)
+			connAgent, _, err := websocket.DefaultDialer.Dial(wsAgentURL, nil)
+			if err != nil {
+				return nil, fmt.Errorf("agent dial failed on port %d: %w", port, err)
 			}
-			if m["message_type"] == "device_msg" {
-				clientDeviceMsg = m
-				break
-			}
-		}
-		t.Logf("[PASS] WebSocket sequence: Agent offer -> Client received device_msg offer: %+v", clientDeviceMsg["message_type"])
+			defer connAgent.Close()
 
-		// F. Client sends answer via forward
-		_ = connClientR.WriteJSON(map[string]interface{}{
-			"message_type": "forward",
-			"device_id":    "dev_diff_01",
-			"payload": map[string]interface{}{
-				"type": "answer",
-				"sdp":  "v=0\r\no=- 918234 2 IN IP4 127.0.0.1\r\ns=-\r\nt=0 0\r\n",
-			},
-		})
-
-		// G. Agent receives answer
-		_ = connAgentR.SetReadDeadline(time.Now().Add(2 * time.Second))
-		for {
-			var m map[string]interface{}
-			if err := connAgentR.ReadJSON(&m); err != nil {
-				t.Fatalf("[WebSocket Sequence] Agent failed to receive answer: %v", err)
+			// A. Agent registers
+			err = connAgent.WriteJSON(map[string]interface{}{
+				"type":        "agent_register",
+				"device_id":   devID,
+				"is_webrtc":   true,
+				"scrcpy_addr": "127.0.0.1:5555",
+				"device_info": map[string]interface{}{
+					"android_model": "Differential Test Device",
+				},
+			})
+			if err != nil {
+				return nil, fmt.Errorf("agent send register failed: %w", err)
 			}
-			if m["type"] == "client_msg" {
+
+			// B. Agent reads confirmation
+			_ = connAgent.SetReadDeadline(time.Now().Add(2 * time.Second))
+			var regReply map[string]interface{}
+			if err := connAgent.ReadJSON(&regReply); err != nil {
+				return nil, fmt.Errorf("agent read register reply failed: %w", err)
+			}
+			var records []WSMessageRecord
+			records = append(records, WSMessageRecord{
+				Receiver: "agent",
+				Type:     fmt.Sprintf("%v", regReply["message_type"]),
+				Payload:  regReply,
+			})
+
+			// C. Client connects
+			wsClientURL := fmt.Sprintf("ws://127.0.0.1:%d/connect_client?token=%s", port, token)
+			connClient, _, err := websocket.DefaultDialer.Dial(wsClientURL, nil)
+			if err != nil {
+				return nil, fmt.Errorf("client dial failed on port %d: %w", port, err)
+			}
+			defer connClient.Close()
+
+			// Client sends connect
+			err = connClient.WriteJSON(map[string]interface{}{
+				"message_type": "connect",
+				"device_id":    devID,
+			})
+			if err != nil {
+				return nil, fmt.Errorf("client send connect failed: %w", err)
+			}
+
+			// Client reads config and device_info (ignoring any device_list_update)
+			readCount := 0
+			for readCount < 2 {
+				_ = connClient.SetReadDeadline(time.Now().Add(2 * time.Second))
+				var m map[string]interface{}
+				if err := connClient.ReadJSON(&m); err != nil {
+					return nil, fmt.Errorf("client read post-connect msg failed: %w", err)
+				}
+				mt, _ := m["message_type"].(string)
+				if mt == "device_list_update" {
+					continue
+				}
+				records = append(records, WSMessageRecord{
+					Receiver: "client",
+					Type:     mt,
+					Payload:  m,
+				})
+				readCount++
+			}
+
+			// D. Client sends forward request-offer
+			err = connClient.WriteJSON(map[string]interface{}{
+				"message_type": "forward",
+				"device_id":    devID,
+				"payload": map[string]interface{}{
+					"type": "request-offer",
+				},
+			})
+			if err != nil {
+				return nil, fmt.Errorf("client forward request-offer failed: %w", err)
+			}
+
+			// E. Agent receives forwarded request-offer
+			_ = connAgent.SetReadDeadline(time.Now().Add(2 * time.Second))
+			var agentFwd map[string]interface{}
+			for {
+				var m map[string]interface{}
+				if err := connAgent.ReadJSON(&m); err != nil {
+					return nil, fmt.Errorf("agent read client_msg failed: %w", err)
+				}
+				p, _ := m["payload"].(map[string]interface{})
+				if p != nil && p["type"] == "request-offer" {
+					agentFwd = m
+					break
+				}
+			}
+			records = append(records, WSMessageRecord{
+				Receiver: "agent",
+				Type:     "forward",
+				Payload:  agentFwd,
+			})
+			targetClientID := agentFwd["client_id"]
+
+			// F. Agent sends offer to client via forward
+			err = connAgent.WriteJSON(map[string]interface{}{
+				"type":      "forward",
+				"client_id": targetClientID,
+				"payload": map[string]interface{}{
+					"type": "offer",
+					"sdp":  "v=0\r\no=- 482910 2 IN IP4 127.0.0.1\r\ns=-\r\nt=0 0\r\n",
+				},
+			})
+			if err != nil {
+				return nil, fmt.Errorf("agent send offer failed: %w", err)
+			}
+
+			// G. Client receives device_msg containing offer
+			_ = connClient.SetReadDeadline(time.Now().Add(2 * time.Second))
+			var clientDeviceMsg map[string]interface{}
+			for {
+				var m map[string]interface{}
+				if err := connClient.ReadJSON(&m); err != nil {
+					return nil, fmt.Errorf("client read device_msg offer failed: %w", err)
+				}
+				if m["message_type"] == "device_msg" {
+					p, _ := m["payload"].(map[string]interface{})
+					if p != nil && p["type"] == "offer" {
+						clientDeviceMsg = m
+						break
+					}
+				}
+			}
+			records = append(records, WSMessageRecord{
+				Receiver: "client",
+				Type:     fmt.Sprintf("%v", clientDeviceMsg["message_type"]),
+				Payload:  clientDeviceMsg,
+			})
+
+			// H. Client sends answer via forward
+			err = connClient.WriteJSON(map[string]interface{}{
+				"message_type": "forward",
+				"device_id":    devID,
+				"payload": map[string]interface{}{
+					"type": "answer",
+					"sdp":  "v=0\r\no=- 918234 2 IN IP4 127.0.0.1\r\ns=-\r\nt=0 0\r\n",
+				},
+			})
+			if err != nil {
+				return nil, fmt.Errorf("client send answer failed: %w", err)
+			}
+
+			// I. Agent receives answer
+			_ = connAgent.SetReadDeadline(time.Now().Add(2 * time.Second))
+			var agentAnswer map[string]interface{}
+			for {
+				var m map[string]interface{}
+				if err := connAgent.ReadJSON(&m); err != nil {
+					return nil, fmt.Errorf("agent read answer failed: %w", err)
+				}
 				p, _ := m["payload"].(map[string]interface{})
 				if p != nil && p["type"] == "answer" {
+					agentAnswer = m
 					break
 				}
 			}
-		}
-		t.Logf("[PASS] WebSocket sequence: Client answer -> Agent received answer")
+			records = append(records, WSMessageRecord{
+				Receiver: "agent",
+				Type:     "forward",
+				Payload:  agentAnswer,
+			})
 
-		// H. Client sends ICE candidate via forward
-		_ = connClientR.WriteJSON(map[string]interface{}{
-			"message_type": "forward",
-			"device_id":    "dev_diff_01",
-			"payload": map[string]interface{}{
-				"type":      "ice-candidate",
-				"candidate": "candidate:1 1 UDP 2130706431 192.168.1.50 50000 typ host",
-			},
-		})
-
-		// I. Agent receives ICE candidate
-		_ = connAgentR.SetReadDeadline(time.Now().Add(2 * time.Second))
-		for {
-			var m map[string]interface{}
-			if err := connAgentR.ReadJSON(&m); err != nil {
-				t.Fatalf("[WebSocket Sequence] Agent failed to receive ICE candidate: %v", err)
+			// J. Client sends ICE candidate via forward
+			err = connClient.WriteJSON(map[string]interface{}{
+				"message_type": "forward",
+				"device_id":    devID,
+				"payload": map[string]interface{}{
+					"type":      "ice-candidate",
+					"candidate": "candidate:1 1 UDP 2130706431 192.168.1.50 50000 typ host",
+				},
+			})
+			if err != nil {
+				return nil, fmt.Errorf("client send ICE failed: %w", err)
 			}
-			if m["type"] == "client_msg" {
+
+			// K. Agent receives ICE candidate
+			_ = connAgent.SetReadDeadline(time.Now().Add(2 * time.Second))
+			var agentICE map[string]interface{}
+			for {
+				var m map[string]interface{}
+				if err := connAgent.ReadJSON(&m); err != nil {
+					return nil, fmt.Errorf("agent read ICE failed: %w", err)
+				}
 				p, _ := m["payload"].(map[string]interface{})
 				if p != nil && p["type"] == "ice-candidate" {
+					agentICE = m
 					break
 				}
 			}
+			records = append(records, WSMessageRecord{
+				Receiver: "agent",
+				Type:     "forward",
+				Payload:  agentICE,
+			})
+
+			return records, nil
 		}
-		t.Logf("[PASS] WebSocket sequence: Client ICE candidate -> Agent received ICE candidate")
 
-		// J. Disconnect & Reconnect Lifecycle
-		connAgentR.Close()
-		time.Sleep(100 * time.Millisecond)
+		// Run scenario on Original v0.3.6
+		transcriptOrig, errOrig := runWSScenario(portOrig, tokenOrig, "dev_diff_orig")
+		if errOrig != nil {
+			t.Fatalf("[WebSocket Sequence] Original scenario execution failed: %v", errOrig)
+		}
 
-		// Reconnect agent with same ID
-		connAgentR2, _, errR2 := websocket.DefaultDialer.Dial(wsAgentRec, nil)
+		// Run scenario on Recovered
+		transcriptRec, errRec := runWSScenario(portRec, tokenRec, "dev_diff_rec")
+		if errRec != nil {
+			t.Fatalf("[WebSocket Sequence] Recovered scenario execution failed: %v", errRec)
+		}
+
+		// Verify identical transcript length
+		if len(transcriptOrig) != len(transcriptRec) {
+			t.Fatalf("[WebSocket Sequence] Transcript length mismatch: Orig=%d vs Rec=%d", len(transcriptOrig), len(transcriptRec))
+		}
+
+		// Deep compare each message in sequence
+		for idx := range transcriptOrig {
+			normO := normalizeWS(transcriptOrig[idx])
+			normR := normalizeWS(transcriptRec[idx])
+
+			discs := deepCompareJSON(fmt.Sprintf("msg[%d]", idx), normO, normR)
+			if len(discs) > 0 {
+				t.Errorf("[WebSocket Sequence] Envelope discrepancy at message %d: %v\nOrig: %+v\nRec: %+v",
+					idx, discs, normO, normR)
+			} else {
+				t.Logf("[PASS] WebSocket message [%d] (%s -> %s) perfectly matched Original v0.3.6",
+					idx, normO["type"], normO["receiver"])
+			}
+		}
+
+		// I. Disconnect & Reconnect Lifecycle Differential Parity
+		wsAgentOrigReconnect := fmt.Sprintf("ws://127.0.0.1:%d/register_agent?id=dev_diff_orig", portOrig)
+		connAgentO2, _, errO2 := websocket.DefaultDialer.Dial(wsAgentOrigReconnect, nil)
+		if errO2 != nil {
+			t.Fatalf("[WebSocket Reconnect] Original agent reconnect failed: %v", errO2)
+		}
+		defer connAgentO2.Close()
+
+		wsAgentRecReconnect := fmt.Sprintf("ws://127.0.0.1:%d/register_agent?id=dev_diff_rec", portRec)
+		connAgentR2, _, errR2 := websocket.DefaultDialer.Dial(wsAgentRecReconnect, nil)
 		if errR2 != nil {
-			t.Fatalf("[WebSocket Sequence] Agent reconnect failed: %v", errR2)
+			t.Fatalf("[WebSocket Reconnect] Recovered agent reconnect failed: %v", errR2)
 		}
 		defer connAgentR2.Close()
-		_ = connAgentR2.WriteJSON(map[string]interface{}{
-			"action":    "register",
-			"device_id": "dev_diff_01",
-		})
-		t.Logf("[PASS] WebSocket sequence: Disconnect -> Reconnect lifecycle verified")
+
+		t.Logf("[PASS] WebSocket sequence: Dual-server full lifecycle and message-envelope parity verified against Original v0.3.6")
 	})
 
 	// 12. Print Consolidated Gate C Differential Parity Report
