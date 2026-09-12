@@ -24,6 +24,11 @@ type StreamerBridge struct {
 	cachedCodecConfig []byte
 	configMu          sync.RWMutex
 
+	// Shared Media Timeline Epoch & Reference Clock
+	timelineMu     sync.Mutex
+	hasCommonEpoch bool
+	basePtsUs      uint64
+
 	// Video PTS Timeline Tracking
 	prevVideoPtsUs uint64
 	hasVideoPrev   bool
@@ -43,6 +48,33 @@ func NewStreamerBridge(ctrl *ControlWriter, fps int) *StreamerBridge {
 		fps:      fps,
 		running:  true,
 	}
+}
+
+// ResetTimeline resets the shared media timeline epoch on reconnect or major discontinuity
+func (sb *StreamerBridge) ResetTimeline() {
+	sb.timelineMu.Lock()
+	defer sb.timelineMu.Unlock()
+	sb.hasCommonEpoch = false
+	sb.basePtsUs = 0
+	sb.hasVideoPrev = false
+	sb.prevVideoPtsUs = 0
+	sb.hasAudioPrev = false
+	sb.prevAudioPtsUs = 0
+}
+
+// establishOrGetEpoch maps microsecond presentation timestamps to a shared reference clock
+func (sb *StreamerBridge) establishOrGetEpoch(ptsUs uint64) (uint64, bool) {
+	sb.timelineMu.Lock()
+	defer sb.timelineMu.Unlock()
+	if !sb.hasCommonEpoch {
+		sb.basePtsUs = ptsUs
+		sb.hasCommonEpoch = true
+		return 0, true
+	}
+	if ptsUs >= sb.basePtsUs {
+		return ptsUs - sb.basePtsUs, false
+	}
+	return 0, false
 }
 
 func (sb *StreamerBridge) SetPreviewStreamer(p *PreviewStreamer) {
@@ -141,7 +173,10 @@ func (sb *StreamerBridge) StreamVideo(conn net.Conn) {
 			continue
 		}
 
-		// Calculate true frame duration from microsecond PTS delta
+		// Calculate frame duration from microsecond PTS delta and map to shared media timeline
+		relPtsUs, _ := sb.establishOrGetEpoch(ptsUs)
+		_ = relPtsUs
+
 		var sampleDuration time.Duration
 		if !sb.hasVideoPrev {
 			sampleDuration = nominalDuration
@@ -150,12 +185,17 @@ func (sb *StreamerBridge) StreamVideo(conn net.Conn) {
 			deltaUs := ptsUs - sb.prevVideoPtsUs
 			// Discontinuity check: if gap > 3 seconds, reset timeline to nominal
 			if deltaUs > 3000000 {
+				log.Printf("[Streamer] Video discontinuity detected (%d us gap), resetting timeline epoch", deltaUs)
+				sb.ResetTimeline()
 				sampleDuration = nominalDuration
 			} else {
+				// Microsecond delta is converted to time.Duration.
+				// Pion's TrackLocalStaticSample uses this duration to advance RTP timestamp (90 kHz for H.264 video).
 				sampleDuration = time.Duration(deltaUs) * time.Microsecond
 			}
 		} else {
 			// PTS reset / wrap / backward timestamp: reset base and use nominal duration
+			sb.ResetTimeline()
 			sampleDuration = nominalDuration
 		}
 		sb.prevVideoPtsUs = ptsUs
@@ -211,7 +251,10 @@ func (sb *StreamerBridge) StreamAudio(conn net.Conn, preview *PreviewStreamer) {
 			break
 		}
 
-		// Dynamic Audio Frame Duration from PTS
+		// Dynamic Audio Frame Duration from PTS mapped onto shared timeline
+		relAudioPtsUs, _ := sb.establishOrGetEpoch(audioPtsUs)
+		_ = relAudioPtsUs
+
 		var audioDuration time.Duration
 		if !sb.hasAudioPrev {
 			audioDuration = nominalAudioDuration
@@ -221,6 +264,8 @@ func (sb *StreamerBridge) StreamAudio(conn net.Conn, preview *PreviewStreamer) {
 			if deltaUs > 1000000 || deltaUs < 1000 {
 				audioDuration = nominalAudioDuration
 			} else {
+				// Microsecond delta is converted to time.Duration.
+				// Pion advances RTP timestamp according to Opus's 48 kHz clock rate.
 				audioDuration = time.Duration(deltaUs) * time.Microsecond
 			}
 		} else {

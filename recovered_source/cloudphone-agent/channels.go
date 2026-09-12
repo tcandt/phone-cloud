@@ -1,10 +1,15 @@
 package main
 
 import (
+	"bytes"
 	"crypto/sha256"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"image"
+	"image/color"
+	"image/jpeg"
 	"io"
 	"log"
 	"net"
@@ -18,6 +23,36 @@ import (
 
 	"github.com/pion/webrtc/v3"
 )
+
+var (
+	latestCameraJpeg   []byte
+	latestCameraJpegMu sync.RWMutex
+	cameraStreaming    bool
+	cameraFacing       = "environment" // "environment" or "user"
+	cameraOrientation  = 0
+	cameraFps          = 30
+	cameraFrameChan    = make(chan []byte, 16)
+	cameraStateMu      sync.RWMutex
+)
+
+// generateTestPatternJpeg generates a valid JPEG test frame with color gradient
+func generateTestPatternJpeg(width, height int) []byte {
+	img := image.NewRGBA(image.Rect(0, 0, width, height))
+	for y := 0; y < height; y++ {
+		for x := 0; x < width; x++ {
+			c := color.RGBA{
+				R: uint8((x * 255) / width),
+				G: uint8((y * 255) / height),
+				B: 128,
+				A: 255,
+			}
+			img.Set(x, y, c)
+		}
+	}
+	var buf bytes.Buffer
+	_ = jpeg.Encode(&buf, img, &jpeg.Options{Quality: 75})
+	return buf.Bytes()
+}
 
 type UploadSession struct {
 	Path            string
@@ -647,6 +682,7 @@ func setupAiCommandChannel(dc *webrtc.DataChannel, sess *WebRTCSession) {
 }
 
 // setupCameraChannel handles camera control commands (camera_start, camera_stop, camera_switch, camera_snapshot, camera_status)
+// and accepts binary JPEG frames streamed from browser client camera
 func setupCameraChannel(dc *webrtc.DataChannel, s *WebRTCSession) {
 	if dc == nil {
 		return
@@ -668,10 +704,42 @@ func setupCameraChannel(dc *webrtc.DataChannel, s *WebRTCSession) {
 			}
 		}
 
+		// 1. Binary Frame Path: Browser client sends raw JPEG ArrayBuffer at ~30 FPS
+		if !msg.IsString {
+			data := msg.Data
+			if len(data) >= 4 && data[0] == 0xFF && data[1] == 0xD8 {
+				latestCameraJpegMu.Lock()
+				latestCameraJpeg = make([]byte, len(data))
+				copy(latestCameraJpeg, data)
+				latestCameraJpegMu.Unlock()
+
+				cameraStateMu.Lock()
+				cameraStreaming = true
+				cameraStateMu.Unlock()
+
+				// Distribute to internal camera socket / virtual device channel if listening
+				select {
+				case cameraFrameChan <- data:
+				default:
+					select {
+					case <-cameraFrameChan:
+					default:
+					}
+					select {
+					case cameraFrameChan <- data:
+					default:
+					}
+				}
+			}
+			return
+		}
+
+		// 2. Control Command Path
 		var cmd struct {
 			Action    string                 `json:"action"`
 			RequestID string                 `json:"request_id"`
 			Params    map[string]interface{} `json:"params"`
+			Lens      string                 `json:"lens"`
 		}
 		if err := json.Unmarshal(msg.Data, &cmd); err != nil {
 			return
@@ -680,53 +748,127 @@ func setupCameraChannel(dc *webrtc.DataChannel, s *WebRTCSession) {
 		log.Printf("[CameraChannel] Received camera command: action=%s, req_id=%s", cmd.Action, cmd.RequestID)
 
 		switch cmd.Action {
-		case "camera_start":
+		case "camera_start", "start":
+			cameraStateMu.Lock()
+			cameraStreaming = true
+			cameraStateMu.Unlock()
+
+			// Proactively signal client over DataChannel to begin streaming camera frames
+			_ = dc.Send([]byte(`{"action":"start"}`))
+
 			resp, _ := json.Marshal(map[string]interface{}{
 				"status":     "success",
 				"action":     "camera_start",
 				"request_id": cmd.RequestID,
 				"active":     true,
+				"streaming":  true,
 			})
 			_ = dc.Send(resp)
 
-		case "camera_stop":
+		case "camera_stop", "stop":
+			cameraStateMu.Lock()
+			cameraStreaming = false
+			cameraStateMu.Unlock()
+
+			// Signal client to stop camera capture
+			_ = dc.Send([]byte(`{"action":"stop"}`))
+
 			resp, _ := json.Marshal(map[string]interface{}{
 				"status":     "success",
 				"action":     "camera_stop",
 				"request_id": cmd.RequestID,
 				"active":     false,
+				"streaming":  false,
 			})
 			_ = dc.Send(resp)
 
-		case "camera_switch":
-			lens := "front"
-			if cmd.Params != nil && cmd.Params["lens"] != nil {
+		case "camera_switch", "switch":
+			cameraStateMu.Lock()
+			lens := cmd.Lens
+			if lens == "" && cmd.Params != nil && cmd.Params["lens"] != nil {
 				lens = fmt.Sprintf("%v", cmd.Params["lens"])
 			}
+			if lens == "" {
+				if cameraFacing == "environment" || cameraFacing == "back" {
+					cameraFacing = "user"
+					lens = "front"
+				} else {
+					cameraFacing = "environment"
+					lens = "back"
+				}
+			} else {
+				if lens == "front" || lens == "user" {
+					cameraFacing = "user"
+				} else {
+					cameraFacing = "environment"
+				}
+			}
+			facing := cameraFacing
+			cameraStateMu.Unlock()
+
+			// Notify peer of lens switch
+			switchCmd, _ := json.Marshal(map[string]interface{}{
+				"action": "switch",
+				"lens":   lens,
+				"facing": facing,
+			})
+			_ = dc.Send(switchCmd)
+
 			resp, _ := json.Marshal(map[string]interface{}{
 				"status":     "success",
 				"action":     "camera_switch",
 				"request_id": cmd.RequestID,
 				"lens":       lens,
+				"facing":     facing,
 			})
 			_ = dc.Send(resp)
 
-		case "camera_status":
+		case "camera_status", "status":
+			cameraStateMu.RLock()
+			streaming := cameraStreaming
+			facing := cameraFacing
+			fps := cameraFps
+			cameraStateMu.RUnlock()
+
+			latestCameraJpegMu.RLock()
+			hasFrame := len(latestCameraJpeg) > 0
+			latestCameraJpegMu.RUnlock()
+
 			resp, _ := json.Marshal(map[string]interface{}{
 				"status":     "success",
 				"action":     "camera_status",
 				"request_id": cmd.RequestID,
 				"supported":  true,
-				"streaming":  true,
+				"streaming":  streaming,
+				"facing":     facing,
+				"fps":        fps,
+				"has_frame":  hasFrame,
 			})
 			_ = dc.Send(resp)
 
-		case "camera_snapshot":
+		case "camera_snapshot", "snapshot":
+			latestCameraJpegMu.RLock()
+			var jpegData []byte
+			if len(latestCameraJpeg) > 0 {
+				jpegData = make([]byte, len(latestCameraJpeg))
+				copy(jpegData, latestCameraJpeg)
+			}
+			latestCameraJpegMu.RUnlock()
+
+			// If no frame has been streamed yet, generate a valid test JPEG image
+			if len(jpegData) == 0 {
+				jpegData = generateTestPatternJpeg(640, 480)
+			}
+
+			imgBase64 := base64.StdEncoding.EncodeToString(jpegData)
 			resp, _ := json.Marshal(map[string]interface{}{
-				"status":     "success",
-				"action":     "camera_snapshot",
-				"request_id": cmd.RequestID,
-				"timestamp":  time.Now().UnixMilli(),
+				"status":       "success",
+				"action":       "camera_snapshot",
+				"request_id":   cmd.RequestID,
+				"timestamp":    time.Now().UnixMilli(),
+				"size":         len(jpegData),
+				"mime_type":    "image/jpeg",
+				"image_base64": imgBase64,
 			})
 			_ = dc.Send(resp)
 

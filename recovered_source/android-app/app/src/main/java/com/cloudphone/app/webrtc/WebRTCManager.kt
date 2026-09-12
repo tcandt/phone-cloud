@@ -28,6 +28,11 @@ class WebRTCManager(
         fun onClipboardReceived(text: String)
         fun onCameraResponse(response: JsonObject)
         fun onVideoTrackReady(track: VideoTrack)
+        fun onAdbOutput(data: ByteArray) {}
+        fun onFileMessage(message: String) {}
+        fun onAiCommandResponse(response: JsonObject) {}
+        fun onCameraStreamStarted() {}
+        fun onCameraStreamStopped() {}
     }
 
     private var factory: PeerConnectionFactory? = null
@@ -44,6 +49,7 @@ class WebRTCManager(
         private set
 
     private var targetDeviceId: String = ""
+    private var currentIceServers: List<PeerConnection.IceServer>? = null
 
     init {
         initPeerConnectionFactory()
@@ -75,11 +81,17 @@ class WebRTCManager(
         remoteVideoTrack?.addSink(renderer)
     }
 
+    fun setIceServers(servers: List<PeerConnection.IceServer>) {
+        this.currentIceServers = servers
+        Log.i(TAG, "Configured ${servers.size} ICE/TURN servers for WebRTC")
+    }
+
     fun startConnection(deviceId: String, iceServersList: List<PeerConnection.IceServer>? = null) {
         this.targetDeviceId = deviceId
         setState(WebRTCConnectionState.SIGNALING)
 
-        val iceServers = iceServersList?.toMutableList() ?: mutableListOf(
+        val servers = iceServersList ?: currentIceServers
+        val iceServers = servers?.toMutableList() ?: mutableListOf(
             PeerConnection.IceServer.builder("stun:stun.l.google.com:19302").createIceServer()
         )
 
@@ -90,10 +102,13 @@ class WebRTCManager(
 
         peerConnection = factory?.createPeerConnection(rtcConfig, peerObserver)
 
-        // Pre-create input and clipboard channels from client side if needed
+        // Pre-create all 6 standard DataChannels
         createDataChannelInternal("input-channel", ordered = true)
         createDataChannelInternal("clipboard-channel", ordered = true)
         createDataChannelInternal("camera-channel", ordered = true)
+        createDataChannelInternal("file-channel", ordered = true)
+        createDataChannelInternal("adb-channel", ordered = true)
+        createDataChannelInternal("ai-command-channel", ordered = true)
 
         // Arm connection timeout -> fallback to WS
         startConnectionTimeout()
@@ -110,7 +125,7 @@ class WebRTCManager(
             add("payload", requestOfferPayload)
         }
         listener.onSendSignaling(forwardMsg)
-        Log.i(TAG, "WebRTC connection initiated for device: $deviceId, sent request-offer")
+        Log.i(TAG, "WebRTC connection initiated for device: $deviceId with ${iceServers.size} ICE servers")
     }
 
     private fun startConnectionTimeout() {
@@ -171,12 +186,38 @@ class WebRTCManager(
                 }
             }
             "camera-channel" -> {
+                if (buffer.binary) {
+                    Log.d(TAG, "Received binary camera data: ${bytes.size} bytes")
+                } else {
+                    val str = String(bytes, StandardCharsets.UTF_8)
+                    try {
+                        val json = Gson().fromJson(str, JsonObject::class.java)
+                        val action = json.get("action")?.asString
+                        if (action == "start") {
+                            mainHandler.post { listener.onCameraStreamStarted() }
+                        } else if (action == "stop") {
+                            mainHandler.post { listener.onCameraStreamStopped() }
+                        }
+                        mainHandler.post { listener.onCameraResponse(json) }
+                    } catch (e: Throwable) {
+                        Log.w(TAG, "Failed to parse camera channel response: $str")
+                    }
+                }
+            }
+            "adb-channel" -> {
+                mainHandler.post { listener.onAdbOutput(bytes) }
+            }
+            "file-channel" -> {
+                val str = String(bytes, StandardCharsets.UTF_8)
+                mainHandler.post { listener.onFileMessage(str) }
+            }
+            "ai-command-channel" -> {
                 val str = String(bytes, StandardCharsets.UTF_8)
                 try {
                     val json = Gson().fromJson(str, JsonObject::class.java)
-                    mainHandler.post { listener.onCameraResponse(json) }
+                    mainHandler.post { listener.onAiCommandResponse(json) }
                 } catch (e: Throwable) {
-                    Log.w(TAG, "Failed to parse camera channel response: $str")
+                    Log.w(TAG, "Failed to parse AI command response: $str")
                 }
             }
         }
@@ -362,6 +403,46 @@ class WebRTCManager(
         return dc.send(buffer)
     }
 
+    fun sendCameraFrame(jpegBytes: ByteArray): Boolean {
+        val dc = dataChannels["camera-channel"] ?: return false
+        if (dc.state() != DataChannel.State.OPEN) return false
+        val buffer = DataChannel.Buffer(ByteBuffer.wrap(jpegBytes), true)
+        return dc.send(buffer)
+    }
+
+    fun sendAdbData(bytes: ByteArray): Boolean {
+        val dc = dataChannels["adb-channel"] ?: return false
+        if (dc.state() != DataChannel.State.OPEN) return false
+        val buffer = DataChannel.Buffer(ByteBuffer.wrap(bytes), true)
+        return dc.send(buffer)
+    }
+
+    fun sendAdbCommand(command: String): Boolean {
+        return sendAdbData((command + "\n").toByteArray(StandardCharsets.UTF_8))
+    }
+
+    fun sendFileChunk(chunk: ByteArray): Boolean {
+        val dc = dataChannels["file-channel"] ?: return false
+        if (dc.state() != DataChannel.State.OPEN) return false
+        if (dc.bufferedAmount() > 1024 * 1024) return false
+        val buffer = DataChannel.Buffer(ByteBuffer.wrap(chunk), true)
+        return dc.send(buffer)
+    }
+
+    fun sendFileMessage(msg: JsonObject): Boolean {
+        val dc = dataChannels["file-channel"] ?: return false
+        if (dc.state() != DataChannel.State.OPEN) return false
+        val buffer = DataChannel.Buffer(ByteBuffer.wrap(msg.toString().toByteArray(StandardCharsets.UTF_8)), false)
+        return dc.send(buffer)
+    }
+
+    fun sendAiCommand(command: JsonObject): Boolean {
+        val dc = dataChannels["ai-command-channel"] ?: return false
+        if (dc.state() != DataChannel.State.OPEN) return false
+        val buffer = DataChannel.Buffer(ByteBuffer.wrap(command.toString().toByteArray(StandardCharsets.UTF_8)), false)
+        return dc.send(buffer)
+    }
+
     private fun setState(state: WebRTCConnectionState) {
         if (currentState == state) return
         Log.i(TAG, "State transition: $currentState -> $state")
@@ -416,7 +497,7 @@ class WebRTCManager(
                 addProperty("sdpMLineIndex", candidate.sdpMLineIndex)
             }
             val payload = JsonObject().apply {
-                addProperty("type", "candidate")
+                addProperty("type", "ice-candidate")
                 add("candidate", candObj)
             }
             val forwardMsg = JsonObject().apply {

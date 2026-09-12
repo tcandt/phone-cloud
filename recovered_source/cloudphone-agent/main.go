@@ -3,6 +3,7 @@ package main
 import (
 	"encoding/json"
 	"flag"
+	"fmt"
 	"log"
 	"os"
 	"os/exec"
@@ -164,10 +165,18 @@ func main() {
 
 			action, _ := msg["action"].(string)
 			msgType, _ := msg["type"].(string)
-			clientID, _ := msg["client_id"].(string)
+			messageType, _ := msg["message_type"].(string)
+			var clientID string
+			if cid, ok := msg["client_id"].(string); ok {
+				clientID = cid
+			} else if cidNum, ok := msg["client_id"].(float64); ok {
+				clientID = fmt.Sprintf("%.0f", cidNum)
+			} else if cidInt, ok := msg["client_id"].(int); ok {
+				clientID = fmt.Sprintf("%d", cidInt)
+			}
 
 			// WebRTC Signaling negotiation routed from browser client
-			if msgType == "client_msg" {
+			if msgType == "client_msg" || messageType == "forward" {
 				payload, _ := msg["payload"].(map[string]interface{})
 				pType, _ := payload["type"].(string)
 
@@ -276,7 +285,7 @@ func main() {
 						log.Printf("[Agent] Answer applied successfully for client: %s", clientID)
 					}
 
-				case "ice-candidate":
+				case "ice-candidate", "candidate":
 					sessionsMu.RLock()
 					sess := sessions[clientID]
 					sessionsMu.RUnlock()

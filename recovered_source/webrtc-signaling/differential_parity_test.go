@@ -478,11 +478,6 @@ func TestGateC_DifferentialParity(t *testing.T) {
 				delete(m, "type")
 				delete(m, "device_id")
 			}
-			// Normalize forwarded agent envelope extras
-			delete(m, "command")
-			delete(m, "request_id")
-			delete(m, "capabilities")
-			delete(m, "type")
 
 			// Normalize payload if present
 			if p, ok := m["payload"].(map[string]interface{}); ok {

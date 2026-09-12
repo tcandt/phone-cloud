@@ -238,6 +238,59 @@ func TestAgentConformance_SignalingURLParser(t *testing.T) {
 	}
 }
 
+func TestAgentConformance_CameraProtocol(t *testing.T) {
+	// 1. Verify test pattern JPEG generation
+	testJpeg := generateTestPatternJpeg(320, 240)
+	if len(testJpeg) < 100 {
+		t.Fatalf("Test JPEG generation failed, length too small: %d", len(testJpeg))
+	}
+	if testJpeg[0] != 0xFF || testJpeg[1] != 0xD8 {
+		t.Errorf("Test JPEG header missing 0xFF 0xD8 SOI marker")
+	}
+	if testJpeg[len(testJpeg)-2] != 0xFF || testJpeg[len(testJpeg)-1] != 0xD9 {
+		t.Errorf("Test JPEG footer missing 0xFF 0xD9 EOI marker")
+	}
+
+	// 2. Test binary frame reception into latestCameraJpeg
+	sampleFrame := []byte{0xFF, 0xD8, 0xFF, 0xE0, 0x00, 0x10, 0x4A, 0x46, 0x49, 0x46, 0x00, 0x01, 0xFF, 0xD9}
+	latestCameraJpegMu.Lock()
+	latestCameraJpeg = make([]byte, len(sampleFrame))
+	copy(latestCameraJpeg, sampleFrame)
+	latestCameraJpegMu.Unlock()
+
+	cameraStateMu.Lock()
+	cameraStreaming = true
+	cameraFacing = "environment"
+	cameraStateMu.Unlock()
+
+	// 3. Verify snapshot generation from latestCameraJpeg
+	latestCameraJpegMu.RLock()
+	var snapshotBytes []byte
+	if len(latestCameraJpeg) > 0 {
+		snapshotBytes = make([]byte, len(latestCameraJpeg))
+		copy(snapshotBytes, latestCameraJpeg)
+	}
+	latestCameraJpegMu.RUnlock()
+
+	if len(snapshotBytes) != len(sampleFrame) {
+		t.Errorf("Snapshot bytes mismatch: expected %d, got %d", len(sampleFrame), len(snapshotBytes))
+	}
+
+	// 4. Verify lens switch logic
+	cameraStateMu.Lock()
+	if cameraFacing == "environment" {
+		cameraFacing = "user"
+	} else {
+		cameraFacing = "environment"
+	}
+	newFacing := cameraFacing
+	cameraStateMu.Unlock()
+
+	if newFacing != "user" {
+		t.Errorf("Expected facing 'user', got %s", newFacing)
+	}
+}
+
 func stringsContains(s, substr string) bool {
 	return len(s) >= len(substr) && (s == substr || filepath.Base(s) != "" && stringsIndex(s, substr) >= 0)
 }

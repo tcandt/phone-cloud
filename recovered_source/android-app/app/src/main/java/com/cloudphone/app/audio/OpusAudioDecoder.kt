@@ -1,13 +1,24 @@
 package com.cloudphone.app.audio
 
-import android.media.AudioFormat
 import android.media.MediaCodec
-import android.media.MediaCodecInfo
 import android.media.MediaCodecList
 import android.media.MediaFormat
 import android.util.Log
+import com.sun.jna.Library
+import com.sun.jna.Native
+import com.sun.jna.Pointer
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
+
+/**
+ * JNA binding interface for the native libopus library.
+ * Pre-compiled libopus.so is provided across all Android ABIs (arm64-v8a, armeabi-v7a, x86, x86_64).
+ */
+interface LibOpus : Library {
+    fun opus_decoder_create(Fs: Int, channels: Int, error: IntArray?): Pointer?
+    fun opus_decode(st: Pointer?, data: ByteArray?, len: Int, pcm: ShortArray, frame_size: Int, decode_fec: Int): Int
+    fun opus_decoder_destroy(st: Pointer?)
+}
 
 class OpusAudioDecoder(
     private val sampleRate: Int = 48000,
@@ -16,11 +27,35 @@ class OpusAudioDecoder(
     companion object {
         private const val TAG = "OpusAudioDecoder"
         private const val MIME_TYPE = "audio/opus"
+        private const val MAX_SAMPLES_PER_CHANNEL = 5760 // Max 120ms frame at 48 kHz
+
+        private fun logW(tag: String, msg: String) {
+            try { Log.w(tag, msg) } catch (_: Throwable) { println("[$tag] W: $msg") }
+        }
+
+        private fun logI(tag: String, msg: String) {
+            try { Log.i(tag, msg) } catch (_: Throwable) { println("[$tag] I: $msg") }
+        }
+
+        // Lazy singleton for the native libopus JNA instance
+        var nativeLibOpus: LibOpus? = try {
+            Native.load("opus", LibOpus::class.java)
+        } catch (t: Throwable) {
+            try {
+                Native.load("opusjni", LibOpus::class.java)
+            } catch (t2: Throwable) {
+                logW(TAG, "Native libopus not loaded: ${t.message}")
+                null
+            }
+        }
     }
 
     private var codec: MediaCodec? = null
-    private var isSoftwareFallback = false
+    var isSoftwareFallback = false
+        private set
     private var isInitialized = false
+
+    private var nativeDecoder: Pointer? = null
 
     init {
         initDecoder()
@@ -28,7 +63,7 @@ class OpusAudioDecoder(
 
     private fun initDecoder() {
         try {
-            // First check if MediaCodec has an Opus decoder
+            // First check if MediaCodec has a hardware/platform Opus decoder
             val decoderName = findOpusDecoderName()
             if (decoderName != null) {
                 val mediaCodec = MediaCodec.createByCodecName(decoderName)
@@ -62,13 +97,34 @@ class OpusAudioDecoder(
                 return
             }
         } catch (e: Throwable) {
-            Log.w(TAG, "MediaCodec Opus decoder initialization failed: ${e.message}. Activating software fallback.", e)
+            Log.w(TAG, "MediaCodec Opus decoder initialization failed: ${e.message}. Activating native software fallback.")
         }
 
-        // Fallback mode activated
+        // Activate Software Fallback via native libopus
+        activateSoftwareFallback()
+    }
+
+    fun activateSoftwareFallback() {
         isSoftwareFallback = true
+        val lib = nativeLibOpus
+        if (lib != null) {
+            try {
+                val err = IntArray(1)
+                nativeDecoder = lib.opus_decoder_create(sampleRate, channels, err)
+                if (nativeDecoder != null && err[0] == 0) {
+                    Log.i(TAG, "Initialized native libopus software decoder ($sampleRate Hz, $channels ch)")
+                } else {
+                    Log.w(TAG, "Failed to create native libopus decoder: error code ${err[0]}")
+                    nativeDecoder = null
+                }
+            } catch (t: Throwable) {
+                Log.w(TAG, "Error initializing native libopus decoder: ${t.message}")
+                nativeDecoder = null
+            }
+        } else {
+            Log.w(TAG, "Native libopus JNA instance unavailable; PLC fallback will be active.")
+        }
         isInitialized = true
-        Log.i(TAG, "Software Opus fallback active")
     }
 
     private fun findOpusDecoderName(): String? {
@@ -90,7 +146,8 @@ class OpusAudioDecoder(
 
     /**
      * Decodes an Opus packet and passes PCM16 stereo samples to the callback.
-     * Guaranteed never to pass compressed Opus data to AudioTrack.
+     * If MediaCodec is unavailable, native libopus decodes the payload into PCM16 samples.
+     * Silence/PLC is used exclusively for lost packets or decoding errors.
      */
     fun decode(opusPacket: ByteArray, onPcmDecoded: (ByteArray) -> Unit) {
         if (!isInitialized || opusPacket.isEmpty()) return
@@ -122,17 +179,48 @@ class OpusAudioDecoder(
                     c.releaseOutputBuffer(outIndex, false)
                     outIndex = c.dequeueOutputBuffer(bufferInfo, 0L)
                 }
+                return
             } catch (e: Throwable) {
                 Log.w(TAG, "MediaCodec decode frame error: ${e.message}")
             }
-        } else {
-            // Software fallback: parse frame packet length to synthesize valid PCM silence/concealment
-            // to maintain continuous audio clock without screeching distortion
-            val samplesPerFrame = (sampleRate * 0.020).toInt() // 20ms = 960 samples
-            val pcmLength = samplesPerFrame * channels * 2 // 16-bit stereo = 3840 bytes
-            val silencePcm = ByteArray(pcmLength)
-            onPcmDecoded(silencePcm)
         }
+
+        // Native libopus software decoding path
+        val lib = nativeLibOpus
+        val decoderPtr = nativeDecoder
+        if (lib != null && decoderPtr != null) {
+            val pcmShorts = ShortArray(MAX_SAMPLES_PER_CHANNEL * channels)
+            val samplesDecoded = try {
+                lib.opus_decode(
+                    decoderPtr,
+                    opusPacket,
+                    opusPacket.size,
+                    pcmShorts,
+                    MAX_SAMPLES_PER_CHANNEL,
+                    0
+                )
+            } catch (t: Throwable) {
+                Log.w(TAG, "Native opus_decode exception: ${t.message}")
+                -1
+            }
+
+            if (samplesDecoded > 0) {
+                val byteCount = samplesDecoded * channels * 2
+                val pcmBytes = ByteArray(byteCount)
+                val bb = ByteBuffer.wrap(pcmBytes).order(ByteOrder.LITTLE_ENDIAN)
+                for (i in 0 until samplesDecoded * channels) {
+                    bb.putShort(pcmShorts[i])
+                }
+                onPcmDecoded(pcmBytes)
+                return
+            }
+        }
+
+        // Packet Loss Concealment (PLC) / fallback silence (20ms) only when decode fails
+        val samplesPerFrame = (sampleRate * 0.020).toInt() // 20ms = 960 samples
+        val pcmLength = samplesPerFrame * channels * 2 // 16-bit stereo = 3840 bytes
+        val silencePcm = ByteArray(pcmLength)
+        onPcmDecoded(silencePcm)
     }
 
     fun release() {
@@ -143,6 +231,16 @@ class OpusAudioDecoder(
             Log.w(TAG, "Error releasing MediaCodec: ${e.message}")
         }
         codec = null
+
+        nativeDecoder?.let {
+            try {
+                nativeLibOpus?.opus_decoder_destroy(it)
+            } catch (e: Throwable) {
+                Log.w(TAG, "Error destroying native libopus decoder: ${e.message}")
+            }
+            nativeDecoder = null
+        }
+
         isInitialized = false
     }
 }

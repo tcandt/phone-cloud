@@ -122,6 +122,12 @@ jobs:
           chmod +x gradlew
           ./gradlew clean assembleHelper
 
+      - name: Run Android Unit Tests
+        run: |
+          cd recovered_source/android-app
+          chmod +x gradlew
+          ./gradlew testDebugUnitTest --stacktrace
+
       - name: Build Android App (Debug & Release APKs)
         run: |
           cd recovered_source/android-app

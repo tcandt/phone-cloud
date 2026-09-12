@@ -8,6 +8,7 @@ import (
 	"net"
 	"net/url"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/gorilla/websocket"
@@ -15,9 +16,10 @@ import (
 
 // SignalingDialer manages robust WebSocket connections to signaling servers with custom DNS & TLS SNI
 type SignalingDialer struct {
-	resolver       *net.Resolver
-	tlsConfig      *tls.Config
+	resolver         *net.Resolver
+	tlsConfig        *tls.Config
 	handshakeTimeout time.Duration
+	ipIndex          uint32
 }
 
 // NewSignalingDialer initializes custom dual-stack Happy Eyeballs resolver and TLS configuration
@@ -97,36 +99,83 @@ func ParseSignalingURL(raw string, deviceID string, secret string) (string, stri
 	return finalURL, sniHostname, nil
 }
 
-// Dial connects to the signaling server using custom dual-stack Happy Eyeballs dialer and proper TLS SNI
+// Dial connects to the signaling server using round-robin DNS candidate rotation and proper TLS SNI
 func (sd *SignalingDialer) Dial(targetURL string, sniHostname string) (*websocket.Conn, error) {
-	netDialer := &net.Dialer{
-		Timeout:   5 * time.Second,
-		KeepAlive: 30 * time.Second,
-		Resolver:  sd.resolver,
-	}
-
-	tlsConf := sd.tlsConfig.Clone()
-	if sniHostname != "" && net.ParseIP(sniHostname) == nil {
-		tlsConf.ServerName = sniHostname
-	}
-
-	dialer := websocket.Dialer{
-		NetDialContext:   netDialer.DialContext,
-		TLSClientConfig:  tlsConf,
-		HandshakeTimeout: sd.handshakeTimeout,
-		Subprotocols:     nil,
-	}
-
-	conn, resp, err := dialer.Dial(targetURL, nil)
+	u, err := url.Parse(targetURL)
 	if err != nil {
-		if resp != nil {
-			return nil, fmt.Errorf("handshake failed with status %d: %w", resp.StatusCode, err)
-		}
-		return nil, err
+		return nil, fmt.Errorf("invalid target URL %q: %w", targetURL, err)
 	}
 
-	log.Printf("[SignalingDialer] Connected to %s (SNI: %s)", targetURL, sniHostname)
-	return conn, nil
+	host := u.Hostname()
+	port := u.Port()
+	if port == "" {
+		if u.Scheme == "wss" || u.Scheme == "https" {
+			port = "443"
+		} else {
+			port = "80"
+		}
+	}
+
+	// 1. Resolve all A and AAAA addresses with custom dual-stack resolver
+	var targetCandidates []string
+	if net.ParseIP(host) != nil {
+		// Literal IP provided
+		targetCandidates = append(targetCandidates, net.JoinHostPort(host, port))
+	} else {
+		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		ips, resolveErr := sd.resolver.LookupIPAddr(ctx, host)
+		cancel()
+
+		if resolveErr == nil && len(ips) > 0 {
+			// Atomic round-robin index rotation across reconnect attempts
+			startIdx := int(atomic.AddUint32(&sd.ipIndex, 1)) % len(ips)
+			for i := 0; i < len(ips); i++ {
+				idx := (startIdx + i) % len(ips)
+				targetCandidates = append(targetCandidates, net.JoinHostPort(ips[idx].IP.String(), port))
+			}
+		} else {
+			targetCandidates = append(targetCandidates, net.JoinHostPort(host, port))
+		}
+	}
+
+	// 2. Iterate candidates with round-robin failover
+	var lastErr error
+	for _, candidateAddr := range targetCandidates {
+		netDialer := &net.Dialer{
+			Timeout:   5 * time.Second,
+			KeepAlive: 30 * time.Second,
+			Resolver:  sd.resolver,
+		}
+
+		tlsConf := sd.tlsConfig.Clone()
+		if sniHostname != "" && net.ParseIP(sniHostname) == nil {
+			tlsConf.ServerName = sniHostname
+		}
+
+		dialer := websocket.Dialer{
+			NetDialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+				return netDialer.DialContext(ctx, network, candidateAddr)
+			},
+			TLSClientConfig:  tlsConf,
+			HandshakeTimeout: sd.handshakeTimeout,
+			Subprotocols:     nil,
+		}
+
+		conn, resp, err := dialer.Dial(targetURL, nil)
+		if err == nil {
+			log.Printf("[SignalingDialer] Connected to %s via %s (SNI: %s)", targetURL, candidateAddr, sniHostname)
+			return conn, nil
+		}
+
+		lastErr = err
+		if resp != nil {
+			log.Printf("[SignalingDialer] Candidate %s rejected (status %d): %v", candidateAddr, resp.StatusCode, err)
+		} else {
+			log.Printf("[SignalingDialer] Candidate %s failed: %v, attempting next...", candidateAddr, err)
+		}
+	}
+
+	return nil, fmt.Errorf("all resolved candidates failed, last error: %w", lastErr)
 }
 
 // BackoffTracker manages exponential reconnect backoff with reset

@@ -331,12 +331,12 @@ func (s *APIServer) handleConnectClient(w http.ResponseWriter, r *http.Request) 
 			if deviceID != "" {
 				client.ActiveDevice = deviceID
 				s.hub.ForwardToAgent(deviceID, map[string]interface{}{
-					"type":         "client_msg",
 					"message_type": "forward",
 					"client_id":    client.ID,
 					"device_id":    deviceID,
+					"command":      nil,
+					"request_id":   nil,
 					"payload":      msg["payload"],
-					"capabilities": clientCaps,
 				})
 			}
 		case "inject_data":

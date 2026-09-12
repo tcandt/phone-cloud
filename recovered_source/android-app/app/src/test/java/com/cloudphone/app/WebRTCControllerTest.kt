@@ -67,7 +67,7 @@ class WebRTCControllerTest {
             addProperty("sdpMLineIndex", 0)
         }
         val payload = JsonObject().apply {
-            addProperty("type", "candidate")
+            addProperty("type", "ice-candidate")
             add("candidate", candObj)
         }
         val envelope = JsonObject().apply {
@@ -77,6 +77,8 @@ class WebRTCControllerTest {
         }
 
         val parsed = Gson().fromJson(envelope.toString(), JsonObject::class.java)
+        assertEquals("forward", parsed.get("message_type").asString)
+        assertEquals("ice-candidate", parsed.getAsJsonObject("payload").get("type").asString)
         val innerCand = parsed.getAsJsonObject("payload").getAsJsonObject("candidate")
         assertEquals("0", innerCand.get("sdpMid").asString)
         assertEquals(0, innerCand.get("sdpMLineIndex").asInt)

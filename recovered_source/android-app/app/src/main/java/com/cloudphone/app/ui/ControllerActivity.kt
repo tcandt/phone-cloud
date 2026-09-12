@@ -55,6 +55,7 @@ class ControllerActivity : AppCompatActivity(), TextureView.SurfaceTextureListen
     // WebRTC Engine
     private var rootEglBase: EglBase? = null
     private var webRTCManager: WebRTCManager? = null
+    private var cachedIceServers: List<org.webrtc.PeerConnection.IceServer>? = null
 
     private var targetDeviceId: String = ""
     private var serverUrl: String = ""
@@ -75,9 +76,105 @@ class ControllerActivity : AppCompatActivity(), TextureView.SurfaceTextureListen
         setupTouchControl()
         initAudioEngine()
         initWebRTC()
+        fetchTurnConfig()
 
         binding.remoteVideoView.surfaceTextureListener = this
         connectWebSocket()
+    }
+
+    private fun fetchTurnConfig() {
+        val httpUrl = if (serverUrl.startsWith("ws://")) {
+            serverUrl.replace("ws://", "http://")
+        } else if (serverUrl.startsWith("wss://")) {
+            serverUrl.replace("wss://", "https://")
+        } else {
+            serverUrl
+        }
+
+        val turnUrl = "$httpUrl/api/turn"
+        val request = Request.Builder()
+            .url(turnUrl)
+            .apply {
+                if (token.isNotEmpty()) {
+                    addHeader("Authorization", "Bearer $token")
+                }
+            }
+            .build()
+
+        client.newCall(request).enqueue(object : Callback {
+            override fun onFailure(call: Call, e: java.io.IOException) {
+                Log.w(TAG, "Failed to fetch /api/turn: ${e.message}. Trying /api/ice_servers...")
+                fetchIceServersFallback(httpUrl)
+            }
+
+            override fun onResponse(call: Call, response: Response) {
+                response.use {
+                    if (response.isSuccessful) {
+                        val body = response.body?.string() ?: ""
+                        parseAndApplyIceServers(body)
+                    } else {
+                        fetchIceServersFallback(httpUrl)
+                    }
+                }
+            }
+        })
+    }
+
+    private fun fetchIceServersFallback(httpUrl: String) {
+        val iceUrl = "$httpUrl/api/ice_servers"
+        val req = Request.Builder().url(iceUrl).apply {
+            if (token.isNotEmpty()) addHeader("Authorization", "Bearer $token")
+        }.build()
+        client.newCall(req).enqueue(object : Callback {
+            override fun onFailure(call: Call, e: java.io.IOException) {
+                Log.w(TAG, "Failed to fetch ICE servers: ${e.message}")
+            }
+            override fun onResponse(call: Call, response: Response) {
+                response.use {
+                    if (response.isSuccessful) {
+                        val body = response.body?.string() ?: ""
+                        parseAndApplyIceServers(body)
+                    }
+                }
+            }
+        })
+    }
+
+    private fun parseAndApplyIceServers(jsonStr: String) {
+        try {
+            val jsonArray = Gson().fromJson(jsonStr, com.google.gson.JsonArray::class.java) ?: return
+            val servers = mutableListOf<org.webrtc.PeerConnection.IceServer>()
+            for (elem in jsonArray) {
+                if (!elem.isJsonObject) continue
+                val obj = elem.asJsonObject
+                val username = obj.get("username")?.asString
+                val credential = obj.get("credential")?.asString
+
+                val urlsElem = obj.get("urls")
+                val urlList = mutableListOf<String>()
+                if (urlsElem != null && urlsElem.isJsonArray) {
+                    for (u in urlsElem.asJsonArray) {
+                        urlList.add(u.asString)
+                    }
+                } else if (urlsElem != null && urlsElem.isJsonPrimitive) {
+                    urlList.add(urlsElem.asString)
+                }
+
+                for (u in urlList) {
+                    val b = org.webrtc.PeerConnection.IceServer.builder(u)
+                    if (!username.isNullOrEmpty()) b.setUsername(username)
+                    if (!credential.isNullOrEmpty()) b.setPassword(credential)
+                    servers.add(b.createIceServer())
+                }
+            }
+            if (servers.isNotEmpty()) {
+                cachedIceServers = servers
+                webRTCManager?.setIceServers(servers)
+                Log.i(TAG, "Successfully loaded and configured ${servers.size} server ICE/TURN servers")
+            }
+        } catch (e: Throwable) {
+            Log.w(TAG, "Error parsing ICE servers JSON: ${e.message}")
+        }
     }
 
     private fun setupToolbar() {
@@ -151,13 +248,41 @@ class ControllerActivity : AppCompatActivity(), TextureView.SurfaceTextureListen
                     runOnUiThread {
                         val action = response.get("action")?.asString ?: "camera"
                         val status = response.get("status")?.asString ?: "ok"
-                        Toast.makeText(this@ControllerActivity, "Camera $action: $status", Toast.LENGTH_SHORT).show()
+                        val hasSnapshot = response.has("image_base64")
+                        val msg = if (hasSnapshot) "Camera snapshot captured!" else "Camera $action: $status"
+                        Toast.makeText(this@ControllerActivity, msg, Toast.LENGTH_SHORT).show()
                     }
                 }
 
                 override fun onVideoTrackReady(track: VideoTrack) {
                     runOnUiThread {
                         binding.connectingOverlay.visibility = View.GONE
+                    }
+                }
+
+                override fun onAdbOutput(data: ByteArray) {
+                    Log.d(TAG, "ADB channel output: ${data.size} bytes")
+                }
+
+                override fun onFileMessage(message: String) {
+                    Log.i(TAG, "File channel message: $message")
+                }
+
+                override fun onAiCommandResponse(response: JsonObject) {
+                    runOnUiThread {
+                        Toast.makeText(this@ControllerActivity, "AI Command: ${response.get("status")?.asString}", Toast.LENGTH_SHORT).show()
+                    }
+                }
+
+                override fun onCameraStreamStarted() {
+                    runOnUiThread {
+                        Toast.makeText(this@ControllerActivity, "Remote camera streaming started", Toast.LENGTH_SHORT).show()
+                    }
+                }
+
+                override fun onCameraStreamStopped() {
+                    runOnUiThread {
+                        Toast.makeText(this@ControllerActivity, "Remote camera streaming stopped", Toast.LENGTH_SHORT).show()
                     }
                 }
             })
@@ -507,7 +632,7 @@ class ControllerActivity : AppCompatActivity(), TextureView.SurfaceTextureListen
 
                 if (targetDeviceId.isNotEmpty()) {
                     runOnUiThread {
-                        webRTCManager?.startConnection(targetDeviceId)
+                        webRTCManager?.startConnection(targetDeviceId, cachedIceServers)
                     }
                 }
             }
@@ -557,6 +682,12 @@ class ControllerActivity : AppCompatActivity(), TextureView.SurfaceTextureListen
             val json = Gson().fromJson(text, JsonObject::class.java)
             val msgType = json.get("message_type")?.asString ?: json.get("type")?.asString
 
+            // Parse server configuration containing ICE/TURN servers
+            if (msgType == "config" && json.has("ice_servers")) {
+                parseAndApplyIceServers(json.get("ice_servers").toString())
+                return
+            }
+
             if ((msgType == "device_list" || msgType == "device_list_update") && targetDeviceId.isEmpty()) {
                 val devices = json.getAsJsonArray("devices")
                 if (devices != null && devices.size() > 0) {
@@ -565,7 +696,7 @@ class ControllerActivity : AppCompatActivity(), TextureView.SurfaceTextureListen
                     if (targetDeviceId.isNotEmpty()) {
                         runOnUiThread {
                             binding.tvTargetDevice.text = "Target: $targetDeviceId"
-                            webRTCManager?.startConnection(targetDeviceId)
+                            webRTCManager?.startConnection(targetDeviceId, cachedIceServers)
                         }
                     }
                 }
@@ -582,7 +713,7 @@ class ControllerActivity : AppCompatActivity(), TextureView.SurfaceTextureListen
                         if (sdp.isNotEmpty()) {
                             runOnUiThread { webRTCManager?.handleRemoteOffer(sdp) }
                         }
-                    } else if (pType == "candidate") {
+                    } else if (pType == "candidate" || pType == "ice-candidate") {
                         val candObj = payload.getAsJsonObject("candidate")
                         if (candObj != null) {
                             runOnUiThread { webRTCManager?.handleRemoteCandidate(candObj) }
@@ -594,7 +725,7 @@ class ControllerActivity : AppCompatActivity(), TextureView.SurfaceTextureListen
                 if (sdp.isNotEmpty()) {
                     runOnUiThread { webRTCManager?.handleRemoteOffer(sdp) }
                 }
-            } else if (msgType == "candidate") {
+            } else if (msgType == "candidate" || msgType == "ice-candidate") {
                 val candObj = json.getAsJsonObject("candidate")
                 if (candObj != null) {
                     runOnUiThread { webRTCManager?.handleRemoteCandidate(candObj) }
