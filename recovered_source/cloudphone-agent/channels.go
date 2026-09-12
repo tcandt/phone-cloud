@@ -583,7 +583,16 @@ func setupAdbChannel(dc *webrtc.DataChannel, s *WebRTCSession) {
 
 // setupAiCommandChannel executes shell commands requested via P2P
 func setupAiCommandChannel(dc *webrtc.DataChannel, sess *WebRTCSession) {
-	if sess != nil && !sess.Caps.CanShell {
+	if sess == nil {
+		if dc != nil {
+			_ = dc.Close()
+		}
+		return
+	}
+	sess.mu.RLock()
+	canShell := sess.Caps.CanShell
+	sess.mu.RUnlock()
+	if !canShell {
 		log.Printf("[AICommand] Rejected AI command channel: session has no shell capability (ClientID: %s)", sess.ClientID)
 		_ = dc.SendText(`{"error":"Permission denied: Shell execution is forbidden for this session","exit_code":-1}`)
 		_ = dc.Close()
@@ -591,7 +600,10 @@ func setupAiCommandChannel(dc *webrtc.DataChannel, sess *WebRTCSession) {
 	}
 
 	dc.OnMessage(func(msg webrtc.DataChannelMessage) {
-		if sess != nil && !sess.Caps.CanShell {
+		sess.mu.RLock()
+		canShellMsg := sess.Caps.CanShell
+		sess.mu.RUnlock()
+		if !canShellMsg {
 			log.Printf("[AICommand] Dropped command: session lacks shell capability (ClientID: %s)", sess.ClientID)
 			_ = dc.SendText(`{"error":"Permission denied: Shell capability required","exit_code":126}`)
 			return

@@ -176,6 +176,26 @@ func (a *AuthManager) RenameUser(oldUsername, newUsername string) bool {
 	return true
 }
 
+func (a *AuthManager) AssignDevice(username, deviceID string) bool {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+
+	u, exists := a.users[username]
+	if !exists {
+		return false
+	}
+	for _, d := range u.AssignedDevices {
+		if d == deviceID {
+			return true
+		}
+	}
+	u.AssignedDevices = append(u.AssignedDevices, deviceID)
+	if a.store != nil {
+		a.store.SaveUser(u)
+	}
+	return true
+}
+
 func (a *AuthManager) ListUsers() []*User {
 	a.mu.RLock()
 	defer a.mu.RUnlock()

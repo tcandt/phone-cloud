@@ -165,20 +165,31 @@ func TestProtocolConformance_AuthAndPolicy(t *testing.T) {
 		t.Fatalf("Expected 200 for POST /api/user/ai-config, got %d", rec.Code)
 	}
 
-	// 4. GET /api/user/ai-config
+	// 4. Parity: GET /api/user/ai-config returns 405 Method Not Allowed
 	req = httptest.NewRequest(http.MethodGet, "/api/user/ai-config", nil)
 	req.Header.Set("Authorization", "Bearer "+token)
 	rec = httptest.NewRecorder()
 	mux.ServeHTTP(rec, req)
 
-	if rec.Code != http.StatusOK {
-		t.Fatalf("Expected 200 for GET /api/user/ai-config, got %d", rec.Code)
+	if rec.Code != http.StatusMethodNotAllowed {
+		t.Fatalf("Expected 405 for GET /api/user/ai-config, got %d", rec.Code)
 	}
 
-	var aiResp map[string]interface{}
-	_ = json.Unmarshal(rec.Body.Bytes(), &aiResp)
-	if aiResp["model"] != "gpt-4o" || aiResp["api_key"] != "sk-12345" {
-		t.Errorf("AI config parity failed, got: %v", aiResp)
+	// 5. Verification: GET /api/me contains the saved ai_config
+	req = httptest.NewRequest(http.MethodGet, "/api/me", nil)
+	req.Header.Set("Authorization", "Bearer "+token)
+	rec = httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("Expected 200 for GET /api/me, got %d", rec.Code)
+	}
+
+	var meResp map[string]interface{}
+	_ = json.Unmarshal(rec.Body.Bytes(), &meResp)
+	aiResp, _ := meResp["ai_config"].(map[string]interface{})
+	if aiResp["ai_model"] != "gpt-4o" || aiResp["ai_api_key"] != "sk-12345" {
+		t.Errorf("AI config in /api/me parity failed, got: %v", aiResp)
 	}
 }
 

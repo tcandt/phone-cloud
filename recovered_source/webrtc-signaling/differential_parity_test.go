@@ -18,8 +18,8 @@ import (
 )
 
 // TestGateC_DifferentialParity runs the Original v0.3.6 binary side-by-side with
-// the Recovered Signaling Server, feeding identical inputs and performing differential
-// schema, status and deterministic value comparison.
+// the Recovered Signaling Server, executing full workflow scenarios and performing
+// recursive deep-value comparison across all response payloads.
 func TestGateC_DifferentialParity(t *testing.T) {
 	var origBinPath string
 	if runtime.GOOS == "windows" {
@@ -61,7 +61,6 @@ func TestGateC_DifferentialParity(t *testing.T) {
 	cmdOrig := exec.Command(origBinPath,
 		"-port", fmt.Sprintf("%d", portOrig),
 		"-tls=false",
-		"-no-auth",
 		"-data", tempDirOrig,
 	)
 	if err := cmdOrig.Start(); err != nil {
@@ -77,9 +76,9 @@ func TestGateC_DifferentialParity(t *testing.T) {
 	cmdRec := exec.Command(recBinPath,
 		"-port", fmt.Sprintf("%d", portRec),
 		"-tls=false",
-		"-no-auth",
 		"-data", tempDirRec,
 	)
+	cmdRec.Env = append(os.Environ(), "DEV_MODE=true")
 	if err := cmdRec.Start(); err != nil {
 		t.Fatalf("Failed to start recovered binary: %v", err)
 	}
@@ -95,161 +94,416 @@ func TestGateC_DifferentialParity(t *testing.T) {
 
 	client := &http.Client{Timeout: 5 * time.Second}
 
-	// 4. Test Matrix: Compare HTTP Endpoints
-	endpoints := []struct {
-		name   string
-		method string
-		path   string
-		body   string
-	}{
-		{"API_Version", "GET", "/api/version", ""},
-		{"Auth_Status", "GET", "/api/auth-status", ""},
-		{"Default_Settings", "GET", "/api/default_settings", ""},
-		{"License_Status", "GET", "/api/license_status", ""},
-		{"Devices_API", "GET", "/api/devices", ""},
-		{"Devices_Path", "GET", "/devices", ""},
-		{"ICE_Servers", "GET", "/api/ice_servers", ""},
-		{"Login_Empty", "POST", "/api/login", `{"username":"","password":""}`},
-		{"Login_Invalid", "POST", "/api/login", `{"username":"fake","password":"wrong"}`},
-		{"NotFound_Handler", "GET", "/api/nonexistent_test_endpoint", ""},
-		{"Share_List", "GET", "/api/share/list", ""},
-		{"Share_Info_Empty", "GET", "/api/share/info?token=invalid_token_123", ""},
-		{"Tasks_Details_Empty", "GET", "/api/tasks/details?task_id=nonexistent", ""},
-		{"Server_Addresses", "GET", "/api/server/addresses", ""},
-		{"Shortcuts_List", "GET", "/api/shortcuts", ""},
-		{"Tags_List", "GET", "/api/tags", ""},
-		{"Method_Not_Allowed_Delete_Version", "DELETE", "/api/version", ""},
-	}
+	// 4. Obtain Admin Tokens for Both Servers
+	loginPayload := `{"username":"admin","password":"admin123"}`
+	tokenOrig := loginAndGetToken(t, client, fmt.Sprintf("http://127.0.0.1:%d/api/login", portOrig), loginPayload)
+	tokenRec := loginAndGetToken(t, client, fmt.Sprintf("http://127.0.0.1:%d/api/login", portRec), loginPayload)
 
 	type DiffResult struct {
-		Endpoint       string
-		OrigStatus     int
-		RecStatus      int
-		OrigKeys       []string
-		RecKeys        []string
-		StatusMatch    bool
-		SchemaMatch    bool
-		Discrepancies  []string
+		Name          string
+		Endpoint      string
+		OrigStatus    int
+		RecStatus     int
+		StatusMatch   bool
+		DeepMatch     bool
+		Discrepancies []string
 	}
 
 	var results []DiffResult
 
-	for _, tc := range endpoints {
-		t.Run(tc.name, func(t *testing.T) {
-			urlOrig := fmt.Sprintf("http://127.0.0.1:%d%s", portOrig, tc.path)
-			urlRec := fmt.Sprintf("http://127.0.0.1:%d%s", portRec, tc.path)
+	// runCase executes a differential test against both servers with deep-value comparison
+	runCase := func(name, method, path, body, authHeader string) (bodyOrig, bodyRec []byte) {
+		urlOrig := fmt.Sprintf("http://127.0.0.1:%d%s", portOrig, path)
+		urlRec := fmt.Sprintf("http://127.0.0.1:%d%s", portRec, path)
 
-			respOrig, bodyOrig, errOrig := doRequest(client, tc.method, urlOrig, tc.body)
-			if errOrig != nil {
-				t.Fatalf("Error querying original server (%s): %v", tc.name, errOrig)
+		tokenO := tokenOrig
+		tokenR := tokenRec
+		if authHeader == "none" {
+			tokenO = ""
+			tokenR = ""
+		}
+
+		respOrig, bOrig, errOrig := doRequestWithAuth(client, method, urlOrig, body, tokenO)
+		if errOrig != nil {
+			t.Fatalf("[%s] Original request failed: %v", name, errOrig)
+		}
+		respRec, bRec, errRec := doRequestWithAuth(client, method, urlRec, body, tokenR)
+		if errRec != nil {
+			t.Fatalf("[%s] Recovered request failed: %v", name, errRec)
+		}
+
+		diff := DiffResult{
+			Name:        name,
+			Endpoint:    fmt.Sprintf("%s %s", method, path),
+			OrigStatus:  respOrig.StatusCode,
+			RecStatus:   respRec.StatusCode,
+			StatusMatch: respOrig.StatusCode == respRec.StatusCode,
+			DeepMatch:   true,
+		}
+
+		if !diff.StatusMatch {
+			diff.Discrepancies = append(diff.Discrepancies,
+				fmt.Sprintf("Status code mismatch: orig=%d, rec=%d", respOrig.StatusCode, respRec.StatusCode))
+		}
+
+		// Parse JSON if applicable and perform recursive deep-value comparison
+		var jsonOrig, jsonRec interface{}
+		errJOrig := json.Unmarshal(bOrig, &jsonOrig)
+		errJRec := json.Unmarshal(bRec, &jsonRec)
+
+		if errJOrig == nil && errJRec == nil {
+			discs := deepCompareJSON("$", jsonOrig, jsonRec)
+			if len(discs) > 0 {
+				diff.DeepMatch = false
+				diff.Discrepancies = append(diff.Discrepancies, discs...)
 			}
-			respRec, bodyRec, errRec := doRequest(client, tc.method, urlRec, tc.body)
-			if errRec != nil {
-				t.Fatalf("Error querying recovered server (%s): %v", tc.name, errRec)
+		} else if errJOrig != nil && errJRec != nil {
+			// Non-JSON responses: compare raw strings (trimmed)
+			sOrig := strings.TrimSpace(string(bOrig))
+			sRec := strings.TrimSpace(string(bRec))
+			if sOrig != sRec {
+				diff.DeepMatch = false
+				diff.Discrepancies = append(diff.Discrepancies,
+					fmt.Sprintf("Raw body mismatch: orig=%q, rec=%q", sOrig, sRec))
 			}
+		} else {
+			diff.DeepMatch = false
+			diff.Discrepancies = append(diff.Discrepancies,
+				fmt.Sprintf("JSON parse asymmetry: origErr=%v, recErr=%v", errJOrig, errJRec))
+		}
 
-			diff := DiffResult{
-				Endpoint:    tc.path,
-				OrigStatus:  respOrig.StatusCode,
-				RecStatus:   respRec.StatusCode,
-				StatusMatch: respOrig.StatusCode == respRec.StatusCode,
-				SchemaMatch: true,
-			}
+		if !diff.StatusMatch || !diff.DeepMatch {
+			t.Errorf("Differential parity mismatch on [%s %s]:\n  Discrepancies: %v\n  Orig: %s\n  Rec:  %s",
+				method, path, diff.Discrepancies, string(bOrig), string(bRec))
+		} else {
+			t.Logf("[PASS] %s [%s %s] Status: %d | Deep Match: 100%%", name, method, path, diff.OrigStatus)
+		}
 
-			if !diff.StatusMatch {
-				diff.Discrepancies = append(diff.Discrepancies, fmt.Sprintf("HTTP status mismatch: orig=%d, rec=%d", respOrig.StatusCode, respRec.StatusCode))
-				t.Logf("WARN: %s Status mismatch: orig=%d, rec=%d", tc.name, respOrig.StatusCode, respRec.StatusCode)
-			}
-
-			// If JSON, compare JSON keys
-			var jsonOrig, jsonRec map[string]interface{}
-			errJOrig := json.Unmarshal(bodyOrig, &jsonOrig)
-			errJRec := json.Unmarshal(bodyRec, &jsonRec)
-
-			if errJOrig == nil && errJRec == nil {
-				for k := range jsonOrig {
-					diff.OrigKeys = append(diff.OrigKeys, k)
-					if _, ok := jsonRec[k]; !ok {
-						diff.SchemaMatch = false
-						diff.Discrepancies = append(diff.Discrepancies, fmt.Sprintf("Recovered missing key: %q", k))
-					}
-				}
-				for k := range jsonRec {
-					diff.RecKeys = append(diff.RecKeys, k)
-					if _, ok := jsonOrig[k]; !ok {
-						diff.SchemaMatch = false
-						diff.Discrepancies = append(diff.Discrepancies, fmt.Sprintf("Recovered extra key: %q", k))
-					}
-				}
-				for k, vOrig := range jsonOrig {
-					if vRec, ok := jsonRec[k]; ok {
-						if k == "version" || k == "status" || k == "license_source" || k == "activated" {
-							strOrig := fmt.Sprintf("%v", vOrig)
-							strRec := fmt.Sprintf("%v", vRec)
-							if strOrig != strRec {
-								diff.SchemaMatch = false
-								diff.Discrepancies = append(diff.Discrepancies, fmt.Sprintf("Value mismatch on %q: orig=%s, rec=%s", k, strOrig, strRec))
-							}
-						}
-					}
-				}
-			}
-
-			if !diff.StatusMatch || !diff.SchemaMatch {
-				t.Errorf("Differential parity mismatch on %s: %v", tc.path, diff.Discrepancies)
-			}
-
-			results = append(results, diff)
-			t.Logf("Endpoint [%s %s]: Orig=%d, Rec=%d, SchemaMatch=%v, Discrepancies=%v\nOrigBody: %s\nRecBody:  %s",
-				tc.method, tc.path, diff.OrigStatus, diff.RecStatus, diff.SchemaMatch, diff.Discrepancies, string(bodyOrig), string(bodyRec))
-		})
+		results = append(results, diff)
+		return bOrig, bRec
 	}
 
-	// 5. Test WebSocket Protocol Differential Comparison
+	// 5. Test Suite 1: Read-Only System Endpoints (Deep Parity)
+	t.Run("System_Endpoints", func(t *testing.T) {
+		// Public endpoints
+		runCase("API_Version", "GET", "/api/version", "", "none")
+		runCase("Auth_Status", "GET", "/api/auth-status", "", "none")
+		runCase("License_Status", "GET", "/api/license_status", "", "none")
+		runCase("Devices_API_MethodNotAllowed", "GET", "/api/devices", "", "none")
+		runCase("NotFound_Handler", "GET", "/api/nonexistent_parity_probe", "", "none")
+		runCase("Method_Not_Allowed_Delete_Version", "DELETE", "/api/version", "", "none")
+
+		// Protected endpoints (Unauthenticated -> 401 Unauthorized)
+		runCase("Default_Settings_Unauth", "GET", "/api/default_settings", "", "none")
+		runCase("Devices_Root_Path_Unauth", "GET", "/devices", "", "none")
+		runCase("ICE_Servers_Unauth", "GET", "/api/ice_servers", "", "none")
+		runCase("Server_Addresses_Unauth", "GET", "/api/server/addresses", "", "none")
+		runCase("Shortcuts_List_Unauth", "GET", "/api/shortcuts", "", "none")
+		runCase("Tags_List_Unauth", "GET", "/api/tags", "", "none")
+		runCase("Share_List_Unauth", "GET", "/api/share/list", "", "none")
+
+		// Protected endpoints (Authenticated -> 200 OK deep schema & value match)
+		runCase("Default_Settings_Auth", "GET", "/api/default_settings", "", "admin")
+		runCase("Devices_Root_Path_Auth", "GET", "/devices", "", "admin")
+		runCase("ICE_Servers_Auth", "GET", "/api/ice_servers", "", "admin")
+		runCase("Server_Addresses_Auth", "GET", "/api/server/addresses", "", "admin")
+		runCase("Shortcuts_List_Auth", "GET", "/api/shortcuts", "", "admin")
+		runCase("Tags_List_Auth", "GET", "/api/tags", "", "admin")
+		runCase("Share_List_Auth", "GET", "/api/share/list", "", "admin")
+	})
+
+	// 6. Test Suite 2: Authentication & Negative Login Cases
+	t.Run("Auth_Validation", func(t *testing.T) {
+		runCase("Login_Empty_Credentials", "POST", "/api/login", `{"username":"","password":""}`, "none")
+		runCase("Login_Invalid_Credentials", "POST", "/api/login", `{"username":"nonexistent","password":"wrong"}`, "none")
+	})
+
+	// 7. Test Suite 3: Admin User Lifecycle Differential Parity
+	t.Run("Admin_User_Lifecycle", func(t *testing.T) {
+		// 1. Create User
+		runCase("Admin_User_Create", "POST", "/api/admin/users/create",
+			`{"username":"diff_user1","password":"diff_pass_123","role":"user","note":"Differential test user"}`, "admin")
+
+		// 2. Update Note
+		runCase("Admin_User_UpdateNote", "POST", "/api/admin/users/update_note",
+			`{"username":"diff_user1","note":"Updated note from diff test"}`, "admin")
+
+		// 3. Update Policy
+		runCase("Admin_User_UpdatePolicy", "POST", "/api/admin/users/update",
+			`{"username":"diff_user1","forbid_bitrate":true,"forbid_fps":true}`, "admin")
+
+		// 4. Assign Device
+		runCase("Admin_Assign_Device", "POST", "/api/admin/assign",
+			`{"username":"diff_user1","device_id":"test_phone_01"}`, "admin")
+
+		// 5. Reset Password
+		runCase("Admin_User_ResetPassword", "POST", "/api/admin/users/reset_password",
+			`{"username":"diff_user1","password":"new_diff_pass_456"}`, "admin")
+
+		// 6. Kick User
+		runCase("Admin_User_Kick", "POST", "/api/admin/users/kick",
+			`{"username":"diff_user1","device_id":"test_phone_01"}`, "admin")
+
+		// 7. Delete User
+		runCase("Admin_User_Delete", "POST", "/api/admin/users/delete",
+			`{"username":"diff_user1"}`, "admin")
+	})
+
+	// 8. Test Suite 4: Share Lifecycle Differential Parity
+	t.Run("Share_Lifecycle", func(t *testing.T) {
+		// 1. Share Info Nonexistent (404)
+		runCase("Share_Info_Invalid", "GET", "/api/share/info?token=invalid_token_999", "", "none")
+
+		// 2. Share Create Full Control
+		bOrig, bRec := runCase("Share_Create_Full", "POST", "/api/share/create",
+			`{"device_id":"diff_phone_01","view_only":false}`, "admin")
+
+		var sOrig, sRec struct {
+			Data struct {
+				Token string `json:"token"`
+			} `json:"data"`
+		}
+		json.Unmarshal(bOrig, &sOrig)
+		json.Unmarshal(bRec, &sRec)
+
+		tokenO := sOrig.Data.Token
+		tokenR := sRec.Data.Token
+
+		// 3. Share Update
+		if tokenO != "" && tokenR != "" {
+			urlOrig := fmt.Sprintf("http://127.0.0.1:%d/api/share/update", portOrig)
+			urlRec := fmt.Sprintf("http://127.0.0.1:%d/api/share/update", portRec)
+			bodyO := fmt.Sprintf(`{"token":%q,"view_only":true,"forbid_bitrate":true}`, tokenO)
+			bodyR := fmt.Sprintf(`{"token":%q,"view_only":true,"forbid_bitrate":true}`, tokenR)
+
+			_, bo, _ := doRequestWithAuth(client, "POST", urlOrig, bodyO, tokenOrig)
+			_, br, _ := doRequestWithAuth(client, "POST", urlRec, bodyR, tokenRec)
+
+			var jo, jr interface{}
+			json.Unmarshal(bo, &jo)
+			json.Unmarshal(br, &jr)
+			discs := deepCompareJSON("Share_Update", jo, jr)
+			if len(discs) > 0 {
+				t.Errorf("Share_Update deep discrepancy: %v", discs)
+			} else {
+				t.Logf("[PASS] Share_Update Deep Match: 100%%")
+			}
+
+			// 4. Share Revoke
+			urlRevO := fmt.Sprintf("http://127.0.0.1:%d/api/share/revoke", portOrig)
+			urlRevR := fmt.Sprintf("http://127.0.0.1:%d/api/share/revoke", portRec)
+			bodyRevO := fmt.Sprintf(`{"token":%q}`, tokenO)
+			bodyRevR := fmt.Sprintf(`{"token":%q}`, tokenR)
+
+			_, boRev, _ := doRequestWithAuth(client, "POST", urlRevO, bodyRevO, tokenOrig)
+			_, brRev, _ := doRequestWithAuth(client, "POST", urlRevR, bodyRevR, tokenRec)
+
+			var joRev, jrRev interface{}
+			json.Unmarshal(boRev, &joRev)
+			json.Unmarshal(brRev, &jrRev)
+			discsRev := deepCompareJSON("Share_Revoke", joRev, jrRev)
+			if len(discsRev) > 0 {
+				t.Errorf("Share_Revoke deep discrepancy: %v", discsRev)
+			} else {
+				t.Logf("[PASS] Share_Revoke Deep Match: 100%%")
+			}
+		}
+
+		// 5. Share Revoke with non-existent token (should be 404 on both)
+		runCase("Share_Revoke_Nonexistent", "POST", "/api/share/revoke",
+			`{"token":"nonexistent_token_123"}`, "admin")
+	})
+
+	// 9. Test Suite 5: Tasks Lifecycle Differential Parity
+	t.Run("Tasks_Lifecycle", func(t *testing.T) {
+		// 1. Tasks GET (405 Method Not Allowed)
+		runCase("Tasks_MethodNotAllowed_GET", "GET", "/api/tasks", "", "admin")
+
+		// 2. Tasks POST empty targets (400 Bad Request)
+		runCase("Tasks_Empty_Targets", "POST", "/api/tasks", `{"targets":[],"action":"reboot"}`, "admin")
+
+		// 3. Tasks POST valid dispatch
+		bOrig, bRec := runCase("Tasks_Create_Valid", "POST", "/api/tasks",
+			`{"targets":["diff_phone_01"],"action":"reboot"}`, "admin")
+
+		var tOrig, tRec struct {
+			TaskID string `json:"task_id"`
+		}
+		json.Unmarshal(bOrig, &tOrig)
+		json.Unmarshal(bRec, &tRec)
+
+		// 4. Tasks Details Query
+		if tOrig.TaskID != "" && tRec.TaskID != "" {
+			urlDetO := fmt.Sprintf("http://127.0.0.1:%d/api/tasks/details?task_id=%s", portOrig, tOrig.TaskID)
+			urlDetR := fmt.Sprintf("http://127.0.0.1:%d/api/tasks/details?task_id=%s", portRec, tRec.TaskID)
+
+			_, boDet, _ := doRequestWithAuth(client, "GET", urlDetO, "", tokenOrig)
+			_, brDet, _ := doRequestWithAuth(client, "GET", urlDetR, "", tokenRec)
+
+			var joDet, jrDet interface{}
+			json.Unmarshal(boDet, &joDet)
+			json.Unmarshal(brDet, &jrDet)
+			discs := deepCompareJSON("Tasks_Details", joDet, jrDet)
+			if len(discs) > 0 {
+				t.Errorf("Tasks_Details deep discrepancy: %v", discs)
+			} else {
+				t.Logf("[PASS] Tasks_Details Deep Match: 100%%")
+			}
+		}
+
+		// 5. Tasks Details Nonexistent (with admin auth -> 404 Task not found)
+		runCase("Tasks_Details_Nonexistent", "GET", "/api/tasks/details?task_id=nonexistent", "", "admin")
+	})
+
+	// 10. Test Suite 6: User AI Config Differential Parity
+	t.Run("User_AI_Config", func(t *testing.T) {
+		// 1. GET not allowed
+		runCase("User_AIConfig_GET_405", "GET", "/api/user/ai-config", "", "admin")
+
+		// 2. POST update config
+		runCase("User_AIConfig_POST_Success", "POST", "/api/user/ai-config",
+			`{"provider":"openai","model":"gpt-4"}`, "admin")
+	})
+
+	// 11. Test Suite 7: WebSocket Agent Registration Handshake
 	t.Run("WebSocket_AgentRegistration_Differential", func(t *testing.T) {
 		wsOrigURL := url.URL{Scheme: "ws", Host: fmt.Sprintf("127.0.0.1:%d", portOrig), Path: "/register_agent"}
 		wsRecURL := url.URL{Scheme: "ws", Host: fmt.Sprintf("127.0.0.1:%d", portRec), Path: "/register_agent"}
 
-		// Connect to Original
 		connOrig, respOrig, errOrig := websocket.DefaultDialer.Dial(wsOrigURL.String(), nil)
-		if errOrig != nil {
-			t.Logf("Original WS dial result: err=%v, resp=%v", errOrig, respOrig)
-		} else {
+		if errOrig == nil {
 			defer connOrig.Close()
 		}
-
-		// Connect to Recovered
 		connRec, respRec, errRec := websocket.DefaultDialer.Dial(wsRecURL.String(), nil)
-		if errRec != nil {
-			t.Logf("Recovered WS dial result: err=%v, resp=%v", errRec, respRec)
-		} else {
+		if errRec == nil {
 			defer connRec.Close()
 		}
 
 		if (errOrig == nil) != (errRec == nil) {
-			t.Errorf("WebSocket handshake mismatch: origErr=%v, recErr=%v", errOrig, errRec)
+			t.Errorf("WebSocket handshake mismatch: origErr=%v, recErr=%v (respOrig=%v, respRec=%v)",
+				errOrig, errRec, respOrig, respRec)
 		} else {
-			t.Logf("WebSocket handshake status matches: both connected successfully")
+			t.Logf("[PASS] WebSocket agent registration handshake matches 1:1")
 		}
 	})
 
-	// 6. Print Consolidated Gate C Differential Parity Report
-	t.Logf("\n=== GATE C: ORIGINAL VS RECOVERED DIFFERENTIAL PARITY REPORT ===")
+	// 12. Print Consolidated Gate C Differential Parity Report
+	t.Logf("\n==========================================================================")
+	t.Logf("=== GATE C: COMPREHENSIVE ORIGINAL VS RECOVERED DEEP PARITY REPORT ===")
+	t.Logf("==========================================================================")
 	matchCount := 0
 	for _, r := range results {
 		status := "PASS"
-		if !r.StatusMatch || !r.SchemaMatch {
+		if !r.StatusMatch || !r.DeepMatch {
 			status = "DIFF"
 		} else {
 			matchCount++
 		}
-		t.Logf("[%s] %s | OrigStatus: %d, RecStatus: %d | Discrepancies: %v",
-			status, r.Endpoint, r.OrigStatus, r.RecStatus, r.Discrepancies)
+		t.Logf("[%s] %-30s | %-32s | Orig: %d, Rec: %d | Discrepancies: %v",
+			status, r.Name, r.Endpoint, r.OrigStatus, r.RecStatus, r.Discrepancies)
 	}
-	t.Logf("Parity Summary: %d/%d endpoints exactly matched original v0.3.6\n", matchCount, len(results))
+	t.Logf("==========================================================================")
+	t.Logf("GATE C SUMMARY: %d/%d test cases perfectly matched Original Binary v0.3.6\n",
+		matchCount, len(results))
+	t.Logf("==========================================================================\n")
 }
 
-func doRequest(client *http.Client, method, targetURL, body string) (*http.Response, []byte, error) {
+// deepCompareJSON recursively traverses two decoded JSON values and returns a list
+// of all structural and deep value discrepancies, ignoring dynamic ephemeral fields.
+func deepCompareJSON(path string, valOrig, valRec interface{}) []string {
+	var discs []string
+
+	// Dynamic fields that naturally vary between separate instances or runtime sessions:
+	// - Ephemeral IP addresses and ports
+	// - Ephemeral timestamps
+	// - Generated UUIDs, card codes, tokens, and task IDs
+	isDynamicField := func(p string) bool {
+		lower := strings.ToLower(p)
+		return strings.HasSuffix(lower, "addresses") ||
+			strings.HasSuffix(lower, "current") ||
+			strings.HasSuffix(lower, "task_id") ||
+			strings.HasSuffix(lower, "card_code") ||
+			strings.HasSuffix(lower, "share_url") ||
+			strings.HasSuffix(lower, "token") ||
+			strings.HasSuffix(lower, "token_id") ||
+			strings.HasSuffix(lower, "created_at") ||
+			strings.HasSuffix(lower, "expires_at") ||
+			strings.HasSuffix(lower, "updated_at") ||
+			strings.HasSuffix(lower, "days_remaining") ||
+			strings.HasSuffix(lower, "first_seen") ||
+			strings.HasSuffix(lower, "last_seen")
+	}
+
+	if isDynamicField(path) {
+		// Both must exist and have equivalent broad type
+		if (valOrig == nil) != (valRec == nil) {
+			return []string{fmt.Sprintf("Dynamic field nil asymmetry at %s: orig=%v, rec=%v", path, valOrig, valRec)}
+		}
+		return nil
+	}
+
+	switch orig := valOrig.(type) {
+	case map[string]interface{}:
+		rec, ok := valRec.(map[string]interface{})
+		if !ok {
+			return []string{fmt.Sprintf("Type mismatch at %s: orig=map, rec=%T", path, valRec)}
+		}
+		// Verify missing keys in recovered
+		for k, vOrig := range orig {
+			fieldPath := path + "." + k
+			if vRec, exists := rec[k]; !exists {
+				discs = append(discs, fmt.Sprintf("Recovered missing key at %s", fieldPath))
+			} else {
+				discs = append(discs, deepCompareJSON(fieldPath, vOrig, vRec)...)
+			}
+		}
+		// Verify extra keys in recovered
+		for k := range rec {
+			fieldPath := path + "." + k
+			if _, exists := orig[k]; !exists {
+				discs = append(discs, fmt.Sprintf("Recovered unexpected extra key at %s", fieldPath))
+			}
+		}
+
+	case []interface{}:
+		rec, ok := valRec.([]interface{})
+		if !ok {
+			return []string{fmt.Sprintf("Type mismatch at %s: orig=[]interface{}, rec=%T", path, valRec)}
+		}
+		if len(orig) != len(rec) {
+			return []string{fmt.Sprintf("Slice length mismatch at %s: orig=%d, rec=%d", path, len(orig), len(rec))}
+		}
+		for i := range orig {
+			discs = append(discs, deepCompareJSON(fmt.Sprintf("%s[%d]", path, i), orig[i], rec[i])...)
+		}
+
+	default:
+		// Primitive comparison (string, float64, bool, nil)
+		sOrig := fmt.Sprintf("%v", valOrig)
+		sRec := fmt.Sprintf("%v", valRec)
+		if sOrig != sRec {
+			discs = append(discs, fmt.Sprintf("Value mismatch at %s: orig=%q, rec=%q", path, sOrig, sRec))
+		}
+	}
+
+	return discs
+}
+
+func loginAndGetToken(t *testing.T, client *http.Client, loginURL, payload string) string {
+	resp, err := client.Post(loginURL, "application/json", strings.NewReader(payload))
+	if err != nil {
+		t.Fatalf("Login failed on %s: %v", loginURL, err)
+	}
+	defer resp.Body.Close()
+	var result map[string]interface{}
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		t.Fatalf("Failed to parse login response from %s: %v", loginURL, err)
+	}
+	token, _ := result["token"].(string)
+	return token
+}
+
+func doRequestWithAuth(client *http.Client, method, targetURL, body, token string) (*http.Response, []byte, error) {
 	var bodyReader io.Reader
 	if body != "" {
 		bodyReader = strings.NewReader(body)
@@ -260,6 +514,9 @@ func doRequest(client *http.Client, method, targetURL, body string) (*http.Respo
 	}
 	if body != "" {
 		req.Header.Set("Content-Type", "application/json")
+	}
+	if token != "" {
+		req.Header.Set("Authorization", "Bearer "+token)
 	}
 	resp, err := client.Do(req)
 	if err != nil {

@@ -94,6 +94,8 @@ type ShareRecord struct {
 	CreatedAt       time.Time              `json:"created_at"`
 	Creator         string                 `json:"creator"`
 	GuestSettings   map[string]interface{} `json:"guest_settings,omitempty"`
+	CardCode        string                 `json:"card_code,omitempty"`
+	AccessMode      string                 `json:"access_mode,omitempty"`
 }
 
 // Tag represents a device categorization tag
@@ -121,9 +123,10 @@ type UserPolicy struct {
 
 // AIConfig represents LLM/AI settings for a user
 type AIConfig struct {
-	BaseURL string `json:"base_url"`
-	APIKey  string `json:"api_key"`
-	Model   string `json:"model"`
+	BaseURL  string `json:"base_url"`
+	APIKey   string `json:"api_key"`
+	Model    string `json:"model"`
+	Provider string `json:"provider,omitempty"`
 }
 
 // StoredFileItem represents a server-stored file for batch distribution
@@ -137,17 +140,19 @@ type StoredFileItem struct {
 type BatchTask struct {
 	TaskID    string                       `json:"task_id"`
 	Type      string                       `json:"type"`
-	Targets   []string                     `json:"targets"`
 	Payload   string                       `json:"payload"`
-	DestPath  string                       `json:"dest_path,omitempty"`
-	Status    string                       `json:"status"`
 	CreatedAt time.Time                    `json:"created_at"`
 	Devices   map[string]*TaskDeviceStatus `json:"devices"`
+	Targets   []string                     `json:"-"`
+	DestPath  string                       `json:"-"`
+	Status    string                       `json:"-"`
 }
 
 // TaskDeviceStatus represents progress of a task on a single device
 type TaskDeviceStatus struct {
-	Status   string `json:"status"` // "pending", "running", "success", "failed"
-	Progress int    `json:"progress"`
-	Message  string `json:"message,omitempty"`
+	DeviceID  string    `json:"device_id"`
+	Status    string    `json:"status"`
+	Progress  int       `json:"progress"`
+	Result    string    `json:"result"`
+	UpdatedAt time.Time `json:"updated_at"`
 }

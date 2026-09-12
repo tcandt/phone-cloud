@@ -192,7 +192,10 @@ func (s *WebRTCSession) setupInputChannel(dc *webrtc.DataChannel) {
 		return
 	}
 	dc.OnMessage(func(msg webrtc.DataChannelMessage) {
-		if !s.Caps.CanControl {
+		s.mu.RLock()
+		canControl := s.Caps.CanControl
+		s.mu.RUnlock()
+		if !canControl {
 			log.Printf("[Agent] Input rejected: session does not have CanControl permission (view-only)")
 			return
 		}
@@ -236,7 +239,10 @@ func (s *WebRTCSession) setupClipboardChannel(dc *webrtc.DataChannel) {
 		return
 	}
 	dc.OnMessage(func(msg webrtc.DataChannelMessage) {
-		if !s.Caps.CanClipboard {
+		s.mu.RLock()
+		canClipboard := s.Caps.CanClipboard
+		s.mu.RUnlock()
+		if !canClipboard {
 			log.Printf("[Agent] Clipboard rejected: session does not have CanClipboard permission")
 			return
 		}

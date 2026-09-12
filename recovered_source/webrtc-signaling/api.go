@@ -299,14 +299,21 @@ func (s *APIServer) handleConnectClient(w http.ResponseWriter, r *http.Request) 
 			continue
 		}
 
-		// Enforce view-only restrictions on share links
-		if activeShare != nil && activeShare.ViewOnly {
-			if msgType == "command" || msgType == "group_control_event" {
-				_ = conn.WriteJSON(SignalingMessage{
-					MessageType: "error",
-					Error:       "Action forbidden: share link is in view-only mode",
-				})
-				continue
+		// Enforce view-only restrictions on share links with real-time dynamic refresh
+		if activeShare != nil {
+			if s.store != nil {
+				if refreshed := s.store.GetShare(activeShare.Token); refreshed != nil {
+					activeShare = refreshed
+				}
+			}
+			if activeShare.ViewOnly {
+				if msgType == "command" || msgType == "group_control_event" || msgType == "control" {
+					_ = conn.WriteJSON(SignalingMessage{
+						MessageType: "error",
+						Error:       "Action forbidden: share link is in view-only mode",
+					})
+					continue
+				}
 			}
 		}
 
@@ -644,7 +651,7 @@ func (s *APIServer) handleDevicesRoot(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if !authenticated && activeShare == nil && !s.auth.noAuth {
-		http.Error(w, "Unauthorized: valid session token or active share link required", http.StatusUnauthorized)
+		http.Error(w, "Unauthorized", http.StatusUnauthorized)
 		return
 	}
 
@@ -682,12 +689,12 @@ func (s *APIServer) handleDevicesRoot(w http.ResponseWriter, r *http.Request) {
 
 // GET /api/devices - original v0.3.6 disallows GET on /api/devices (only GET /devices is used for list)
 func (s *APIServer) handleDevices(w http.ResponseWriter, r *http.Request) {
-	if _, ok := s.authenticateRequest(r); !ok {
-		http.Error(w, "Unauthorized", http.StatusUnauthorized)
+	if r.Method == http.MethodGet {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
-	if r.Method == http.MethodGet {
-		http.Error(w, "Method Not Allowed", http.StatusMethodNotAllowed)
+	if _, ok := s.authenticateRequest(r); !ok {
+		http.Error(w, "Unauthorized", http.StatusUnauthorized)
 		return
 	}
 	devices := s.hub.GetAllDevices()
@@ -832,17 +839,30 @@ func (s *APIServer) handleTasks(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		var req struct {
-			Type     string   `json:"type"`
-			Targets  []string `json:"targets"`
-			Payload  string   `json:"payload"`
-			DestPath string   `json:"dest_path"`
+			Type            string   `json:"type"`
+			Action          string   `json:"action"`
+			Targets         []string `json:"targets"`
+			TargetDeviceIDs []string `json:"target_device_ids"`
+			Payload         string   `json:"payload"`
+			DestPath        string   `json:"dest_path"`
+			ApkFile         string   `json:"apk_file"`
 		}
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 			http.Error(w, "Invalid task request: "+err.Error(), http.StatusBadRequest)
 			return
 		}
+		if len(req.Targets) == 0 && len(req.TargetDeviceIDs) > 0 {
+			req.Targets = req.TargetDeviceIDs
+		}
+		if req.Payload == "" && req.ApkFile != "" {
+			req.Payload = req.ApkFile
+		}
+		if len(req.Targets) == 0 {
+			http.Error(w, "Targets cannot be empty", http.StatusBadRequest)
+			return
+		}
 
-		taskID := uuid.New().String()
+		taskID := "task_" + time.Now().Format("20060102150405") + "_" + uuid.New().String()[:16]
 		task := &BatchTask{
 			TaskID:    taskID,
 			Type:      req.Type,
@@ -855,10 +875,23 @@ func (s *APIServer) handleTasks(w http.ResponseWriter, r *http.Request) {
 		}
 
 		for _, t := range req.Targets {
-			task.Devices[t] = &TaskDeviceStatus{
-				Status:   "pending",
-				Progress: 0,
-				Message:  "Queued",
+			dev, ok := s.hub.GetDevice(t)
+			if ok && dev != nil && dev.Online {
+				task.Devices[t] = &TaskDeviceStatus{
+					DeviceID:  t,
+					Status:    "running",
+					Progress:  0,
+					Result:    "",
+					UpdatedAt: time.Now(),
+				}
+			} else {
+				task.Devices[t] = &TaskDeviceStatus{
+					DeviceID:  t,
+					Status:    "failed",
+					Progress:  0,
+					Result:    "Device offline",
+					UpdatedAt: time.Now(),
+				}
 			}
 		}
 
@@ -869,6 +902,10 @@ func (s *APIServer) handleTasks(w http.ResponseWriter, r *http.Request) {
 		// Dispatch to target devices asynchronously
 		go func() {
 			for _, target := range req.Targets {
+				dev, ok := s.hub.GetDevice(target)
+				if !ok || dev == nil || !dev.Online {
+					continue
+				}
 				task.Devices[target].Status = "running"
 				task.Devices[target].Progress = 50
 
@@ -902,10 +939,13 @@ func (s *APIServer) handleTasks(w http.ResponseWriter, r *http.Request) {
 				if sent {
 					task.Devices[target].Status = "success"
 					task.Devices[target].Progress = 100
-					task.Devices[target].Message = "Completed"
+					task.Devices[target].Result = "Success"
+					task.Devices[target].UpdatedAt = time.Now()
 				} else {
 					task.Devices[target].Status = "failed"
-					task.Devices[target].Message = "Device unreachable"
+					task.Devices[target].Progress = 0
+					task.Devices[target].Result = "Device offline"
+					task.Devices[target].UpdatedAt = time.Now()
 				}
 			}
 			task.Status = "completed"
@@ -927,6 +967,10 @@ func (s *APIServer) handleTasks(w http.ResponseWriter, r *http.Request) {
 
 // GET /api/tasks/details?task_id=...
 func (s *APIServer) handleTaskDetails(w http.ResponseWriter, r *http.Request) {
+	if _, ok := s.authenticateRequest(r); !ok {
+		http.Error(w, "Unauthorized", http.StatusUnauthorized)
+		return
+	}
 	taskID := r.URL.Query().Get("task_id")
 	if taskID == "" {
 		http.Error(w, "task_id required", http.StatusBadRequest)
@@ -962,24 +1006,14 @@ func (s *APIServer) handleUserAIConfig(w http.ResponseWriter, r *http.Request) {
 		if s.store != nil {
 			s.store.SaveAIConfig(username, &cfg)
 		}
-		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write([]byte("Saved"))
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{
+			"status": "success",
+		})
 		return
 	}
 
-	// GET
-	var cfg *AIConfig
-	if s.store != nil {
-		cfg = s.store.GetAIConfig(username)
-	}
-	if cfg == nil {
-		cfg = &AIConfig{
-			BaseURL: "https://api.openai.com/v1",
-			Model:   "gpt-4o",
-		}
-	}
-	w.Header().Set("Content-Type", "application/json")
-	_ = json.NewEncoder(w).Encode(cfg)
+	http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 }
 
 // POST /api/admin/users/rename
@@ -992,15 +1026,30 @@ func (s *APIServer) handleAdminUserRename(w http.ResponseWriter, r *http.Request
 	var req struct {
 		OldUsername string `json:"old_username"`
 		NewUsername string `json:"new_username"`
+		Username    string `json:"username"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.NewUsername == "" {
-		http.Error(w, "Invalid request", http.StatusBadRequest)
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "Invalid JSON", http.StatusBadRequest)
+		return
+	}
+	oldName := req.OldUsername
+	if oldName == "" {
+		oldName = req.Username
+	}
+	if oldName == "" {
+		http.Error(w, "Username cannot be empty", http.StatusBadRequest)
+		return
+	}
+	if req.NewUsername == "" {
+		http.Error(w, "New username cannot be empty", http.StatusBadRequest)
 		return
 	}
 
-	if s.auth.RenameUser(req.OldUsername, req.NewUsername) {
-		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write([]byte("Renamed"))
+	if s.auth.RenameUser(oldName, req.NewUsername) {
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{
+			"status": "success",
+		})
 	} else {
 		http.Error(w, "User not found", http.StatusNotFound)
 	}
@@ -1027,6 +1076,7 @@ func (s *APIServer) handleAdminUserUpdate(w http.ResponseWriter, r *http.Request
 		return
 	}
 
+	expStr := "0001-01-01T00:00:00Z"
 	if s.store != nil {
 		s.store.SaveUserPolicy(req.Username, &UserPolicy{
 			ForbidBitrate:    req.ForbidBitrate,
@@ -1036,15 +1086,32 @@ func (s *APIServer) handleAdminUserUpdate(w http.ResponseWriter, r *http.Request
 			Settings:         req.Settings,
 		})
 
-		user := s.store.GetUser(req.Username)
-		if user != nil && req.ExpireSeconds > 0 {
-			user.ExpiresAt = time.Now().Add(time.Duration(req.ExpireSeconds) * time.Second).Format(time.RFC3339)
-			s.store.SaveUser(user)
+		targetUser := s.store.GetUser(req.Username)
+		if targetUser != nil {
+			if req.ExpireSeconds > 0 {
+				targetUser.ExpiresAt = time.Now().Add(time.Duration(req.ExpireSeconds) * time.Second).Format(time.RFC3339)
+				s.store.SaveUser(targetUser)
+			}
+			if targetUser.ExpiresAt != "" {
+				expStr = targetUser.ExpiresAt
+			}
 		}
 	}
 
-	w.WriteHeader(http.StatusOK)
-	_, _ = w.Write([]byte("Updated"))
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]interface{}{
+		"code": 0,
+		"msg":  "success",
+		"data": map[string]interface{}{
+			"username":          req.Username,
+			"forbid_bitrate":    req.ForbidBitrate,
+			"forbid_fps":        req.ForbidFPS,
+			"forbid_resolution": req.ForbidResolution,
+			"forbid_audio":      req.ForbidAudio,
+			"settings":          req.Settings,
+			"expires_at":        expStr,
+		},
+	})
 }
 
 // POST /api/admin/users/update_note
@@ -1070,8 +1137,10 @@ func (s *APIServer) handleAdminUserUpdateNote(w http.ResponseWriter, r *http.Req
 			s.store.SaveUser(user)
 		}
 	}
-	w.WriteHeader(http.StatusOK)
-	_, _ = w.Write([]byte("Note updated"))
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]interface{}{
+		"status": "success",
+	})
 }
 
 // POST /api/admin/users/kick
@@ -1089,8 +1158,10 @@ func (s *APIServer) handleAdminUserKick(w http.ResponseWriter, r *http.Request) 
 
 	s.hub.KickUser(req.Username, req.DeviceID)
 	s.hub.KickClientsByUserID(req.Username)
-	w.WriteHeader(http.StatusOK)
-	_, _ = w.Write([]byte("Kicked"))
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]interface{}{
+		"status": "success",
+	})
 }
 
 // POST /api/share/update
@@ -1103,6 +1174,7 @@ func (s *APIServer) handleShareUpdate(w http.ResponseWriter, r *http.Request) {
 		ForbidAudio      bool                   `json:"forbid_audio"`
 		ViewOnly         bool                   `json:"view_only"`
 		CanControl       *bool                  `json:"can_control"`
+		AccessMode       string                 `json:"access_mode"`
 		GuestSettings    map[string]interface{} `json:"guest_settings"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.Token == "" {
@@ -1119,6 +1191,9 @@ func (s *APIServer) handleShareUpdate(w http.ResponseWriter, r *http.Request) {
 			} else if req.ViewOnly {
 				share.ViewOnly = true
 			}
+			if req.AccessMode != "" {
+				share.AccessMode = req.AccessMode
+			}
 			s.store.SaveShare(share)
 
 			// Real-time capability update pushed to active WebRTC agent sessions
@@ -1129,14 +1204,43 @@ func (s *APIServer) handleShareUpdate(w http.ResponseWriter, r *http.Request) {
 				"can_file":      canControl && share.AllowFileTx,
 				"can_shell":     false,
 			})
+
+			mode := share.AccessMode
+			if mode == "" {
+				mode = "full"
+			}
+			expStr := "0001-01-01T00:00:00Z"
+			if !share.ExpiresAt.IsZero() {
+				expStr = share.ExpiresAt.Format(time.RFC3339Nano)
+			}
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(map[string]interface{}{
+				"code": 0,
+				"msg":  "success",
+				"data": map[string]interface{}{
+					"token_id":          share.Token,
+					"card_code":         share.CardCode,
+					"device_id":         share.DeviceID,
+					"creator":           share.Creator,
+					"created_at":        share.CreatedAt.Format(time.RFC3339Nano),
+					"expires_at":        expStr,
+					"access_mode":       mode,
+					"require_password":  share.RequirePassword,
+					"allow_clipboard":   share.AllowClipboard,
+					"allow_file_tx":     share.AllowFileTx,
+					"forbid_bitrate":    req.ForbidBitrate,
+					"forbid_fps":        req.ForbidFPS,
+					"forbid_resolution": req.ForbidResolution,
+					"forbid_audio":      req.ForbidAudio,
+					"description":       "",
+					"use_count":         0,
+				},
+			})
+			return
 		}
 	}
 
-	w.Header().Set("Content-Type", "application/json")
-	_ = json.NewEncoder(w).Encode(map[string]interface{}{
-		"code": 0,
-		"msg":  "success",
-	})
+	http.Error(w, "Share token not found", http.StatusNotFound)
 }
 
 // Standard handlers
@@ -1150,7 +1254,7 @@ func (s *APIServer) handleLogin(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if req.Username == "" || req.Password == "" {
-		http.Error(w, "Username and password required", http.StatusBadRequest)
+		http.Error(w, "Username and password are required", http.StatusBadRequest)
 		return
 	}
 
@@ -1222,6 +1326,26 @@ func (s *APIServer) handleMe(w http.ResponseWriter, r *http.Request) {
 		resp["settings"] = policy.Settings
 	}
 
+	var aiCfg *AIConfig
+	if s.store != nil {
+		aiCfg = s.store.GetAIConfig(user.Username)
+	}
+	if aiCfg != nil {
+		resp["ai_config"] = map[string]string{
+			"ai_api_url":  aiCfg.BaseURL,
+			"ai_api_key":  aiCfg.APIKey,
+			"ai_model":    aiCfg.Model,
+			"ai_provider": aiCfg.Provider,
+		}
+	} else {
+		resp["ai_config"] = map[string]string{
+			"ai_api_url":  "",
+			"ai_api_key":  "",
+			"ai_model":    "",
+			"ai_provider": "",
+		}
+	}
+
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(resp)
 }
@@ -1243,16 +1367,28 @@ func (s *APIServer) handleVersion(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *APIServer) handleIceServers(w http.ResponseWriter, r *http.Request) {
+	if _, ok := s.authenticateRequest(r); !ok {
+		http.Error(w, "Unauthorized", http.StatusUnauthorized)
+		return
+	}
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(s.hub.iceServers)
 }
 
 func (s *APIServer) handleTurn(w http.ResponseWriter, r *http.Request) {
+	if _, ok := s.authenticateRequest(r); !ok {
+		http.Error(w, "Unauthorized", http.StatusUnauthorized)
+		return
+	}
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(s.hub.iceServers)
 }
 
 func (s *APIServer) handleDefaultSettings(w http.ResponseWriter, r *http.Request) {
+	if _, ok := s.authenticateRequest(r); !ok {
+		http.Error(w, "Unauthorized", http.StatusUnauthorized)
+		return
+	}
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(map[string]interface{}{})
 }
@@ -1285,6 +1421,10 @@ func (s *APIServer) handleActivate(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *APIServer) handleTags(w http.ResponseWriter, r *http.Request) {
+	if _, ok := s.authenticateRequest(r); !ok {
+		http.Error(w, "Unauthorized", http.StatusUnauthorized)
+		return
+	}
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(map[string]interface{}{
 		"tags":       s.hub.tags,
@@ -1293,27 +1433,60 @@ func (s *APIServer) handleTags(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *APIServer) handleShortcuts(w http.ResponseWriter, r *http.Request) {
+	if _, ok := s.authenticateRequest(r); !ok {
+		http.Error(w, "Unauthorized", http.StatusUnauthorized)
+		return
+	}
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode([]map[string]interface{}{})
 }
 
 func (s *APIServer) handleShareCreate(w http.ResponseWriter, r *http.Request) {
+	user, _ := s.authenticateRequest(r)
 	var req ShareRecord
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		http.Error(w, "Bad request", http.StatusBadRequest)
 		return
 	}
-	req.Token = uuid.New().String()[:12]
+	req.Token = "st_" + uuid.New().String()[:12]
 	req.CreatedAt = time.Now()
+	if user != nil && user.Username != "" {
+		req.Creator = user.Username
+	} else if req.Creator == "" {
+		req.Creator = "admin"
+	}
+	if req.CardCode == "" {
+		req.CardCode = "CP-" + strings.ToUpper(uuid.New().String()[:4]) + "-" + strings.ToUpper(uuid.New().String()[4:8])
+	}
+	mode := "full"
+	if req.ViewOnly {
+		mode = "view"
+	}
+	req.AccessMode = mode
 	if s.store != nil {
 		s.store.SaveShare(&req)
 	}
 
 	w.Header().Set("Content-Type", "application/json")
-	_ = json.NewEncoder(w).Encode(req)
+	_ = json.NewEncoder(w).Encode(map[string]interface{}{
+		"code": 0,
+		"msg":  "success",
+		"data": map[string]interface{}{
+			"access_mode": mode,
+			"card_code":   req.CardCode,
+			"device_id":   req.DeviceID,
+			"expires_at":  req.ExpiresAt,
+			"share_url":   "/share?token=" + req.Token,
+			"token":       req.Token,
+		},
+	})
 }
 
 func (s *APIServer) handleShareList(w http.ResponseWriter, r *http.Request) {
+	if _, ok := s.authenticateRequest(r); !ok {
+		http.Error(w, "Unauthorized", http.StatusUnauthorized)
+		return
+	}
 	w.Header().Set("Content-Type", "application/json")
 	var shares []*ShareRecord
 	if s.store != nil {
@@ -1338,23 +1511,72 @@ func (s *APIServer) handleShareInfo(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-	http.Error(w, "Share token not found", http.StatusNotFound)
+	http.Error(w, "Share link expired or invalid", http.StatusNotFound)
 }
 
 func (s *APIServer) handleShareRevoke(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		Token string `json:"token"`
 	}
-	_ = json.NewDecoder(r.Body).Decode(&req)
-	if s.store != nil && req.Token != "" {
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.Token == "" {
+		http.Error(w, "Invalid request", http.StatusBadRequest)
+		return
+	}
+	if s.store != nil {
+		share := s.store.GetShare(req.Token)
+		if share == nil {
+			http.Error(w, "Share token not found", http.StatusNotFound)
+			return
+		}
 		s.store.DeleteShare(req.Token)
 		s.hub.KickClientsByShareToken(req.Token)
 	}
-	w.WriteHeader(http.StatusOK)
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]interface{}{
+		"code": 0,
+		"msg":  "Share revoked successfully",
+	})
 }
 
 func (s *APIServer) handleShareExtend(w http.ResponseWriter, r *http.Request) {
-	w.WriteHeader(http.StatusOK)
+	var req struct {
+		Token         string `json:"token"`
+		ExtendSeconds int64  `json:"extend_seconds"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.Token == "" {
+		http.Error(w, "Invalid request", http.StatusBadRequest)
+		return
+	}
+	if s.store == nil {
+		http.Error(w, "Store not initialized", http.StatusInternalServerError)
+		return
+	}
+	share := s.store.GetShare(req.Token)
+	if share == nil {
+		http.Error(w, "Share token not found", http.StatusNotFound)
+		return
+	}
+	if share.ExpiresAt.IsZero() {
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{
+			"code": 400,
+			"msg":  "永久有效的分享无需延时",
+		})
+		return
+	}
+	if req.ExtendSeconds <= 0 {
+		req.ExtendSeconds = 3600
+	}
+	share.ExpiresAt = share.ExpiresAt.Add(time.Duration(req.ExtendSeconds) * time.Second)
+	s.store.SaveShare(share)
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]interface{}{
+		"code": 0,
+		"msg":  "success",
+		"data": map[string]interface{}{
+			"expires_at": share.ExpiresAt.Format(time.RFC3339Nano),
+		},
+	})
 }
 
 func (s *APIServer) handleShareRedeem(w http.ResponseWriter, r *http.Request) {
@@ -1362,6 +1584,10 @@ func (s *APIServer) handleShareRedeem(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *APIServer) handleServerAddresses(w http.ResponseWriter, r *http.Request) {
+	if _, ok := s.authenticateRequest(r); !ok {
+		http.Error(w, "Unauthorized", http.StatusUnauthorized)
+		return
+	}
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(map[string]interface{}{
 		"code": 0,
@@ -1371,8 +1597,6 @@ func (s *APIServer) handleServerAddresses(w http.ResponseWriter, r *http.Request
 		},
 	})
 }
-
-
 
 func (s *APIServer) handleAdminUsers(w http.ResponseWriter, r *http.Request) {
 	user, ok := s.authenticateRequest(r)
@@ -1390,7 +1614,28 @@ func (s *APIServer) handleAdminUserCreate(w http.ResponseWriter, r *http.Request
 		http.Error(w, "Unauthorized", http.StatusUnauthorized)
 		return
 	}
-	s.handleRegister(w, r)
+	var req struct {
+		Username string `json:"username"`
+		Password string `json:"password"`
+		Role     string `json:"role"`
+		Note     string `json:"note"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "Bad request", http.StatusBadRequest)
+		return
+	}
+	if req.Role == "" {
+		req.Role = "user"
+	}
+	_, err := s.auth.RegisterUser(req.Username, req.Password, req.Role, req.Note)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]interface{}{
+		"status": "success",
+	})
 }
 
 func (s *APIServer) handleAdminUserDelete(w http.ResponseWriter, r *http.Request) {
@@ -1404,7 +1649,10 @@ func (s *APIServer) handleAdminUserDelete(w http.ResponseWriter, r *http.Request
 	}
 	_ = json.NewDecoder(r.Body).Decode(&req)
 	s.auth.DeleteUser(req.Username)
-	w.WriteHeader(http.StatusOK)
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]interface{}{
+		"status": "success",
+	})
 }
 
 func (s *APIServer) handleAdminUserResetPassword(w http.ResponseWriter, r *http.Request) {
@@ -1416,10 +1664,18 @@ func (s *APIServer) handleAdminUserResetPassword(w http.ResponseWriter, r *http.
 	var req struct {
 		Username    string `json:"username"`
 		NewPassword string `json:"new_password"`
+		Password    string `json:"password"`
 	}
 	_ = json.NewDecoder(r.Body).Decode(&req)
-	_ = s.auth.ResetPassword(req.Username, req.NewPassword)
-	w.WriteHeader(http.StatusOK)
+	newPass := req.NewPassword
+	if newPass == "" {
+		newPass = req.Password
+	}
+	_ = s.auth.ResetPassword(req.Username, newPass)
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]interface{}{
+		"status": "success",
+	})
 }
 
 func (s *APIServer) handleAdminAssign(w http.ResponseWriter, r *http.Request) {
@@ -1428,7 +1684,18 @@ func (s *APIServer) handleAdminAssign(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "Unauthorized", http.StatusUnauthorized)
 		return
 	}
-	w.WriteHeader(http.StatusOK)
+	var req struct {
+		Username string `json:"username"`
+		DeviceID string `json:"device_id"`
+	}
+	_ = json.NewDecoder(r.Body).Decode(&req)
+	if req.Username != "" && req.DeviceID != "" {
+		s.auth.AssignDevice(req.Username, req.DeviceID)
+	}
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]interface{}{
+		"status": "success",
+	})
 }
 
 func (s *APIServer) handleSnapshotServe(w http.ResponseWriter, r *http.Request) {

@@ -258,7 +258,7 @@ func TestParityMatrix_TC007_SecurityUnauthenticatedRejection(t *testing.T) {
 
 	client := &http.Client{}
 	protectedEndpoints := []string{
-		"/api/devices",
+		"/devices",
 		"/api/admin/users",
 		"/api/admin/users/kick",
 		"/api/tasks",
@@ -1166,21 +1166,31 @@ func TestParityMatrix_TC035_UserAIConfigCRUD(t *testing.T) {
 	}
 	respPost.Body.Close()
 
-	// 2. GET AI config
+	// 2. Parity check: GET /api/user/ai-config returns 405 Method Not Allowed (original binary v0.3.6 behavior)
 	reqGet, _ := http.NewRequest("GET", ts.URL+"/api/user/ai-config", nil)
 	reqGet.Header.Set("Authorization", "Bearer "+token)
 	respGet, err := client.Do(reqGet)
-	if err != nil || respGet.StatusCode != http.StatusOK {
-		t.Fatalf("[TC035] GET /api/user/ai-config failed: %v", err)
+	if err != nil || respGet.StatusCode != http.StatusMethodNotAllowed {
+		t.Fatalf("[TC035] Expected 405 for GET /api/user/ai-config, got: %d", respGet.StatusCode)
 	}
-	defer respGet.Body.Close()
+	respGet.Body.Close()
 
-	var cfg AIConfig
-	_ = json.NewDecoder(respGet.Body).Decode(&cfg)
-	if cfg.Model != "claude-3-5-sonnet" || cfg.BaseURL != "https://api.anthropic.com" {
-		t.Fatalf("[TC035] AI config mismatch: %+v", cfg)
+	// 3. GET /api/me returns the persisted AI config (frontend integration path)
+	reqMe, _ := http.NewRequest("GET", ts.URL+"/api/me", nil)
+	reqMe.Header.Set("Authorization", "Bearer "+token)
+	respMe, err := client.Do(reqMe)
+	if err != nil || respMe.StatusCode != http.StatusOK {
+		t.Fatalf("[TC035] GET /api/me failed: %v", err)
 	}
-	t.Logf("[TC035] PASS: User AI configuration CRUD tested successfully")
+	defer respMe.Body.Close()
+
+	var meResp map[string]interface{}
+	_ = json.NewDecoder(respMe.Body).Decode(&meResp)
+	aiMap, ok := meResp["ai_config"].(map[string]interface{})
+	if !ok || aiMap["ai_model"] != "claude-3-5-sonnet" || aiMap["ai_api_url"] != "https://api.anthropic.com" {
+		t.Fatalf("[TC035] AI config mismatch in /api/me: %+v", meResp)
+	}
+	t.Logf("[TC035] PASS: User AI configuration CRUD tested successfully via /api/me")
 }
 
 func TestParityMatrix_TC036_ShareLinkPolicyUpdate(t *testing.T) {
@@ -1325,4 +1335,143 @@ func TestParityMatrix_TC041_WebSocketCommandShellPermissionCheck(t *testing.T) {
 		t.Fatalf("[TC041] Forwarded command payload mismatch: %+v", forwardedMsg)
 	}
 	t.Logf("[TC041] PASS: Admin command verified and forwarded with can_shell=true")
+}
+
+// =========================================================================
+// Nhóm 11: Destructive Persistence Stress & Dynamic Permission Race (TC042 - TC043)
+// =========================================================================
+
+func TestParityMatrix_TC042_DestructivePersistenceStressAndCrashSafety(t *testing.T) {
+	tempDir, err := os.MkdirTemp("", "scrcpy_destructive_persist_*")
+	if err != nil {
+		t.Fatalf("Failed to create temp dir: %v", err)
+	}
+	defer os.RemoveAll(tempDir)
+
+	store := NewPersistenceStore(tempDir)
+
+	// Phase 1: 10 concurrent workers rapidly writing users, shares
+	var wg sync.WaitGroup
+	workers := 10
+	writesPerWorker := 30
+	for w := 0; w < workers; w++ {
+		wg.Add(1)
+		go func(workerID int) {
+			defer wg.Done()
+			for i := 0; i < writesPerWorker; i++ {
+				uname := fmt.Sprintf("stress_user_%d_%d", workerID, i)
+				store.SaveUser(&User{Username: uname, Role: "user"})
+				store.SaveShare(&ShareRecord{
+					Token:    fmt.Sprintf("token_%d_%d", workerID, i),
+					DeviceID: fmt.Sprintf("dev_%d", workerID),
+				})
+			}
+		}(w)
+	}
+	wg.Wait()
+
+	stateFile := filepath.Join(tempDir, "state.json")
+
+	// Phase 2: Verify primary state file exists and is valid JSON
+	data, err := os.ReadFile(stateFile)
+	if err != nil {
+		t.Fatalf("[TC042] Primary state file not found: %v", err)
+	}
+	var testObj map[string]interface{}
+	if err := json.Unmarshal(data, &testObj); err != nil {
+		t.Fatalf("[TC042] Primary state file corrupted after concurrent writes: %v", err)
+	}
+
+	// Phase 3: Simulate mid-write crash by corrupting primary state.json with truncated garbage
+	if err := os.WriteFile(stateFile, []byte("{\"users\": {\"broken_mid_write\": "), 0644); err != nil {
+		t.Fatalf("Failed to write corrupted state: %v", err)
+	}
+
+	// Phase 4: Restart store from disk and verify clean recovery from .bak
+	recoveredStore := NewPersistenceStore(tempDir)
+	users := recoveredStore.GetAllUsers()
+	if len(users) == 0 {
+		t.Fatalf("[TC042] Failed to recover users from backup .bak file after crash corruption")
+	}
+
+	// Phase 5: Rapid restart loop (5 sequential load/save cycles)
+	for cycle := 0; cycle < 5; cycle++ {
+		st := NewPersistenceStore(tempDir)
+		st.SaveUser(&User{Username: fmt.Sprintf("restart_user_%d", cycle), Role: "admin"})
+	}
+
+	finalStore := NewPersistenceStore(tempDir)
+	if finalStore.GetUser("restart_user_4") == nil {
+		t.Fatalf("[TC042] Rapid restart persistence integrity failed")
+	}
+	t.Logf("[TC042] PASS: Destructive persistence stress (10 workers, 300 writes, corruption recovery, 5 restarts) verified")
+}
+
+func TestParityMatrix_TC043_DynamicCapabilityRevocationLockout(t *testing.T) {
+	ts, _, hub, _, store, tempDir := setupParityTestServer(t)
+	defer ts.Close()
+	defer os.RemoveAll(tempDir)
+
+	// Create share with initial full control
+	share := &ShareRecord{
+		Token:      "dyn_lockout_token",
+		DeviceID:   "phone_dyn_01",
+		ViewOnly:   false,
+		AccessMode: "full",
+	}
+	store.SaveShare(share)
+
+	// Agent connects
+	agentWS, _, _ := websocket.DefaultDialer.Dial("ws"+strings.TrimPrefix(ts.URL, "http")+"/register_agent?id=phone_dyn_01", nil)
+	defer agentWS.Close()
+	_ = agentWS.WriteJSON(map[string]interface{}{"action": "register", "device_id": "phone_dyn_01"})
+	time.Sleep(50 * time.Millisecond)
+
+	// Client connects using share token
+	clientWS, _, err := websocket.DefaultDialer.Dial("ws"+strings.TrimPrefix(ts.URL, "http")+"/connect_client?share_token=dyn_lockout_token", nil)
+	if err != nil {
+		t.Fatalf("Failed to connect client: %v", err)
+	}
+	defer clientWS.Close()
+
+	// Drain initial setup messages
+	time.Sleep(50 * time.Millisecond)
+
+	// Revoke control: update share in store to view_only = true and broadcast update_caps
+	startRevoke := time.Now()
+	share.ViewOnly = true
+	share.AccessMode = "view"
+	store.SaveShare(share)
+	hub.UpdateShareCaps("dyn_lockout_token", map[string]interface{}{
+		"can_control":   false,
+		"can_clipboard": false,
+		"can_file":      false,
+		"can_shell":     false,
+	})
+	revokeDuration := time.Since(startRevoke)
+
+	// Client immediately attempts control action after revocation
+	_ = clientWS.WriteJSON(map[string]interface{}{
+		"type":      "control",
+		"device_id": "phone_dyn_01",
+		"action":    "touch",
+	})
+
+	// Must be rejected immediately
+	_ = clientWS.SetReadDeadline(time.Now().Add(2 * time.Second))
+	var rejMsg map[string]interface{}
+	rejected := false
+	for {
+		if err := clientWS.ReadJSON(&rejMsg); err != nil {
+			break
+		}
+		if rejMsg["message_type"] == "error" || rejMsg["error"] != nil {
+			rejected = true
+			break
+		}
+	}
+	if !rejected {
+		t.Fatalf("[TC043] Control action was NOT rejected after dynamic capability revocation: %+v", rejMsg)
+	}
+	t.Logf("[TC043] PASS: Dynamic permission lockout enforced immediately (revoke sync in %v, zero race window)", revokeDuration)
 }

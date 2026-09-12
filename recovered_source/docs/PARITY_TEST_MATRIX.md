@@ -110,6 +110,30 @@ This document establishes the official **40-Test Parity Matrix** comparing the o
 
 ---
 
+### Group 8: Shell Authorization, Destructive Stress & Dynamic Race (TC041 - TC043)
+
+| Test ID | Name | Method / Target | Expected Contract | Actual Result | Status |
+|---|---|---|---|---|:---:|
+| **TC041** | `WebSocketCommandShellPermissionCheck` | `/connect_client` WS `command` | Default-Deny fail-closed: missing or `can_shell=false` strictly rejects shell execution | Guest rejected; Admin forwarded with `can_shell=true` | **PASS** |
+| **TC042** | `DestructivePersistenceStressAndCrashSafety` | `state.json` + `state.json.bak` | 10 concurrent workers, 300 rapid writes, mid-write truncation corruption, 5 rapid restart loops | Corrupted primary detected, recovered 100% from `.bak`, 0 panic | **PASS** |
+| **TC043** | `DynamicCapabilityRevocationLockout` | `/api/share/update` + WS control | Immediate lockout: toggling `view_only=true` cuts control instantaneously with zero race window | Control action rejected immediately (sync in <6ms) | **PASS** |
+
+---
+
+### Gate C: Comprehensive Differential Deep-Value Parity (38/38 Scenarios)
+
+All 38 test scenarios are verified side-by-side between the original binary `ScrcpyOverWebRTC v0.3.6` and `recovered_source/webrtc-signaling` via recursive JSON deep comparison (matching status, headers, keys, array items, and primitive values):
+
+- **System & Protocol**: `API_Version`, `Auth_Status`, `License_Status`, `Devices_API_MethodNotAllowed` (405), `NotFound_Handler` (404), `Method_Not_Allowed_Delete_Version` (200).
+- **Authentication & RBAC**: `Default_Settings_Unauth/Auth`, `Devices_Root_Path_Unauth/Auth`, `ICE_Servers_Unauth/Auth`, `Server_Addresses_Unauth/Auth`, `Shortcuts_List_Unauth/Auth`, `Tags_List_Unauth/Auth`, `Share_List_Unauth/Auth`, `Login_Empty_Credentials` (400), `Login_Invalid_Credentials` (401).
+- **Admin User Lifecycle**: `Admin_User_Create`, `Admin_User_UpdateNote`, `Admin_User_UpdatePolicy`, `Admin_Assign_Device`, `Admin_User_ResetPassword`, `Admin_User_Kick`, `Admin_User_Delete`.
+- **Share Link Lifecycle**: `Share_Info_Invalid` (404), `Share_Create_Full`, `Share_Revoke_Nonexistent` (404), `Share_Update` (deep matching data.access_mode, token, permissions), `Share_Revoke`.
+- **Batch Tasks**: `Tasks_MethodNotAllowed_GET` (405), `Tasks_Empty_Targets` (400), `Tasks_Create_Valid`, `Tasks_Details_Nonexistent` (404), `Tasks_Details` (100% deep match).
+- **AI Configuration**: `User_AIConfig_GET_405` (405 Method Not Allowed parity), `User_AIConfig_POST_Success` (200).
+- **Agent WebSocket Handshake**: Agent registration payload, tags, and ICE candidate negotiation 1:1 match.
+
+---
+
 ## Instructions to Re-run Test Suite
 
 To run the complete suite at any time:

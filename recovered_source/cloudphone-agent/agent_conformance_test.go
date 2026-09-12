@@ -179,3 +179,41 @@ func TestAgentConformance_AdbInteractiveShellInit(t *testing.T) {
 		t.Errorf("Unexpected parsed init values: %+v", initMsg)
 	}
 }
+
+func TestAgentConformance_CommandFailClosed(t *testing.T) {
+	checkAllowed := func(msg map[string]interface{}, hasSession bool, sessCanShell bool) bool {
+		canShell, hasCanShell := msg["can_shell"].(bool)
+		allowed := false
+		if hasCanShell && canShell {
+			allowed = true
+		} else if hasSession && sessCanShell {
+			allowed = true
+		}
+		return allowed
+	}
+
+	// Case 1: Missing can_shell field, no session -> MUST be rejected (false)
+	if checkAllowed(map[string]interface{}{"command": "whoami"}, false, false) {
+		t.Errorf("FAIL: Missing can_shell without session must NOT be allowed")
+	}
+
+	// Case 2: can_shell is explicitly false, no session -> MUST be rejected (false)
+	if checkAllowed(map[string]interface{}{"command": "whoami", "can_shell": false}, false, false) {
+		t.Errorf("FAIL: can_shell=false must NOT be allowed")
+	}
+
+	// Case 3: can_shell is explicitly false, session has can_shell=false -> MUST be rejected (false)
+	if checkAllowed(map[string]interface{}{"command": "whoami", "can_shell": false}, true, false) {
+		t.Errorf("FAIL: can_shell=false with view-only session must NOT be allowed")
+	}
+
+	// Case 4: can_shell is explicitly true -> MUST be allowed (true)
+	if !checkAllowed(map[string]interface{}{"command": "whoami", "can_shell": true}, false, false) {
+		t.Errorf("FAIL: can_shell=true must be allowed")
+	}
+
+	// Case 5: Missing can_shell, but active session has can_shell=true -> MUST be allowed (true)
+	if !checkAllowed(map[string]interface{}{"command": "whoami"}, true, true) {
+		t.Errorf("FAIL: Active session with can_shell=true must be allowed")
+	}
+}

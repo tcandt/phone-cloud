@@ -312,19 +312,20 @@ func main() {
 			} else if action == "command" {
 				reqID, _ := msg["request_id"].(string)
 				canShell, hasCanShell := msg["can_shell"].(bool)
-				if hasCanShell && !canShell {
-					_ = ws.WriteJSON(map[string]interface{}{
-						"action":     "command_result",
-						"request_id": reqID,
-						"client_id":  clientID,
-						"output":     "permission denied: shell execution capability required",
-						"error":      "permission denied",
-					})
-					continue
-				}
-				sessionsMu.RLock()
-				if sess, ok := sessions[clientID]; ok && !sess.Caps.CanShell {
+
+				// Strict Fail-Closed: Default-Deny unless explicitly proven authorized
+				allowed := false
+				if hasCanShell && canShell {
+					allowed = true
+				} else if clientID != "" {
+					sessionsMu.RLock()
+					if sess, ok := sessions[clientID]; ok && sess.Caps.CanShell {
+						allowed = true
+					}
 					sessionsMu.RUnlock()
+				}
+
+				if !allowed {
 					_ = ws.WriteJSON(map[string]interface{}{
 						"action":     "command_result",
 						"request_id": reqID,
@@ -334,7 +335,6 @@ func main() {
 					})
 					continue
 				}
-				sessionsMu.RUnlock()
 
 				cmdStr, _ := msg["command"].(string)
 				out, err := exec.Command("sh", "-c", cmdStr).CombinedOutput()
