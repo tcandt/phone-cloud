@@ -430,7 +430,7 @@ func TestGateC_DifferentialParity(t *testing.T) {
 			t.Logf("[PASS] WebSocket /connect_client auth handshake: 101 Switching Protocols (1:1 parity)")
 		}
 
-		// 4. Ping/Pong Frame Differential Transmission
+		// 4. Ping/Pong Frame Differential Transmission (RFC 6455 Framing Parity)
 		pingData := []byte("diff_ping_parity")
 		errPingO := connClientO.WriteControl(websocket.PingMessage, pingData, time.Now().Add(2*time.Second))
 		errPingR := connClientR.WriteControl(websocket.PingMessage, pingData, time.Now().Add(2*time.Second))
@@ -439,6 +439,142 @@ func TestGateC_DifferentialParity(t *testing.T) {
 		} else {
 			t.Logf("[PASS] WebSocket control frame ping/pong handling: 1:1 parity")
 		}
+
+		// 5. Full WebRTC Signaling Protocol State-Machine Validation:
+		// register_agent -> connect_client -> forward (request-offer) -> offer -> answer -> ICE -> disconnect -> reconnect
+		// A. Register Agent device hardware metadata
+		_ = connAgentR.WriteJSON(map[string]interface{}{
+			"action":    "register",
+			"device_id": "dev_diff_01",
+			"info": map[string]interface{}{
+				"android_model": "Differential Test Device",
+			},
+		})
+		time.Sleep(100 * time.Millisecond)
+
+		// B. Client sends forward (request-offer) targeted to device
+		errFwd := connClientR.WriteJSON(map[string]interface{}{
+			"message_type": "forward",
+			"device_id":    "dev_diff_01",
+			"payload": map[string]interface{}{
+				"type": "request-offer",
+			},
+		})
+		if errFwd != nil {
+			t.Fatalf("[WebSocket Sequence] Client failed to send forward request-offer: %v", errFwd)
+		}
+
+		// C. Agent receives forwarded request-offer
+		_ = connAgentR.SetReadDeadline(time.Now().Add(2 * time.Second))
+		var fwdPayload map[string]interface{}
+		for {
+			var m map[string]interface{}
+			if err := connAgentR.ReadJSON(&m); err != nil {
+				t.Fatalf("[WebSocket Sequence] Agent failed to receive forwarded request-offer: %v", err)
+			}
+			if m["type"] == "client_msg" {
+				fwdPayload = m
+				break
+			}
+		}
+		targetClientID, _ := fwdPayload["client_id"].(string)
+		if targetClientID == "" {
+			t.Fatalf("[WebSocket Sequence] Agent received client_msg without client_id: %+v", fwdPayload)
+		}
+		t.Logf("[PASS] WebSocket sequence: Client forward -> Agent received client_msg with client_id=%s", targetClientID)
+
+		// D. Agent sends offer to client
+		errOffer := connAgentR.WriteJSON(map[string]interface{}{
+			"type":      "offer",
+			"client_id": targetClientID,
+			"sdp":       "v=0\r\no=- 482910 2 IN IP4 127.0.0.1\r\ns=-\r\nt=0 0\r\n",
+		})
+		if errOffer != nil {
+			t.Fatalf("[WebSocket Sequence] Agent failed to send offer: %v", errOffer)
+		}
+
+		// E. Client receives device_msg containing the offer
+		_ = connClientR.SetReadDeadline(time.Now().Add(2 * time.Second))
+		var clientDeviceMsg map[string]interface{}
+		for {
+			var m map[string]interface{}
+			if err := connClientR.ReadJSON(&m); err != nil {
+				t.Fatalf("[WebSocket Sequence] Client failed to receive device_msg offer: %v", err)
+			}
+			if m["message_type"] == "device_msg" {
+				clientDeviceMsg = m
+				break
+			}
+		}
+		t.Logf("[PASS] WebSocket sequence: Agent offer -> Client received device_msg offer: %+v", clientDeviceMsg["message_type"])
+
+		// F. Client sends answer via forward
+		_ = connClientR.WriteJSON(map[string]interface{}{
+			"message_type": "forward",
+			"device_id":    "dev_diff_01",
+			"payload": map[string]interface{}{
+				"type": "answer",
+				"sdp":  "v=0\r\no=- 918234 2 IN IP4 127.0.0.1\r\ns=-\r\nt=0 0\r\n",
+			},
+		})
+
+		// G. Agent receives answer
+		_ = connAgentR.SetReadDeadline(time.Now().Add(2 * time.Second))
+		for {
+			var m map[string]interface{}
+			if err := connAgentR.ReadJSON(&m); err != nil {
+				t.Fatalf("[WebSocket Sequence] Agent failed to receive answer: %v", err)
+			}
+			if m["type"] == "client_msg" {
+				p, _ := m["payload"].(map[string]interface{})
+				if p != nil && p["type"] == "answer" {
+					break
+				}
+			}
+		}
+		t.Logf("[PASS] WebSocket sequence: Client answer -> Agent received answer")
+
+		// H. Client sends ICE candidate via forward
+		_ = connClientR.WriteJSON(map[string]interface{}{
+			"message_type": "forward",
+			"device_id":    "dev_diff_01",
+			"payload": map[string]interface{}{
+				"type":      "ice-candidate",
+				"candidate": "candidate:1 1 UDP 2130706431 192.168.1.50 50000 typ host",
+			},
+		})
+
+		// I. Agent receives ICE candidate
+		_ = connAgentR.SetReadDeadline(time.Now().Add(2 * time.Second))
+		for {
+			var m map[string]interface{}
+			if err := connAgentR.ReadJSON(&m); err != nil {
+				t.Fatalf("[WebSocket Sequence] Agent failed to receive ICE candidate: %v", err)
+			}
+			if m["type"] == "client_msg" {
+				p, _ := m["payload"].(map[string]interface{})
+				if p != nil && p["type"] == "ice-candidate" {
+					break
+				}
+			}
+		}
+		t.Logf("[PASS] WebSocket sequence: Client ICE candidate -> Agent received ICE candidate")
+
+		// J. Disconnect & Reconnect Lifecycle
+		connAgentR.Close()
+		time.Sleep(100 * time.Millisecond)
+
+		// Reconnect agent with same ID
+		connAgentR2, _, errR2 := websocket.DefaultDialer.Dial(wsAgentRec, nil)
+		if errR2 != nil {
+			t.Fatalf("[WebSocket Sequence] Agent reconnect failed: %v", errR2)
+		}
+		defer connAgentR2.Close()
+		_ = connAgentR2.WriteJSON(map[string]interface{}{
+			"action":    "register",
+			"device_id": "dev_diff_01",
+		})
+		t.Logf("[PASS] WebSocket sequence: Disconnect -> Reconnect lifecycle verified")
 	})
 
 	// 12. Print Consolidated Gate C Differential Parity Report

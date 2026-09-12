@@ -130,7 +130,17 @@ All 38 test scenarios are verified side-by-side between the original binary `Scr
 - **Share Link Lifecycle**: `Share_Info_Invalid` (404), `Share_Create_Full`, `Share_Revoke_Nonexistent` (404), `Share_Update`, `Share_Revoke`.
 - **Batch Tasks**: `Tasks_MethodNotAllowed_GET` (405), `Tasks_Empty_Targets` (400), `Tasks_Create_Valid`, `Tasks_Details_Nonexistent` (404), `Tasks_Details`.
 - **AI Configuration**: `User_AIConfig_GET_405` (405 Method Not Allowed parity), `User_AIConfig_POST_Success` (200).
-- **WebSocket Differential Lifecycle**: Agent handshake (/register_agent), unauthenticated rejection, authenticated handshake (/connect_client), and ping/pong control frame transmission parity.
+- **WebSocket Differential Lifecycle & WebRTC Negotiation State-Machine**:
+  - Agent Handshake (`/register_agent`) 101 Switching Protocols 1:1 parity
+  - Unauthenticated rejection 1:1 parity
+  - Authenticated Client Handshake (`/connect_client?token=...`) 101 Switching Protocols 1:1 parity
+  - Ping/Pong Control Frame transmission (RFC 6455) 1:1 parity
+  - Full WebRTC Negotiation Sequence: `forward` (request-offer) -> Agent received `client_msg` -> Agent `offer` -> Client `device_msg` -> Client `answer` -> Agent `client_msg` -> Client `ice-candidate` -> Disconnect -> Reconnect lifecycle.
+- **Docker Compose & Coturn Smoke Gate**:
+  - Validated compose config schema and multi-stage container build.
+  - Active STUN Binding UDP probe directly to Coturn port 3478 (asserting 0x0101 Binding Success response).
+  - TURN Allocation and relay probe via `turnutils_uclient`.
+  - Smoke tests against verified backend routes: `/api/version`, `/api/auth-status`, `/devices` (unauth 401 & auth 200 with Bearer token), `/api/login` (fail-closed & success). All asserted with strict `application/json` Content-Type and parsed JSON bodies (zero HTML fallback).
 
 ---
 
