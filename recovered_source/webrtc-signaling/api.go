@@ -369,12 +369,21 @@ func (s *APIServer) handleConnectClient(w http.ResponseWriter, r *http.Request) 
 				})
 			}
 		case "command":
+			canShell, _ := clientCaps["can_shell"].(bool)
+			if !canShell {
+				_ = conn.WriteJSON(SignalingMessage{
+					MessageType: "error",
+					Error:       "Action forbidden: shell execution capability required",
+				})
+				continue
+			}
 			if deviceID != "" {
 				s.hub.ForwardToAgent(deviceID, map[string]interface{}{
 					"action":     "command",
 					"request_id": msg["request_id"],
 					"command":    msg["command"],
 					"client_id":  client.ID,
+					"can_shell":  true,
 				})
 			}
 		case "start_preview":
@@ -495,9 +504,19 @@ func (s *APIServer) handleRegisterAgent(w http.ResponseWriter, r *http.Request) 
 	agentSecret := os.Getenv("AGENT_SECRET")
 	if !s.auth.noAuth {
 		isDev := os.Getenv("DEV_MODE") == "true" || os.Getenv("DEBUG") == "true" || flag.Lookup("test.v") != nil
-		if agentSecret == "" && !isDev {
-			log.Printf("[Agent] FATAL/DENY: AGENT_SECRET is not configured in production mode! Rejecting agent registration for device: %s", deviceID)
-			_ = conn.WriteControl(websocket.CloseMessage, websocket.FormatCloseMessage(websocket.ClosePolicyViolation, "AGENT_SECRET must be configured in production"), time.Now().Add(time.Second))
+		trimmedSecret := strings.ToLower(strings.TrimSpace(agentSecret))
+		insecureDefaults := map[string]bool{
+			"cloudphone_production_agent_secret_2026": true,
+			"changeme":                                 true,
+			"secret":                                   true,
+			"admin":                                    true,
+			"123456":                                   true,
+			"password":                                 true,
+			"default":                                  true,
+		}
+		if (trimmedSecret == "" || insecureDefaults[trimmedSecret]) && !isDev {
+			log.Printf("[Agent] FATAL/DENY: Insecure or unconfigured AGENT_SECRET in production mode! Rejecting agent registration for device: %s", deviceID)
+			_ = conn.WriteControl(websocket.CloseMessage, websocket.FormatCloseMessage(websocket.ClosePolicyViolation, "AGENT_SECRET must be configured securely in production"), time.Now().Add(time.Second))
 			conn.Close()
 			return
 		}
@@ -801,11 +820,17 @@ func (s *APIServer) handleDownloads(w http.ResponseWriter, r *http.Request) {
 
 // POST /api/tasks and GET /api/tasks
 func (s *APIServer) handleTasks(w http.ResponseWriter, r *http.Request) {
-	if _, ok := s.authenticateRequest(r); !ok {
+	user, ok := s.authenticateRequest(r)
+	if !ok {
 		http.Error(w, "Unauthorized", http.StatusUnauthorized)
 		return
 	}
 	if r.Method == http.MethodPost {
+		// Only administrators can dispatch device commands and batch tasks
+		if !s.auth.noAuth && user != nil && user.Role != "admin" {
+			http.Error(w, "Forbidden: batch tasks execution requires administrator privilege", http.StatusForbidden)
+			return
+		}
 		var req struct {
 			Type     string   `json:"type"`
 			Targets  []string `json:"targets"`
@@ -871,6 +896,7 @@ func (s *APIServer) handleTasks(w http.ResponseWriter, r *http.Request) {
 					"action":     "command",
 					"command":    cmdStr,
 					"request_id": taskID,
+					"can_shell":  true,
 				})
 
 				if sent {

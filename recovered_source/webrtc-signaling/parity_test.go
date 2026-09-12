@@ -1241,3 +1241,88 @@ func TestParityMatrix_TC039_AndroidKotlinAppStructure(t *testing.T) {
 func TestParityMatrix_TC040_DockerSourceBuildPipeline(t *testing.T) {
 	t.Logf("[TC040] PASS: Pure source multi-stage Docker build pipeline verified")
 }
+
+func TestParityMatrix_TC041_WebSocketCommandShellPermissionCheck(t *testing.T) {
+	ts, _, _, auth, store, tempDir := setupParityTestServer(t)
+	defer ts.Close()
+	defer os.RemoveAll(tempDir)
+
+	// Create non-admin standard user
+	guestUser, _ := auth.RegisterUser("guest", "guest_pass", "user", "standard user")
+	guestUser.AssignedDevices = []string{"phone_shell_01"}
+	store.SaveUser(guestUser)
+
+	guestToken, _, _ := auth.Authenticate("guest", "guest_pass")
+	adminToken, _ := auth.GenerateToken("admin")
+
+	// Agent connects
+	agentWS, _, err := websocket.DefaultDialer.Dial("ws"+strings.TrimPrefix(ts.URL, "http")+"/register_agent?id=phone_shell_01", nil)
+	if err != nil {
+		t.Fatalf("[TC041] Agent dial failed: %v", err)
+	}
+	defer agentWS.Close()
+	_ = agentWS.WriteJSON(map[string]interface{}{"action": "register", "device_id": "phone_shell_01"})
+	time.Sleep(50 * time.Millisecond)
+
+	// Non-admin client connects
+	guestWS, _, err := websocket.DefaultDialer.Dial("ws"+strings.TrimPrefix(ts.URL, "http")+"/connect_client?token="+guestToken, nil)
+	if err != nil {
+		t.Fatalf("[TC041] Guest client dial failed: %v", err)
+	}
+	defer guestWS.Close()
+
+	// Guest attempts to execute shell command
+	_ = guestWS.WriteJSON(map[string]interface{}{
+		"message_type": "command",
+		"device_id":    "phone_shell_01",
+		"command":      "id",
+		"request_id":   "req_forbidden",
+	})
+
+	_ = guestWS.SetReadDeadline(time.Now().Add(2 * time.Second))
+	var guestResp map[string]interface{}
+	for {
+		if err := guestWS.ReadJSON(&guestResp); err != nil {
+			t.Fatalf("[TC041] Guest did not receive rejection message: %v", err)
+		}
+		mType, _ := guestResp["message_type"].(string)
+		if mType == "device_list_update" || mType == "config" {
+			continue
+		}
+		break
+	}
+	if guestResp["message_type"] != "error" && guestResp["type"] != "error" {
+		t.Fatalf("[TC041] Expected error response for guest command execution, got: %+v", guestResp)
+	}
+	t.Logf("[TC041] Guest command execution was strictly forbidden: %+v", guestResp)
+
+	// Admin client connects and executes shell command
+	adminWS, _, err := websocket.DefaultDialer.Dial("ws"+strings.TrimPrefix(ts.URL, "http")+"/connect_client?token="+adminToken, nil)
+	if err != nil {
+		t.Fatalf("[TC041] Admin client dial failed: %v", err)
+	}
+	defer adminWS.Close()
+
+	_ = adminWS.WriteJSON(map[string]interface{}{
+		"message_type": "command",
+		"device_id":    "phone_shell_01",
+		"command":      "id",
+		"request_id":   "req_allowed",
+	})
+
+	// Verify agent receives forwarded command with can_shell == true
+	_ = agentWS.SetReadDeadline(time.Now().Add(2 * time.Second))
+	var forwardedMsg map[string]interface{}
+	for {
+		if err := agentWS.ReadJSON(&forwardedMsg); err != nil {
+			t.Fatalf("[TC041] Agent failed to receive forwarded command: %v", err)
+		}
+		if forwardedMsg["action"] == "command" {
+			break
+		}
+	}
+	if forwardedMsg["command"] != "id" || forwardedMsg["can_shell"] != true {
+		t.Fatalf("[TC041] Forwarded command payload mismatch: %+v", forwardedMsg)
+	}
+	t.Logf("[TC041] PASS: Admin command verified and forwarded with can_shell=true")
+}

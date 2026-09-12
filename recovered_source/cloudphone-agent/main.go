@@ -310,8 +310,33 @@ func main() {
 				}
 				sessionsMu.Unlock()
 			} else if action == "command" {
-				cmdStr, _ := msg["command"].(string)
 				reqID, _ := msg["request_id"].(string)
+				canShell, hasCanShell := msg["can_shell"].(bool)
+				if hasCanShell && !canShell {
+					_ = ws.WriteJSON(map[string]interface{}{
+						"action":     "command_result",
+						"request_id": reqID,
+						"client_id":  clientID,
+						"output":     "permission denied: shell execution capability required",
+						"error":      "permission denied",
+					})
+					continue
+				}
+				sessionsMu.RLock()
+				if sess, ok := sessions[clientID]; ok && !sess.Caps.CanShell {
+					sessionsMu.RUnlock()
+					_ = ws.WriteJSON(map[string]interface{}{
+						"action":     "command_result",
+						"request_id": reqID,
+						"client_id":  clientID,
+						"output":     "permission denied: shell execution capability required",
+						"error":      "permission denied",
+					})
+					continue
+				}
+				sessionsMu.RUnlock()
+
+				cmdStr, _ := msg["command"].(string)
 				out, err := exec.Command("sh", "-c", cmdStr).CombinedOutput()
 				outStr := string(out)
 				if err != nil && outStr == "" {

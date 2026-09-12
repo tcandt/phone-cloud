@@ -139,7 +139,8 @@ class ControllerActivity : AppCompatActivity(), TextureView.SurfaceTextureListen
             audioDecoder = codec
             Log.i(TAG, "Audio MediaCodec (Opus) initialized successfully")
         } catch (e: Throwable) {
-            Log.w(TAG, "Opus decoder initialization fallback: ${e.message}")
+            audioDecoder = null
+            Log.w(TAG, "Opus MediaCodec decoder initialization failed: ${e.message}. Audio playback disabled to avoid noise.")
         }
     }
 
@@ -467,8 +468,8 @@ class ControllerActivity : AppCompatActivity(), TextureView.SurfaceTextureListen
     private fun feedOpusDecoder(opusPacket: ByteArray) {
         val codec = audioDecoder
         if (codec == null) {
-            // Direct PCM fallback if Opus decoder is unavailable
-            feedAudio(opusPacket)
+            // Never feed compressed Opus packets directly to AudioTrack (PCM16) - that produces extreme noise/distortion
+            Log.w(TAG, "Dropping audio packet: MediaCodec Opus decoder unavailable on this device")
             return
         }
 
@@ -498,8 +499,7 @@ class ControllerActivity : AppCompatActivity(), TextureView.SurfaceTextureListen
                 outIndex = codec.dequeueOutputBuffer(bufferInfo, 0L)
             }
         } catch (e: Throwable) {
-            Log.w(TAG, "Opus decoding error, fallback direct: ${e.message}")
-            feedAudio(opusPacket)
+            Log.w(TAG, "Opus decoding error, dropping corrupted frame: ${e.message}")
         }
     }
 

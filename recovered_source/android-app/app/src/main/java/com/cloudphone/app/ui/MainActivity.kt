@@ -120,7 +120,7 @@ class MainActivity : AppCompatActivity(), ShizukuManager.StatusListener {
             putExtra(CloudPhoneHostService.EXTRA_SERVER_URL, serverUrl)
             putExtra(CloudPhoneHostService.EXTRA_DEVICE_ID, deviceId)
             putExtra(CloudPhoneHostService.EXTRA_AGENT_SECRET, agentSecret)
-            putExtra(CloudPhoneHostService.EXTRA_TOKEN, if (agentSecret.isNotEmpty()) agentSecret else token)
+            putExtra(CloudPhoneHostService.EXTRA_TOKEN, agentSecret)
             putExtra(CloudPhoneHostService.EXTRA_USER_TOKEN, token)
             putExtra(CloudPhoneHostService.EXTRA_STANDALONE, standalone)
         }

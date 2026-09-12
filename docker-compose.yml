@@ -44,9 +44,9 @@ services:
       - DOWNLOADS_DIR=/app/downloads
       - USE_TLS=${USE_TLS:-true}
       - TLS_CERT=/app/certs/server.crt
-      - AGENT_SECRET=${AGENT_SECRET:-cloudphone_production_agent_secret_2026}
+      - AGENT_SECRET=${AGENT_SECRET:-}
       - ALLOWED_ORIGINS=${ALLOWED_ORIGINS:-}
-      - DEV_MODE=${DEV_MODE:-false}
+      - DEV_MODE=${DEV_MODE:-true}
       - ICE_SERVERS=turn:${TURN_USER:-cloudphone_user}:${TURN_PASSWORD:-cloudphone_secure_password}@${PUBLIC_IP:-127.0.0.1}:3478?transport=udp,stun:${PUBLIC_IP:-127.0.0.1}:3478
       - DEFAULT_SETTINGS={"maxBitrate":4,"minBitrate":1,"fps":30,"size":1920,"bitrate":4}
     volumes:

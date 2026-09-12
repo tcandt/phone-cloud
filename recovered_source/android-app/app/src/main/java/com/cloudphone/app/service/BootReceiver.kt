@@ -35,7 +35,7 @@ class BootReceiver : BroadcastReceiver() {
                 val serverUrl = prefs.getString(KEY_SERVER_URL, "ws://127.0.0.1:8000") ?: "ws://127.0.0.1:8000"
                 val deviceId = prefs.getString(KEY_DEVICE_ID, Build.MODEL) ?: Build.MODEL
                 val token = prefs.getString(KEY_AUTH_TOKEN, "") ?: ""
-                val agentSecret = prefs.getString(KEY_AGENT_SECRET, token) ?: token
+                val agentSecret = prefs.getString(KEY_AGENT_SECRET, "") ?: ""
                 val standalone = prefs.getBoolean(KEY_STANDALONE, false)
 
                 Log.i(TAG, "Auto-starting CloudPhoneHostService for device $deviceId")

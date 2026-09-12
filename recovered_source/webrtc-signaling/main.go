@@ -57,6 +57,28 @@ func main() {
 	auth := NewAuthManager(*noAuthFlag, store)
 	apiServer := NewAPIServer(hub, auth, store, *assetsFlag, *downloadsFlag)
 
+	// Validate AGENT_SECRET fail-fast in production mode
+	agentSecret := os.Getenv("AGENT_SECRET")
+	isDev := os.Getenv("DEV_MODE") == "true" || os.Getenv("DEBUG") == "true" || *debugFlag || *noAuthFlag || flag.Lookup("test.v") != nil
+	insecureDefaults := map[string]bool{
+		"cloudphone_production_agent_secret_2026": true,
+		"changeme":                                 true,
+		"secret":                                   true,
+		"admin":                                    true,
+		"123456":                                   true,
+		"password":                                 true,
+		"default":                                  true,
+	}
+	trimmedSecret := strings.ToLower(strings.TrimSpace(agentSecret))
+	if !isDev {
+		if trimmedSecret == "" {
+			log.Fatalf("[Security] FATAL: Production mode requires a non-empty AGENT_SECRET! Please set AGENT_SECRET in your environment or enable DEV_MODE=true for local testing.")
+		}
+		if insecureDefaults[trimmedSecret] {
+			log.Fatalf("[Security] FATAL: Production mode detected insecure placeholder AGENT_SECRET '%s'! Please set a unique, cryptographically secure secret.", agentSecret)
+		}
+	}
+
 	mux := http.NewServeMux()
 	apiServer.RegisterRoutes(mux)
 
