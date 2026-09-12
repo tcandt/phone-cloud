@@ -150,6 +150,10 @@ jobs:
         run: docker build -t scrcpy-over-webrtc:ci .
 
       - name: Run Docker Compose Stack & Healthcheck Smoke Test
+        env:
+          AGENT_SECRET: "ci_production_random_secret_48921849128491028491"
+          DEV_MODE: "false"
+          PUBLIC_IP: "127.0.0.1"
         run: |
           mkdir -p data downloads
           docker compose up -d
@@ -161,5 +165,13 @@ jobs:
             fi
             sleep 2
           done
+          echo "=== 1. Healthcheck Signaling ==="
           curl -k -f -s https://127.0.0.1:8443/api/version
+          echo "=== 2. Healthcheck Coturn ==="
+          docker compose ps coturn | grep -q "Up" && echo "Coturn service is UP!"
+          echo "=== 3. Smoke Device/Login API ==="
+          curl -k -f -s https://127.0.0.1:8443/api/device/list
+          curl -k -s -X POST https://127.0.0.1:8443/api/login -H "Content-Type: application/json" -d '{"username":"invalid_user","password":"wrong"}'
+          echo "=== 4. Docker Compose Down ==="
           docker compose down -v
+
