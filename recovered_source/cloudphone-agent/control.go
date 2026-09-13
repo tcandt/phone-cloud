@@ -157,6 +157,36 @@ func (cw *ControlWriter) SetClipboard(text string, paste bool) error {
 	return err
 }
 
+// SetDisplayPower powers on or off the physical display (ControlMsgSetDisplayPower = 10)
+func (cw *ControlWriter) SetDisplayPower(on bool) error {
+	cw.mu.Lock()
+	defer cw.mu.Unlock()
+
+	buf := make([]byte, 2)
+	buf[0] = ControlMsgSetDisplayPower // 10
+	if on {
+		buf[1] = 1
+	} else {
+		buf[1] = 0
+	}
+
+	if cw.conn == nil {
+		return nil
+	}
+	_, err := cw.conn.Write(buf)
+	return err
+}
+
+// UpdateConn updates the underlying connection upon scrcpy restart
+func (cw *ControlWriter) UpdateConn(conn net.Conn) {
+	cw.mu.Lock()
+	defer cw.mu.Unlock()
+	if cw.conn != nil {
+		_ = cw.conn.Close()
+	}
+	cw.conn = conn
+}
+
 func (cw *ControlWriter) Close() error {
 	cw.mu.Lock()
 	defer cw.mu.Unlock()

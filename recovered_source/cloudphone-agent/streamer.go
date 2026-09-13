@@ -40,14 +40,15 @@ type StreamerBridge struct {
 // MediaTimeline manages an immutable common temporal origin epoch (microsecond hardware PTS)
 // and maps both Video (90 kHz) and Audio (48 kHz) to synchronized RTP timestamps.
 type MediaTimeline struct {
-	mu           sync.RWMutex
-	initialized  bool
-	epochPtsUs   int64  // Immutable reference origin in microseconds
-	videoRtpBase uint32 // 90 kHz base RTP timestamp
-	audioRtpBase uint32 // 48 kHz base RTP timestamp
-	generation   uint32 // Monotonic discontinuity generation counter
-	lastVideoPts int64
-	lastAudioPts int64
+	mu             sync.RWMutex
+	initialized    bool
+	epochPtsUs     int64  // Immutable reference origin in microseconds
+	videoRtpBase   uint32 // 90 kHz base RTP timestamp
+	audioRtpBase   uint32 // 48 kHz base RTP timestamp
+	generation     uint32 // Monotonic discontinuity generation counter
+	lastVideoPts   int64
+	lastAudioPts   int64
+	lastVideoRtpTs uint32
 }
 
 func NewMediaTimeline(vBase, aBase uint32) *MediaTimeline {
@@ -66,6 +67,7 @@ func (mt *MediaTimeline) Reset() {
 	mt.generation++
 	mt.lastVideoPts = 0
 	mt.lastAudioPts = 0
+	mt.lastVideoRtpTs = 0
 }
 
 // ComputeVideoTimestamp maps video PTS (microseconds) to 90 kHz RTP timestamp relative to common epoch
@@ -83,7 +85,19 @@ func (mt *MediaTimeline) ComputeVideoTimestamp(ptsUs uint64) uint32 {
 	diffUs := pts - mt.epochPtsUs
 	// H.264 Clock Rate: 90,000 Hz
 	offset := (diffUs * 90000) / 1000000
-	return mt.videoRtpBase + uint32(offset)
+	ts := mt.videoRtpBase + uint32(offset)
+	mt.lastVideoRtpTs = ts
+	return ts
+}
+
+// LastVideoRtpTs returns the most recent video RTP timestamp, or videoRtpBase if uninitialized
+func (mt *MediaTimeline) LastVideoRtpTs() uint32 {
+	mt.mu.RLock()
+	defer mt.mu.RUnlock()
+	if !mt.initialized || mt.lastVideoRtpTs == 0 {
+		return mt.videoRtpBase
+	}
+	return mt.lastVideoRtpTs
 }
 
 // ComputeAudioTimestamp maps audio PTS (microseconds) to 48 kHz RTP timestamp relative to common epoch
@@ -162,6 +176,12 @@ func (sb *StreamerBridge) SetPreviewStreamer(p *PreviewStreamer) {
 	sb.previewStreamer = p
 }
 
+func (sb *StreamerBridge) SetControlWriter(ctrl *ControlWriter) {
+	sb.mu.Lock()
+	defer sb.mu.Unlock()
+	sb.control = ctrl
+}
+
 func (sb *StreamerBridge) RegisterSession(clientID string, sess *WebRTCSession) {
 	sb.sessionsMu.Lock()
 	sb.sessions[clientID] = sess
@@ -169,9 +189,11 @@ func (sb *StreamerBridge) RegisterSession(clientID string, sess *WebRTCSession) 
 
 	// Immediately deliver cached SPS/PPS codec configuration to the new session as RTP packets
 	// using the session's own monotonic sequence numbering (isolated from other viewers)
+	// and aligning with current stream timestamp position
 	sb.configMu.RLock()
 	if len(sb.cachedCodecConfig) > 0 {
 		configPacketsData := parseH264ConfigPackets(sb.cachedCodecConfig)
+		cachedTs := sb.timeline.LastVideoRtpTs()
 		for i, pData := range configPacketsData {
 			isLast := (i == len(configPacketsData)-1)
 			pkt := &rtp.Packet{
@@ -179,7 +201,7 @@ func (sb *StreamerBridge) RegisterSession(clientID string, sess *WebRTCSession) 
 					Version:        2,
 					PayloadType:    96,
 					SequenceNumber: sess.NextVideoSeq(),
-					Timestamp:      sb.timeline.videoRtpBase,
+					Timestamp:      cachedTs,
 					SSRC:           sb.videoSSRC,
 					Marker:         isLast,
 				},

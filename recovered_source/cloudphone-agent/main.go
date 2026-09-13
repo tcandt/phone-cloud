@@ -185,6 +185,32 @@ func main() {
 				switch pType {
 				case "request-offer":
 					log.Printf("[Agent] Received request-offer from client: %s", clientID)
+
+					// Parse scrcpy_options if provided by client (Surveillance Camera Mode / Custom Streaming Settings)
+					if scrcpyOptsRaw, hasOpts := payload["scrcpy_options"]; hasOpts && scrcpyOptsRaw != nil {
+						if optsJSON, err := json.Marshal(scrcpyOptsRaw); err == nil {
+							var clientOpts ScrcpyOptions
+							if err := json.Unmarshal(optsJSON, &clientOpts); err == nil {
+								if scrcpy.NeedsRestart(clientOpts) {
+									log.Printf("[Agent] Client %s requested stream reconfiguration (VideoSource=%s, Facing=%s, Size=%s)",
+										clientID, clientOpts.VideoSource, clientOpts.CameraFacing, clientOpts.CameraSize)
+									if err := scrcpy.Restart(clientOpts, streamer); err != nil {
+										log.Printf("[Agent] Failed to reconfigure scrcpy: %v", err)
+									} else {
+										ctrl = scrcpy.GetControlWriter()
+									}
+								}
+								// If client requested screen-off (power_off = true), turn off remote phone screen
+								if clientOpts.PowerOff {
+									if cw := scrcpy.GetControlWriter(); cw != nil {
+										_ = cw.SetDisplayPower(false)
+										log.Printf("[Agent] Screen power off applied for remote surveillance mode")
+									}
+								}
+							}
+						}
+					}
+
 					sessionsMu.Lock()
 					if oldSess, exists := sessions[clientID]; exists {
 						oldSess.Close()
@@ -192,6 +218,7 @@ func main() {
 						delete(sessions, clientID)
 					}
 
+					ctrl = scrcpy.GetControlWriter()
 					session, err := NewWebRTCSession(ctrl, cfg.IceServers)
 					if err != nil {
 						sessionsMu.Unlock()
@@ -472,6 +499,9 @@ func main() {
 						sH, _ := payload["scrollH"].(float64)
 						sV, _ := payload["scrollV"].(float64)
 						_ = ctrl.SendScroll(int(x), int(y), int(w), int(h), float32(sH), float32(sV))
+					case "set_display_power":
+						on, _ := payload["on"].(bool)
+						_ = ctrl.SetDisplayPower(on)
 					}
 				}
 			} else if action == "inject_data" || msgType == "inject_data" {

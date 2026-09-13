@@ -524,3 +524,167 @@ func TestPerSessionRTPSequence(t *testing.T) {
 	t.Logf("[PASS] Per-session sequence isolation verified: Viewer A seq=(%d, %d, %d), Viewer B seq=(%d, %d)",
 		pktA0.SequenceNumber, pktA1.SequenceNumber, pktA2.SequenceNumber, pktB0.SequenceNumber, pktB1.SequenceNumber)
 }
+
+func TestScrcpyOptions_RemoteCameraMode(t *testing.T) {
+	cfg := &AgentConfig{
+		DeviceID: "phone_camera_test",
+		MaxSize:  1280,
+		Bitrate:  4000000,
+		MaxFPS:   60,
+		Audio:    true,
+	}
+	proc := NewScrcpyProcess(cfg)
+
+	// Default options must be display streaming
+	if proc.GetCurrentOptions().VideoSource != "display" {
+		t.Fatalf("Expected default VideoSource to be display, got %s", proc.GetCurrentOptions().VideoSource)
+	}
+
+	// 1. Simulate JSON payload from request-offer with scrcpy_options
+	offerPayloadJSON := `{
+		"type": "request-offer",
+		"scrcpy_options": {
+			"video_source": "camera",
+			"camera_facing": "back",
+			"camera_id": "0",
+			"camera_size": "1920x1080",
+			"camera_fps": 30,
+			"camera_zoom": 2.5,
+			"camera_orientation": "90",
+			"stay_awake": true,
+			"power_off": true
+		}
+	}`
+	var req map[string]interface{}
+	if err := json.Unmarshal([]byte(offerPayloadJSON), &req); err != nil {
+		t.Fatalf("JSON parse error: %v", err)
+	}
+
+	optsRaw := req["scrcpy_options"]
+	optsJSON, err := json.Marshal(optsRaw)
+	if err != nil {
+		t.Fatalf("Marshal error: %v", err)
+	}
+	var clientOpts ScrcpyOptions
+	if err := json.Unmarshal(optsJSON, &clientOpts); err != nil {
+		t.Fatalf("Unmarshal error: %v", err)
+	}
+
+	if clientOpts.VideoSource != "camera" {
+		t.Fatalf("Expected VideoSource camera, got %s", clientOpts.VideoSource)
+	}
+	if clientOpts.CameraFacing != "back" {
+		t.Fatalf("Expected CameraFacing back, got %s", clientOpts.CameraFacing)
+	}
+	if clientOpts.CameraZoom != 2.5 {
+		t.Fatalf("Expected CameraZoom 2.5, got %f", clientOpts.CameraZoom)
+	}
+
+	// 2. Assert NeedsRestart evaluates to true when switching to camera
+	if !proc.NeedsRestart(clientOpts) {
+		t.Fatal("Expected NeedsRestart to be true when switching display -> camera")
+	}
+
+	// 3. Assert command arguments include camera parameters and stay_awake
+	args := proc.buildArgs(clientOpts, "v_sock", "a_sock", "c_sock")
+	argsStr := fmt.Sprintf("%v", args)
+
+	expectedSubs := []string{
+		"video_source=camera",
+		"camera_facing=back",
+		"camera_id=0",
+		"camera_size=1920x1080",
+		"camera_fps=30",
+		"camera_zoom=2.50",
+		"capture_orientation=90",
+		"stay_awake=true",
+	}
+	for _, sub := range expectedSubs {
+		found := false
+		for _, arg := range args {
+			if arg == sub {
+				found = true
+				break
+			}
+		}
+		if !found {
+			t.Fatalf("Missing expected argument %q in args: %s", sub, argsStr)
+		}
+	}
+	t.Log("[PASS] ScrcpyOptions Remote Camera Mode arguments verified")
+}
+
+func TestScrcpyControl_SetDisplayPower(t *testing.T) {
+	serverConn, clientConn := net.Pipe()
+	defer serverConn.Close()
+	defer clientConn.Close()
+
+	cw := NewControlWriter(serverConn)
+
+	// Send SetDisplayPower(false) to turn off screen
+	go func() {
+		_ = cw.SetDisplayPower(false)
+	}()
+
+	buf := make([]byte, 2)
+	n, err := clientConn.Read(buf)
+	if err != nil || n != 2 {
+		t.Fatalf("Failed to read SetDisplayPower control packet: n=%d, err=%v", n, err)
+	}
+
+	if buf[0] != ControlMsgSetDisplayPower || buf[1] != 0 {
+		t.Fatalf("Expected [10, 0] for display power off, got [%d, %d]", buf[0], buf[1])
+	}
+	t.Log("[PASS] SetDisplayPower(false) correctly sent scrcpy control message [10, 0]")
+}
+
+func TestCachedConfig_LastVideoRtpTs(t *testing.T) {
+	streamer := NewStreamerBridge(nil, 30)
+
+	// Before any video packet, LastVideoRtpTs() must equal videoRtpBase
+	initTs := streamer.timeline.LastVideoRtpTs()
+	if initTs != streamer.timeline.videoRtpBase {
+		t.Fatalf("Expected initial LastVideoRtpTs %d, got %d", streamer.timeline.videoRtpBase, initTs)
+	}
+
+	// Simulate streaming frames up to PTS 100,000 us
+	frameTs := streamer.computeVideoRtpTimestamp(100000)
+	lastTs := streamer.timeline.LastVideoRtpTs()
+	if lastTs != frameTs {
+		t.Fatalf("Expected LastVideoRtpTs to be updated to %d, got %d", frameTs, lastTs)
+	}
+
+	// Register SPS/PPS config cache
+	fakeSPS := []byte{0x00, 0x00, 0x00, 0x01, 0x67, 0x42, 0x00, 0x1f}
+	fakePPS := []byte{0x00, 0x00, 0x00, 0x01, 0x68, 0xce, 0x38, 0x80}
+	streamer.cachedCodecConfig = append(fakeSPS, fakePPS...)
+
+	vTrack, err := webrtc.NewTrackLocalStaticRTP(webrtc.RTPCodecCapability{MimeType: webrtc.MimeTypeH264}, "video", "cloudphone-video")
+	if err != nil {
+		t.Fatalf("Failed to create video track: %v", err)
+	}
+
+	sess := &WebRTCSession{
+		ClientID:   "viewer_late_joiner",
+		videoTrack: vTrack,
+		videoQueue: make(chan *rtp.Packet, 100),
+		audioQueue: make(chan *rtp.Packet, 100),
+		videoSeq:   7000,
+	}
+
+	streamer.RegisterSession("viewer_late_joiner", sess)
+
+	// Viewer must receive cached STAP-A packet stamped with lastTs (current stream time), NOT videoRtpBase
+	select {
+	case pkt := <-sess.videoQueue:
+		if pkt.Timestamp != lastTs {
+			t.Fatalf("Expected cached config timestamp %d (current stream time), got %d", lastTs, pkt.Timestamp)
+		}
+		if pkt.Payload[0] != 0x78 { // STAP-A
+			t.Fatalf("Expected STAP-A packet (0x78), got 0x%02x", pkt.Payload[0])
+		}
+		t.Logf("[PASS] Cached SPS/PPS delivered to new viewer with aligned timestamp %d", pkt.Timestamp)
+	default:
+		t.Fatal("No cached config packet delivered to new session")
+	}
+}

@@ -366,8 +366,21 @@ func (s *WebRTCSession) setupInputChannel(dc *webrtc.DataChannel) {
 			if err := json.Unmarshal(msg.Data, &sc); err == nil {
 				_ = s.ctrl.SendScroll(sc.X, sc.Y, sc.W, sc.H, sc.ScrollH, sc.ScrollV)
 			}
+		case "set_display_power":
+			var pwr struct {
+				On bool `json:"on"`
+			}
+			if err := json.Unmarshal(msg.Data, &pwr); err == nil {
+				_ = s.ctrl.SetDisplayPower(pwr.On)
+			}
 		}
 	})
+}
+
+func (s *WebRTCSession) SetControlWriter(ctrl *ControlWriter) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.ctrl = ctrl
 }
 
 func (s *WebRTCSession) setupClipboardChannel(dc *webrtc.DataChannel) {

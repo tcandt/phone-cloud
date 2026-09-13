@@ -98,7 +98,7 @@ class ControllerActivity : AppCompatActivity(), TextureView.SurfaceTextureListen
     private var currentCaptureHeight = 720
     private var currentCaptureRequestBuilder: CaptureRequest.Builder? = null
 
-    // Surveillance Advanced Features: PTZ Digital Zoom, Rotation, Instant Recording & WakeLock
+    // Local Camera Injection State (Controller Camera2 -> Remote Agent)
     private var currentZoomRatio: Float = 1.0f
     private var currentCameraRotation: Int = 0
     private var cameraWakeLock: PowerManager.WakeLock? = null
@@ -107,6 +107,34 @@ class ControllerActivity : AppCompatActivity(), TextureView.SurfaceTextureListen
     private var recordingOutputStream: FileOutputStream? = null
     private var recordingStartTimeMs: Long = 0L
     private var recordedFrameCount: Long = 0L
+
+    // Remote Surveillance Camera State (Remote Phone Hardware Camera -> WebRTC VideoTrack)
+    private var isRemoteSurveillanceMode: Boolean = false
+    private var remoteCameraFacing: String = "back"
+    private var remoteCameraId: String = "0"
+    private var remoteCameraSize: String = "1920x1080"
+    private var remoteCameraFps: Int = 30
+    private var remoteCameraZoomRatio: Float = 1.0f
+    private var remoteCameraOrientation: String = "auto"
+    private var remoteStayAwake: Boolean = true
+    private var remoteScreenOff: Boolean = false
+
+    // Viewport PTZ Parity (Pan X/Y, Zoom, Rotate, Horizontal Mirror)
+    private var viewportZoom: Float = 1.0f
+    private var viewportPanX: Float = 0f
+    private var viewportPanY: Float = 0f
+    private var viewportRotation: Float = 0f
+    private var viewportMirror: Boolean = false
+    private var lastTouchX: Float = 0f
+    private var lastTouchY: Float = 0f
+    private var isPanning: Boolean = false
+
+    // Remote Surveillance Stream Recording & Snapshot
+    private var isRemoteRecording = false
+    private var remoteRecordingHandler: Handler? = null
+    private var remoteRecordingRunnable: Runnable? = null
+    private var remoteRecordingSessionDir: File? = null
+    private var remoteRecordingFrameCount = 0L
 
     private var targetDeviceId: String = ""
     private var serverUrl: String = ""
@@ -807,6 +835,34 @@ class ControllerActivity : AppCompatActivity(), TextureView.SurfaceTextureListen
             val h = v.height
             if (w <= 0 || h <= 0) return@setOnTouchListener false
 
+            // When in Remote Surveillance Camera Mode and zoomed in, touch drags pan the viewport
+            if (isRemoteSurveillanceMode && viewportZoom > 1.0f) {
+                when (event.actionMasked) {
+                    MotionEvent.ACTION_DOWN -> {
+                        lastTouchX = event.x
+                        lastTouchY = event.y
+                        isPanning = true
+                        return@setOnTouchListener true
+                    }
+                    MotionEvent.ACTION_MOVE -> {
+                        if (isPanning) {
+                            val dx = event.x - lastTouchX
+                            val dy = event.y - lastTouchY
+                            viewportPanX += dx
+                            viewportPanY += dy
+                            lastTouchX = event.x
+                            lastTouchY = event.y
+                            applyViewportTransform()
+                            return@setOnTouchListener true
+                        }
+                    }
+                    MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
+                        isPanning = false
+                        return@setOnTouchListener true
+                    }
+                }
+            }
+
             val actionMasked = event.actionMasked
             val pointerIndex = event.actionIndex
 
@@ -1018,33 +1074,284 @@ class ControllerActivity : AppCompatActivity(), TextureView.SurfaceTextureListen
             .show()
     }
 
+    fun applyViewportTransform() {
+        binding.webrtcVideoView.apply {
+            pivotX = width / 2f
+            pivotY = height / 2f
+            scaleX = viewportZoom * (if (viewportMirror) -1f else 1f)
+            scaleY = viewportZoom
+            translationX = viewportPanX
+            translationY = viewportPanY
+            rotation = viewportRotation
+        }
+    }
+
+    fun resetViewportPTZ() {
+        viewportZoom = 1.0f
+        viewportPanX = 0f
+        viewportPanY = 0f
+        viewportRotation = 0f
+        viewportMirror = false
+        applyViewportTransform()
+        Toast.makeText(this, "Viewport PTZ reset to default", Toast.LENGTH_SHORT).show()
+    }
+
+    private fun toggleRemoteSurveillanceMode() {
+        isRemoteSurveillanceMode = !isRemoteSurveillanceMode
+        if (isRemoteSurveillanceMode) {
+            Toast.makeText(this, "Switching to Remote Phone Hardware Camera...", Toast.LENGTH_SHORT).show()
+            val options = WebRTCManager.buildRemoteCameraOptions(
+                facing = remoteCameraFacing,
+                cameraId = remoteCameraId,
+                size = remoteCameraSize,
+                fps = remoteCameraFps,
+                zoomRatio = remoteCameraZoomRatio,
+                orientation = remoteCameraOrientation,
+                stayAwake = remoteStayAwake,
+                powerOff = remoteScreenOff
+            )
+            webRTCManager?.reconnectWithOptions(options)
+        } else {
+            Toast.makeText(this, "Switching back to Remote Phone Display...", Toast.LENGTH_SHORT).show()
+            resetViewportPTZ()
+            val options = JsonObject().apply {
+                addProperty("video_source", "display")
+            }
+            webRTCManager?.reconnectWithOptions(options)
+        }
+    }
+
+    private fun showRemoteLensSelectionDialog() {
+        val lenses = arrayOf(
+            "Back Main Lens (1.0x)" to ("back" to "0"),
+            "Back Ultra-Wide Lens (0.5x)" to ("back" to "0"),
+            "Back Telephoto Lens (2.0x)" to ("back" to "0"),
+            "Front Selfie Camera (1.0x)" to ("front" to "1"),
+            "External Camera Lens" to ("external" to "")
+        )
+        val titles = lenses.map { it.first }.toTypedArray()
+        AlertDialog.Builder(this)
+            .setTitle("Select Remote Camera Lens")
+            .setItems(titles) { _, which ->
+                val chosen = lenses[which]
+                remoteCameraFacing = chosen.second.first
+                remoteCameraId = chosen.second.second
+                when (which) {
+                    0 -> remoteCameraZoomRatio = 1.0f
+                    1 -> remoteCameraZoomRatio = 0.5f
+                    2 -> remoteCameraZoomRatio = 2.0f
+                    3 -> {
+                        remoteCameraZoomRatio = 1.0f
+                        viewportMirror = true // Front selfie defaults to mirror flip
+                    }
+                    4 -> remoteCameraZoomRatio = 1.0f
+                }
+                applyViewportTransform()
+                Toast.makeText(this, "Selected ${chosen.first}", Toast.LENGTH_SHORT).show()
+                if (isRemoteSurveillanceMode) {
+                    val options = WebRTCManager.buildRemoteCameraOptions(
+                        facing = remoteCameraFacing,
+                        cameraId = remoteCameraId,
+                        size = remoteCameraSize,
+                        fps = remoteCameraFps,
+                        zoomRatio = remoteCameraZoomRatio,
+                        orientation = remoteCameraOrientation,
+                        stayAwake = remoteStayAwake,
+                        powerOff = remoteScreenOff
+                    )
+                    webRTCManager?.reconnectWithOptions(options)
+                }
+            }
+            .setNegativeButton("Cancel", null)
+            .show()
+    }
+
+    private fun showRemoteResolutionSelectionDialog() {
+        val resOptions = arrayOf("1080P (1920x1080)", "720P (1280x720)", "480P (640x480)", "4K (3840x2160)")
+        val resValues = arrayOf("1920x1080", "1280x720", "640x480", "3840x2160")
+        AlertDialog.Builder(this)
+            .setTitle("Select Remote Camera Resolution")
+            .setItems(resOptions) { _, which ->
+                remoteCameraSize = resValues[which]
+                Toast.makeText(this, "Remote camera resolution: $remoteCameraSize", Toast.LENGTH_SHORT).show()
+                if (isRemoteSurveillanceMode) {
+                    val options = WebRTCManager.buildRemoteCameraOptions(
+                        facing = remoteCameraFacing,
+                        cameraId = remoteCameraId,
+                        size = remoteCameraSize,
+                        fps = remoteCameraFps,
+                        zoomRatio = remoteCameraZoomRatio,
+                        orientation = remoteCameraOrientation,
+                        stayAwake = remoteStayAwake,
+                        powerOff = remoteScreenOff
+                    )
+                    webRTCManager?.reconnectWithOptions(options)
+                }
+            }
+            .setNegativeButton("Cancel", null)
+            .show()
+    }
+
+    private fun toggleRemoteScreenPower() {
+        remoteScreenOff = !remoteScreenOff
+        webRTCManager?.sendSetDisplayPower(!remoteScreenOff)
+        Toast.makeText(
+            this,
+            if (remoteScreenOff) "Remote screen turned OFF (Camera streaming continues)" else "Remote screen turned ON",
+            Toast.LENGTH_SHORT
+        ).show()
+    }
+
+    private fun showViewportZoomDialog() {
+        val zoomLevels = arrayOf("1.0x (Normal)", "1.5x", "2.0x", "3.0x", "5.0x")
+        val zoomValues = arrayOf(1.0f, 1.5f, 2.0f, 3.0f, 5.0f)
+        AlertDialog.Builder(this)
+            .setTitle("Viewport PTZ Zoom")
+            .setItems(zoomLevels) { _, which ->
+                viewportZoom = zoomValues[which]
+                if (viewportZoom <= 1.0f) {
+                    viewportPanX = 0f
+                    viewportPanY = 0f
+                }
+                applyViewportTransform()
+                Toast.makeText(this, "Viewport zoom: ${viewportZoom}x (Drag with finger to pan)", Toast.LENGTH_SHORT).show()
+            }
+            .setNegativeButton("Cancel", null)
+            .show()
+    }
+
+    private fun takeRemoteSurveillanceSnapshot() {
+        val view = binding.webrtcVideoView
+        if (view.width <= 0 || view.height <= 0) {
+            Toast.makeText(this, "Remote video stream is not active yet", Toast.LENGTH_SHORT).show()
+            return
+        }
+
+        try {
+            val bitmap = android.graphics.Bitmap.createBitmap(view.width, view.height, android.graphics.Bitmap.Config.ARGB_8888)
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
+                android.view.PixelCopy.request(view, bitmap, { copyResult ->
+                    if (copyResult == android.view.PixelCopy.SUCCESS) {
+                        saveSnapshotBitmap(bitmap)
+                    } else {
+                        mainHandler.post {
+                            Toast.makeText(this, "PixelCopy snapshot completed with code $copyResult", Toast.LENGTH_SHORT).show()
+                        }
+                    }
+                }, Handler(Looper.getMainLooper()))
+            } else {
+                saveSnapshotBitmap(bitmap)
+            }
+        } catch (e: Throwable) {
+            Log.e(TAG, "Error capturing remote surveillance snapshot: ${e.message}", e)
+            Toast.makeText(this, "Snapshot error: ${e.message}", Toast.LENGTH_SHORT).show()
+        }
+    }
+
+    private fun saveSnapshotBitmap(bitmap: android.graphics.Bitmap) {
+        val timestamp = System.currentTimeMillis()
+        val dir = getExternalFilesDir(Environment.DIRECTORY_PICTURES) ?: filesDir
+        val file = File(dir, "surveillance_snapshot_$timestamp.jpg")
+        try {
+            FileOutputStream(file).use { out ->
+                bitmap.compress(android.graphics.Bitmap.CompressFormat.JPEG, 90, out)
+            }
+            mainHandler.post {
+                Toast.makeText(this, "Remote Snapshot saved: ${file.name}", Toast.LENGTH_LONG).show()
+                Log.i(TAG, "Remote surveillance snapshot saved to ${file.absolutePath} (${file.length()} bytes)")
+            }
+        } catch (e: Throwable) {
+            Log.e(TAG, "Failed to save snapshot file: ${e.message}", e)
+        }
+    }
+
+    private fun toggleRemoteRecording() {
+        if (isRemoteRecording) {
+            isRemoteRecording = false
+            remoteRecordingRunnable?.let { remoteRecordingHandler?.removeCallbacks(it) }
+            remoteRecordingRunnable = null
+            Toast.makeText(this, "Remote recording stopped. Saved $remoteRecordingFrameCount frames to ${remoteRecordingSessionDir?.name}", Toast.LENGTH_LONG).show()
+        } else {
+            val timestamp = System.currentTimeMillis()
+            val dir = File(getExternalFilesDir(Environment.DIRECTORY_MOVIES) ?: filesDir, "surveillance_rec_$timestamp")
+            dir.mkdirs()
+            remoteRecordingSessionDir = dir
+            remoteRecordingFrameCount = 0L
+            isRemoteRecording = true
+
+            val view = binding.webrtcVideoView
+            if (remoteRecordingHandler == null) {
+                val thread = HandlerThread("RemoteRecordingThread")
+                thread.start()
+                remoteRecordingHandler = Handler(thread.looper)
+            }
+
+            remoteRecordingRunnable = object : Runnable {
+                override fun run() {
+                    if (!isRemoteRecording) return
+                    if (view.width > 0 && view.height > 0 && Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
+                        val bmp = android.graphics.Bitmap.createBitmap(view.width, view.height, android.graphics.Bitmap.Config.ARGB_8888)
+                        android.view.PixelCopy.request(view, bmp, { res ->
+                            if (res == android.view.PixelCopy.SUCCESS) {
+                                val frameFile = File(dir, String.format("frame_%06d.jpg", remoteRecordingFrameCount++))
+                                try {
+                                    FileOutputStream(frameFile).use { out ->
+                                        bmp.compress(android.graphics.Bitmap.CompressFormat.JPEG, 80, out)
+                                    }
+                                } catch (_: Throwable) {}
+                            }
+                        }, Handler(Looper.getMainLooper()))
+                    }
+                    remoteRecordingHandler?.postDelayed(this, 200) // 5 fps periodic snapshot recording
+                }
+            }
+            remoteRecordingHandler?.post(remoteRecordingRunnable!!)
+            Toast.makeText(this, "Remote stream recording started (saving to ${dir.name})", Toast.LENGTH_SHORT).show()
+        }
+    }
+
     private fun showCameraControlDialog() {
-        val lenses = queryAvailableCameraLenses()
-        val currentLensName = lenses.find { it.id == currentSelectedCameraId }?.facingName ?: "Back"
         val options = arrayOf(
-            "Switch Lens (Current: $currentLensName)",
-            "Change Resolution (Current: ${currentCaptureWidth}x${currentCaptureHeight})",
-            "PTZ Digital Zoom (Current: ${currentZoomRatio}x)",
-            "Rotate Camera (${currentCameraRotation}°)",
-            "Take Surveillance Snapshot",
-            if (isRecording) "Stop Instant Recording (Active: $recordedFrameCount frames)" else "Start Instant Recording",
-            if (isCameraCapturing) "Stop Camera Streaming" else "Start Camera Streaming",
-            "Camera Surveillance Diagnostics"
+            // --- Remote Surveillance Camera (Hardware Camera of Remote Phone) ---
+            if (isRemoteSurveillanceMode) "📹 Surveillance: Switch to Remote Display Mode" else "📷 Surveillance: Switch to Remote Camera Stream",
+            "🔍 Remote Lens (${remoteCameraFacing.uppercase()}, ID: $remoteCameraId, ${remoteCameraZoomRatio}x)",
+            "📐 Remote Resolution (${remoteCameraSize} @ ${remoteCameraFps}fps)",
+            if (remoteScreenOff) "💡 Remote Screen: Turn ON" else "🌙 Remote Screen: Turn OFF (Keep Streaming)",
+            "🖼️ Viewport PTZ: Zoom (Current: ${viewportZoom}x, Pan: ${viewportPanX.toInt()},${viewportPanY.toInt()})",
+            "🔄 Viewport Rotate (${viewportRotation.toInt()}°)",
+            "🪞 Viewport Mirror (${if (viewportMirror) "ON (Flipped)" else "OFF"})",
+            "↩️ Reset Viewport PTZ (1.0x, Pan 0,0)",
+            "📸 Take Remote Stream Snapshot (VideoTrack)",
+            if (isRemoteRecording) "⏹️ Stop Remote Stream Recording" else "🔴 Start Remote Stream Recording",
+            // --- Local Camera Injection (Controller -> Remote Device) ---
+            "--- Local Camera Injection ---",
+            if (isCameraCapturing) "🛑 Stop Local Camera Injection" else "▶️ Start Local Camera Injection (Controller Camera2)",
+            "⚙️ Local Camera Injection Lens & Settings"
         )
         AlertDialog.Builder(this)
-            .setTitle("Surveillance Camera Control")
+            .setTitle("Surveillance & Camera Controls")
             .setItems(options) { _, which ->
                 when (which) {
-                    0 -> showLensSelectionDialog(lenses)
-                    1 -> showResolutionSelectionDialog()
-                    2 -> showZoomSelectionDialog()
-                    3 -> showRotationSelectionDialog()
-                    4 -> {
-                        webRTCManager?.sendCameraCommand("camera_snapshot")
-                        Toast.makeText(this, "Requested snapshot from camera...", Toast.LENGTH_SHORT).show()
+                    0 -> toggleRemoteSurveillanceMode()
+                    1 -> showRemoteLensSelectionDialog()
+                    2 -> showRemoteResolutionSelectionDialog()
+                    3 -> toggleRemoteScreenPower()
+                    4 -> showViewportZoomDialog()
+                    5 -> {
+                        viewportRotation = (viewportRotation + 90f) % 360f
+                        applyViewportTransform()
+                        Toast.makeText(this, "Viewport rotated to ${viewportRotation.toInt()}°", Toast.LENGTH_SHORT).show()
                     }
-                    5 -> toggleRecording()
                     6 -> {
+                        viewportMirror = !viewportMirror
+                        applyViewportTransform()
+                        Toast.makeText(this, "Viewport mirror: ${if (viewportMirror) "Enabled (Flipped)" else "Disabled"}", Toast.LENGTH_SHORT).show()
+                    }
+                    7 -> resetViewportPTZ()
+                    8 -> takeRemoteSurveillanceSnapshot()
+                    9 -> toggleRemoteRecording()
+                    10 -> {} // Separator
+                    11 -> {
                         if (isCameraCapturing) {
                             stopCameraCapture()
                             webRTCManager?.sendCameraCommand("camera_stop")
@@ -1053,10 +1360,37 @@ class ControllerActivity : AppCompatActivity(), TextureView.SurfaceTextureListen
                             webRTCManager?.sendCameraCommand("camera_start")
                         }
                     }
-                    7 -> showCameraStatusDialog(currentLensName)
+                    12 -> showLocalCameraInjectionSettings()
                 }
             }
             .setNegativeButton("Close", null)
+            .show()
+    }
+
+    private fun showLocalCameraInjectionSettings() {
+        val lenses = queryAvailableCameraLenses()
+        val currentLensName = lenses.find { it.id == currentSelectedCameraId }?.facingName ?: "Back"
+        val options = arrayOf(
+            "Switch Local Lens (Current: $currentLensName)",
+            "Change Local Resolution (Current: ${currentCaptureWidth}x${currentCaptureHeight})",
+            "Local Camera2 Digital Zoom (Current: ${currentZoomRatio}x)",
+            "Rotate Local Camera (${currentCameraRotation}°)",
+            if (isRecording) "Stop Local MJPEG Recording ($recordedFrameCount frames)" else "Start Local MJPEG Recording",
+            "Local Camera2 Diagnostics"
+        )
+        AlertDialog.Builder(this)
+            .setTitle("Local Camera Injection Settings")
+            .setItems(options) { _, which ->
+                when (which) {
+                    0 -> showLensSelectionDialog(lenses)
+                    1 -> showResolutionSelectionDialog()
+                    2 -> showZoomSelectionDialog()
+                    3 -> showRotationSelectionDialog()
+                    4 -> toggleRecording()
+                    5 -> showCameraStatusDialog(currentLensName)
+                }
+            }
+            .setNegativeButton("Back", null)
             .show()
     }
 

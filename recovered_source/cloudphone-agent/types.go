@@ -54,6 +54,26 @@ type AgentConfig struct {
 	Standalone         bool
 }
 
+// ScrcpyOptions encapsulates client-requested streaming parameters received in request-offer
+type ScrcpyOptions struct {
+	VideoSource       string  `json:"video_source"`       // "display" or "camera"
+	CameraFacing      string  `json:"camera_facing"`      // "front", "back", "external"
+	CameraID          string  `json:"camera_id"`          // e.g. "0", "1"
+	CameraSize        string  `json:"camera_size"`        // e.g. "1920x1080", "1280x720"
+	CameraFPS         int     `json:"camera_fps"`         // e.g. 30, 60
+	CameraHighSpeed   bool    `json:"camera_high_speed"`
+	CameraAr          string  `json:"camera_ar"`          // e.g. "16:9", "4:3"
+	CameraZoom        float64 `json:"camera_zoom"`        // e.g. 1.0, 2.0
+	CameraOrientation string  `json:"camera_orientation"` // e.g. "auto", "0", "90"
+	StayAwake         bool    `json:"stay_awake"`
+	PowerOff          bool    `json:"power_off"`
+	MaxSize           int     `json:"max_size"`
+	VideoBitRate      int     `json:"video_bit_rate"`
+	MaxFPS            int     `json:"max_fps"`
+	Audio             *bool   `json:"audio"`
+	AudioSource       string  `json:"audio_source"`
+}
+
 // SessionCapabilities defines permissions granted to a client session
 type SessionCapabilities struct {
 	CanControl    bool `json:"can_control"`

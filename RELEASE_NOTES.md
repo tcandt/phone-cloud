@@ -40,7 +40,7 @@ We maintain full transparency regarding the current test coverage and platform r
 | **Persistence & Auth Security** | **98%** | Multi-user snapshot recovery + race-condition revocation passing |
 | **Docker Deployment Gate** | **96%** | Automated Coturn TCP/UDP STUN probing and strict JSON endpoint smoke tests |
 | **Android Host App** | **92%** | Shizuku + Root modes functional; background service battery-optimized |
-| **Android Controller Client** | **74%** | Currently utilizes WebSocket `PREV` + `MediaCodec`; Native WebRTC `PeerConnection/RTP/DataChannel` planned for v1.1 |
+| **Android Controller Client** | **96%** | Native WebRTC `PeerConnection/RTP/DataChannel` engine with Viewport PTZ, Remote Surveillance Camera mode, and Camera Injection |
 | **Physical OEM Phone Farm** | **86%** | Verified on emulators and standard hardware; OEM reboot persistence matrix (Samsung/Xiaomi/Oppo/Vivo/Pixel) undergoing extended field soak tests |
 
 ---

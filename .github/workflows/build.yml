@@ -28,7 +28,7 @@ jobs:
       - name: Run Agent Conformance, TURN Relay & WebRTC End-to-End Integration Tests
         run: |
           cd recovered_source/cloudphone-agent
-          go test -v -timeout 90s -run "TestAgentConformance|TestTURNRelay|TestWebRTC_EndToEndIntegration" .
+          go test -v -timeout 180s ./...
 
       - name: Run Differential Parity Tests (Original vs Recovered)
         run: |

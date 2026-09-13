@@ -136,4 +136,84 @@ class WebRTCControllerTest {
         assertEquals("camera_rotate", rotCmd.get("action").asString)
         assertEquals(180, rotCmd.getAsJsonObject("params").get("degrees").asInt)
     }
+
+    @Test
+    fun testBuildRemoteCameraOptionsParity() {
+        val camOpts = com.cloudphone.app.webrtc.WebRTCManager.buildRemoteCameraOptions(
+            facing = "front",
+            cameraId = "1",
+            size = "1280x720",
+            fps = 60,
+            zoomRatio = 2.0f,
+            orientation = "0",
+            stayAwake = true,
+            powerOff = true
+        )
+
+        assertEquals("camera", camOpts.get("video_source").asString)
+        assertEquals("front", camOpts.get("camera_facing").asString)
+        assertEquals("1", camOpts.get("camera_id").asString)
+        assertEquals("1280x720", camOpts.get("camera_size").asString)
+        assertEquals(60, camOpts.get("camera_fps").asInt)
+        assertEquals(2.0f, camOpts.get("camera_zoom").asFloat, 0.001f)
+        assertEquals("0", camOpts.get("camera_orientation").asString)
+        assertTrue(camOpts.get("stay_awake").asBoolean)
+        assertTrue(camOpts.get("power_off").asBoolean)
+    }
+
+    @Test
+    fun testRequestOfferWithScrcpyOptionsEnvelope() {
+        val camOpts = com.cloudphone.app.webrtc.WebRTCManager.buildRemoteCameraOptions(
+            facing = "back",
+            size = "1920x1080",
+            fps = 30,
+            stayAwake = true,
+            powerOff = true
+        )
+
+        val payload = JsonObject().apply {
+            addProperty("type", "request-offer")
+            addProperty("request", "request-offer")
+            add("scrcpy_options", camOpts)
+        }
+
+        val envelope = JsonObject().apply {
+            addProperty("message_type", "forward")
+            addProperty("device_id", "phone_remote_01")
+            add("payload", payload)
+        }
+
+        val parsed = Gson().fromJson(envelope.toString(), JsonObject::class.java)
+        assertEquals("forward", parsed.get("message_type").asString)
+        assertEquals("phone_remote_01", parsed.get("device_id").asString)
+
+        val innerPayload = parsed.getAsJsonObject("payload")
+        assertEquals("request-offer", innerPayload.get("type").asString)
+        assertTrue(innerPayload.has("scrcpy_options"))
+
+        val scrcpyOpts = innerPayload.getAsJsonObject("scrcpy_options")
+        assertEquals("camera", scrcpyOpts.get("video_source").asString)
+        assertEquals("back", scrcpyOpts.get("camera_facing").asString)
+        assertEquals("1920x1080", scrcpyOpts.get("camera_size").asString)
+        assertTrue(scrcpyOpts.get("stay_awake").asBoolean)
+        assertTrue(scrcpyOpts.get("power_off").asBoolean)
+    }
+
+    @Test
+    fun testSetDisplayPowerPayload() {
+        val powerOffMsg = JsonObject().apply {
+            addProperty("type", "set_display_power")
+            addProperty("on", false)
+        }
+        assertEquals("set_display_power", powerOffMsg.get("type").asString)
+        assertFalse(powerOffMsg.get("on").asBoolean)
+
+        val powerOnMsg = JsonObject().apply {
+            addProperty("type", "set_display_power")
+            addProperty("on", true)
+        }
+        assertEquals("set_display_power", powerOnMsg.get("type").asString)
+        assertTrue(powerOnMsg.get("on").asBoolean)
+    }
 }
+

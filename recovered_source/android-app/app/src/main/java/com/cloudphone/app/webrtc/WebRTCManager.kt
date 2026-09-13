@@ -20,6 +20,29 @@ class WebRTCManager(
     companion object {
         private const val TAG = "WebRTCManager"
         private const val CONNECTION_TIMEOUT_MS = 12000L
+
+        fun buildRemoteCameraOptions(
+            facing: String = "back",
+            cameraId: String = "0",
+            size: String = "1920x1080",
+            fps: Int = 30,
+            zoomRatio: Float = 1.0f,
+            orientation: String = "auto",
+            stayAwake: Boolean = true,
+            powerOff: Boolean = false
+        ): JsonObject {
+            return JsonObject().apply {
+                addProperty("video_source", "camera")
+                addProperty("camera_facing", facing)
+                addProperty("camera_id", cameraId)
+                addProperty("camera_size", size)
+                addProperty("camera_fps", fps)
+                addProperty("camera_zoom", zoomRatio)
+                addProperty("camera_orientation", orientation)
+                addProperty("stay_awake", stayAwake)
+                addProperty("power_off", powerOff)
+            }
+        }
     }
 
     interface WebRTCListener {
@@ -107,8 +130,17 @@ class WebRTCManager(
         }
     }
 
-    fun startConnection(deviceId: String, iceServersList: List<PeerConnection.IceServer>? = null) {
+    private var currentScrcpyOptions: JsonObject? = null
+
+    fun startConnection(
+        deviceId: String,
+        iceServersList: List<PeerConnection.IceServer>? = null,
+        scrcpyOptions: JsonObject? = null
+    ) {
         this.targetDeviceId = deviceId
+        if (scrcpyOptions != null) {
+            this.currentScrcpyOptions = scrcpyOptions
+        }
         setState(WebRTCConnectionState.SIGNALING)
 
         val servers = iceServersList ?: currentIceServers
@@ -137,6 +169,10 @@ class WebRTCManager(
         val requestOfferPayload = JsonObject().apply {
             addProperty("type", "request-offer")
             addProperty("request", "request-offer")
+            val effectiveOptions = scrcpyOptions ?: currentScrcpyOptions
+            if (effectiveOptions != null) {
+                add("scrcpy_options", effectiveOptions)
+            }
         }
         val forwardMsg = JsonObject().apply {
             addProperty("message_type", "forward")
@@ -144,7 +180,30 @@ class WebRTCManager(
             add("payload", requestOfferPayload)
         }
         listener.onSendSignaling(forwardMsg)
-        Log.i(TAG, "WebRTC connection initiated for device: $deviceId with ${iceServers.size} ICE servers")
+        Log.i(TAG, "WebRTC connection initiated for device: $deviceId with ${iceServers.size} ICE servers (hasOptions=${requestOfferPayload.has("scrcpy_options")})")
+    }
+
+    fun reconnectWithOptions(scrcpyOptions: JsonObject) {
+        this.currentScrcpyOptions = scrcpyOptions
+        if (targetDeviceId.isNotEmpty()) {
+            close()
+            mainHandler.postDelayed({
+                startConnection(targetDeviceId, currentIceServers, scrcpyOptions)
+            }, 300)
+        }
+    }
+
+    fun sendSetDisplayPower(on: Boolean): Boolean {
+        val dc = dataChannels["input-channel"] ?: return false
+        if (dc.state() != DataChannel.State.OPEN) return false
+        val pwrPayload = JsonObject().apply {
+            addProperty("type", "set_display_power")
+            addProperty("on", on)
+        }
+        val buffer = DataChannel.Buffer(ByteBuffer.wrap(pwrPayload.toString().toByteArray(StandardCharsets.UTF_8)), false)
+        val sent = dc.send(buffer)
+        Log.i(TAG, "Sent set_display_power(on=$on) via input-channel (success=$sent)")
+        return sent
     }
 
     private fun startConnectionTimeout() {
