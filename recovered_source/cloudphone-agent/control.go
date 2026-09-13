@@ -38,6 +38,9 @@ func (cw *ControlWriter) SendTouch(action byte, pointerID int64, x, y, w, h int,
 	binary.BigEndian.PutUint32(buf[24:28], 0) // actionButton
 	binary.BigEndian.PutUint32(buf[28:32], 0) // buttons
 
+	if cw.conn == nil {
+		return nil
+	}
 	_, err := cw.conn.Write(buf)
 	return err
 }
@@ -54,6 +57,9 @@ func (cw *ControlWriter) SendKeycode(action byte, keycode, repeat, meta int) err
 	binary.BigEndian.PutUint32(buf[6:10], uint32(repeat))
 	binary.BigEndian.PutUint32(buf[10:14], uint32(meta))
 
+	if cw.conn == nil {
+		return nil
+	}
 	_, err := cw.conn.Write(buf)
 	return err
 }
@@ -69,6 +75,9 @@ func (cw *ControlWriter) SendText(text string) error {
 	binary.BigEndian.PutUint32(buf[1:5], uint32(len(textBytes)))
 	copy(buf[5:], textBytes)
 
+	if cw.conn == nil {
+		return nil
+	}
 	_, err := cw.conn.Write(buf)
 	return err
 }
@@ -89,6 +98,9 @@ func (cw *ControlWriter) SendScroll(x, y, w, h int, hScroll, vScroll float32) er
 	binary.BigEndian.PutUint32(buf[13:17], uint32(int32(hScroll*65536.0)))
 	binary.BigEndian.PutUint32(buf[17:21], uint32(int32(vScroll*65536.0)))
 
+	if cw.conn == nil {
+		return nil
+	}
 	_, err := cw.conn.Write(buf)
 	return err
 }
@@ -102,6 +114,9 @@ func (cw *ControlWriter) SetBitrate(bitrate int) error {
 	buf[0] = ControlMsgSetBitrate
 	binary.BigEndian.PutUint32(buf[1:5], uint32(bitrate))
 
+	if cw.conn == nil {
+		return nil
+	}
 	_, err := cw.conn.Write(buf)
 	return err
 }
@@ -111,6 +126,9 @@ func (cw *ControlWriter) RequestKeyframe() error {
 	cw.mu.Lock()
 	defer cw.mu.Unlock()
 
+	if cw.conn == nil {
+		return nil
+	}
 	_, err := cw.conn.Write([]byte{ControlMsgRequestKeyframe})
 	return err
 }
@@ -132,6 +150,9 @@ func (cw *ControlWriter) SetClipboard(text string, paste bool) error {
 	binary.BigEndian.PutUint32(buf[10:14], uint32(len(textBytes)))
 	copy(buf[14:], textBytes)
 
+	if cw.conn == nil {
+		return nil
+	}
 	_, err := cw.conn.Write(buf)
 	return err
 }

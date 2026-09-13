@@ -183,25 +183,47 @@ jobs:
           docker compose ps coturn
           docker compose logs coturn | tail -n 25
           echo "Waiting for Coturn to listen on port 3478..."
+          coturn_ok=0
           for i in $(seq 1 15); do
             if python3 -c "import socket; s = socket.socket(socket.AF_INET, socket.SOCK_STREAM); s.settimeout(1); s.connect(('127.0.0.1', 3478)); s.close()" 2>/dev/null; then
               echo "PASS: Coturn TCP 3478 socket accepting connections"
+              coturn_ok=1
               break
             fi
             sleep 1
           done
-          # Verify UDP 3478 listener is responsive
+          if [ "$coturn_ok" -ne 1 ]; then
+            echo "ERROR: Coturn TCP 3478 socket did not accept connections within 15 seconds"
+            exit 1
+          fi
+          # Strict UDP 3478 STUN Binding probe (fail-closed)
           python3 -c "
-          import socket, os
+          import socket, os, sys, struct
           s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-          s.settimeout(3)
-          req = b'\x00\x01\x00\x00\x21\x12\xa4\x42' + os.urandom(12)
+          s.settimeout(5)
+          tx_id = os.urandom(12)
+          req = struct.pack('!HHI', 0x0001, 0, 0x2112a442) + tx_id
           try:
               s.sendto(req, ('127.0.0.1', 3478))
               data, _ = s.recvfrom(1024)
-              print('PASS: Coturn UDP 3478 STUN binding verified')
+              if len(data) < 20:
+                  print('ERROR: STUN response too short (<20 bytes):', len(data), file=sys.stderr)
+                  sys.exit(1)
+              msg_type, msg_len, magic = struct.unpack('!HHI', data[:8])
+              resp_tx_id = data[8:20]
+              if msg_type != 0x0101:
+                  print(f'ERROR: Expected STUN Binding Success (0x0101), got 0x{msg_type:04x}', file=sys.stderr)
+                  sys.exit(1)
+              if magic != 0x2112a442:
+                  print(f'ERROR: STUN magic cookie mismatch: 0x{magic:08x}', file=sys.stderr)
+                  sys.exit(1)
+              if resp_tx_id != tx_id:
+                  print('ERROR: STUN transaction ID mismatch', file=sys.stderr)
+                  sys.exit(1)
+              print('PASS: Coturn UDP 3478 STUN Binding Success (0x0101) verified with matching transaction ID')
           except Exception as e:
-              print('Coturn UDP socket probe sent to port 3478')
+              print(f'ERROR: Coturn UDP 3478 STUN binding probe failed: {e}', file=sys.stderr)
+              sys.exit(1)
           "
           echo "PASS: Coturn TURN runtime healthcheck completed"
 

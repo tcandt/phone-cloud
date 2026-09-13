@@ -96,4 +96,21 @@ class OpusDecoderTest {
         assertTrue("Decoded PCM must contain non-zero audio samples", nonZeroCount > 0)
         decoder.release()
     }
+
+    @Test
+    fun testNativeLibOpusAbiSymbolsPresentInPackagedBinaries() {
+        val buildDir = java.io.File("build")
+        if (!buildDir.exists()) return
+
+        val soFiles = buildDir.walkTopDown().filter { it.name == "libopus.so" }.toList()
+        if (soFiles.isEmpty()) return
+
+        for (soFile in soFiles) {
+            val content = soFile.readBytes()
+            val text = String(content, java.nio.charset.StandardCharsets.ISO_8859_1)
+            assertTrue("libopus.so in ${soFile.parent} must export opus_decode", text.contains("opus_decode"))
+            assertTrue("libopus.so in ${soFile.parent} must export opus_decoder_create", text.contains("opus_decoder_create"))
+            assertTrue("libopus.so in ${soFile.parent} must export opus_decoder_destroy", text.contains("opus_decoder_destroy"))
+        }
+    }
 }

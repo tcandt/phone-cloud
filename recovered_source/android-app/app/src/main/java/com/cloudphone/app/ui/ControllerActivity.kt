@@ -1,15 +1,23 @@
 package com.cloudphone.app.ui
 
+import android.Manifest
 import android.content.ClipData
 import android.content.ClipboardManager
 import android.content.Context
+import android.content.pm.PackageManager
+import android.graphics.ImageFormat
 import android.graphics.SurfaceTexture
+import android.hardware.camera2.*
 import android.media.AudioAttributes
 import android.media.AudioFormat
 import android.media.AudioTrack
+import android.media.ImageReader
 import android.media.MediaCodec
 import android.media.MediaFormat
 import android.os.Bundle
+import android.os.Handler
+import android.os.HandlerThread
+import android.os.Looper
 import android.util.Log
 import android.view.MotionEvent
 import android.view.Surface
@@ -39,6 +47,7 @@ class ControllerActivity : AppCompatActivity(), TextureView.SurfaceTextureListen
         private const val PREV_HEADER_LEN = 49
     }
 
+    private val mainHandler = Handler(Looper.getMainLooper())
     private lateinit var binding: ActivityControllerBinding
     private val client = OkHttpClient()
     private var webSocket: WebSocket? = null
@@ -52,10 +61,22 @@ class ControllerActivity : AppCompatActivity(), TextureView.SurfaceTextureListen
     private var audioTrack: AudioTrack? = null
     private lateinit var opusAudioDecoder: OpusAudioDecoder
 
-    // WebRTC Engine
+    // WebRTC Engine & ICE readiness state machine
     private var rootEglBase: EglBase? = null
     private var webRTCManager: WebRTCManager? = null
     private var cachedIceServers: List<org.webrtc.PeerConnection.IceServer>? = null
+    private var isSignalingReady = false
+    private var isIceConfigReady = false
+    private var isWebRTCStarted = false
+    private var iceConfigFallbackRunnable: Runnable? = null
+
+    // Camera2 streaming pipeline
+    private var cameraDevice: CameraDevice? = null
+    private var cameraCaptureSession: CameraCaptureSession? = null
+    private var cameraImageReader: ImageReader? = null
+    private var isCameraCapturing = false
+    private var cameraHandlerThread: HandlerThread? = null
+    private var cameraHandler: Handler? = null
 
     private var targetDeviceId: String = ""
     private var serverUrl: String = ""
@@ -170,11 +191,122 @@ class ControllerActivity : AppCompatActivity(), TextureView.SurfaceTextureListen
             if (servers.isNotEmpty()) {
                 cachedIceServers = servers
                 webRTCManager?.setIceServers(servers)
+                isIceConfigReady = true
+                maybeStartWebRTC()
                 Log.i(TAG, "Successfully loaded and configured ${servers.size} server ICE/TURN servers")
             }
         } catch (e: Throwable) {
             Log.w(TAG, "Error parsing ICE servers JSON: ${e.message}")
+            if (!isIceConfigReady) {
+                isIceConfigReady = true
+                maybeStartWebRTC()
+            }
         }
+    }
+
+    private fun maybeStartWebRTC() {
+        runOnUiThread {
+            if (isSignalingReady && isIceConfigReady && targetDeviceId.isNotEmpty() && !isWebRTCStarted) {
+                isWebRTCStarted = true
+                iceConfigFallbackRunnable?.let { mainHandler.removeCallbacks(it) }
+                binding.tvConnectingMessage.text = "Signaling & ICE ready. Connecting WebRTC..."
+                webRTCManager?.startConnection(targetDeviceId, cachedIceServers)
+                Log.i(TAG, "WebRTC connection initiated with ${cachedIceServers?.size ?: 0} ICE servers")
+            }
+        }
+    }
+
+    private fun startCameraCapture() {
+        if (isCameraCapturing) return
+        if (checkSelfPermission(Manifest.permission.CAMERA) != PackageManager.PERMISSION_GRANTED) {
+            Log.w(TAG, "Camera permission not granted, unable to start camera capture")
+            return
+        }
+        val cameraManager = getSystemService(Context.CAMERA_SERVICE) as? CameraManager ?: return
+        try {
+            val cameraIdList = cameraManager.cameraIdList
+            if (cameraIdList.isEmpty()) {
+                Log.w(TAG, "No camera devices found on device")
+                return
+            }
+            val selectedCameraId = cameraIdList[0]
+            val thread = HandlerThread("CameraCaptureThread").apply { start() }
+            cameraHandlerThread = thread
+            val handler = Handler(thread.looper)
+            cameraHandler = handler
+
+            val reader = ImageReader.newInstance(640, 480, ImageFormat.JPEG, 2)
+            cameraImageReader = reader
+            reader.setOnImageAvailableListener({ imgReader ->
+                val image = imgReader.acquireLatestImage() ?: return@setOnImageAvailableListener
+                try {
+                    val plane = image.planes[0]
+                    val buffer = plane.buffer
+                    val bytes = ByteArray(buffer.remaining())
+                    buffer.get(bytes)
+                    webRTCManager?.sendCameraFrame(bytes)
+                } catch (e: Throwable) {
+                    Log.w(TAG, "Camera frame capture error: ${e.message}")
+                } finally {
+                    image.close()
+                }
+            }, handler)
+
+            cameraManager.openCamera(selectedCameraId, object : CameraDevice.StateCallback() {
+                override fun onOpened(camera: CameraDevice) {
+                    cameraDevice = camera
+                    isCameraCapturing = true
+                    try {
+                        val surface = reader.surface
+                        val captureRequestBuilder = camera.createCaptureRequest(CameraDevice.TEMPLATE_PREVIEW).apply {
+                            addTarget(surface)
+                            set(CaptureRequest.CONTROL_MODE, CameraMetadata.CONTROL_MODE_AUTO)
+                        }
+                        camera.createCaptureSession(listOf(surface), object : CameraCaptureSession.StateCallback() {
+                            override fun onConfigured(session: CameraCaptureSession) {
+                                if (cameraDevice == null) return
+                                cameraCaptureSession = session
+                                try {
+                                    session.setRepeatingRequest(captureRequestBuilder.build(), null, handler)
+                                    Log.i(TAG, "Camera capture repeating request active at ~30 FPS")
+                                } catch (e: Throwable) {
+                                    Log.e(TAG, "Failed to start camera repeating request: ${e.message}")
+                                }
+                            }
+                            override fun onConfigureFailed(session: CameraCaptureSession) {
+                                Log.e(TAG, "Camera capture session configuration failed")
+                            }
+                        }, handler)
+                    } catch (e: Throwable) {
+                        Log.e(TAG, "Failed to setup camera capture session: ${e.message}")
+                    }
+                }
+                override fun onDisconnected(camera: CameraDevice) {
+                    stopCameraCapture()
+                }
+                override fun onError(camera: CameraDevice, error: Int) {
+                    Log.e(TAG, "Camera device error: $error")
+                    stopCameraCapture()
+                }
+            }, handler)
+        } catch (e: Throwable) {
+            Log.e(TAG, "Failed to initialize camera capture: ${e.message}", e)
+        }
+    }
+
+    private fun stopCameraCapture() {
+        isCameraCapturing = false
+        try { cameraCaptureSession?.stopRepeating() } catch (e: Throwable) {}
+        try { cameraCaptureSession?.close() } catch (e: Throwable) {}
+        cameraCaptureSession = null
+        try { cameraDevice?.close() } catch (e: Throwable) {}
+        cameraDevice = null
+        try { cameraImageReader?.close() } catch (e: Throwable) {}
+        cameraImageReader = null
+        try { cameraHandlerThread?.quitSafely() } catch (e: Throwable) {}
+        cameraHandlerThread = null
+        cameraHandler = null
+        Log.i(TAG, "Camera capture stopped and released")
     }
 
     private fun setupToolbar() {
@@ -277,12 +409,14 @@ class ControllerActivity : AppCompatActivity(), TextureView.SurfaceTextureListen
                 override fun onCameraStreamStarted() {
                     runOnUiThread {
                         Toast.makeText(this@ControllerActivity, "Remote camera streaming started", Toast.LENGTH_SHORT).show()
+                        startCameraCapture()
                     }
                 }
 
                 override fun onCameraStreamStopped() {
                     runOnUiThread {
                         Toast.makeText(this@ControllerActivity, "Remote camera streaming stopped", Toast.LENGTH_SHORT).show()
+                        stopCameraCapture()
                     }
                 }
             })
@@ -626,15 +760,20 @@ class ControllerActivity : AppCompatActivity(), TextureView.SurfaceTextureListen
         webSocket = client.newWebSocket(request, object : WebSocketListener() {
             override fun onOpen(ws: WebSocket, response: Response) {
                 Log.i(TAG, "Signaling WebSocket connected")
+                isSignalingReady = true
                 runOnUiThread {
-                    binding.tvConnectingMessage.text = "Signaling connected. Starting WebRTC..."
+                    binding.tvConnectingMessage.text = "Signaling connected. Awaiting ICE configuration..."
                 }
 
-                if (targetDeviceId.isNotEmpty()) {
-                    runOnUiThread {
-                        webRTCManager?.startConnection(targetDeviceId, cachedIceServers)
+                iceConfigFallbackRunnable = Runnable {
+                    if (!isIceConfigReady) {
+                        Log.i(TAG, "ICE/TURN config wait timeout (1500ms), falling back to default STUN")
+                        isIceConfigReady = true
+                        maybeStartWebRTC()
                     }
                 }
+                mainHandler.postDelayed(iceConfigFallbackRunnable!!, 1500L)
+                maybeStartWebRTC()
             }
 
             override fun onMessage(ws: WebSocket, text: String) {
@@ -696,8 +835,8 @@ class ControllerActivity : AppCompatActivity(), TextureView.SurfaceTextureListen
                     if (targetDeviceId.isNotEmpty()) {
                         runOnUiThread {
                             binding.tvTargetDevice.text = "Target: $targetDeviceId"
-                            webRTCManager?.startConnection(targetDeviceId, cachedIceServers)
                         }
+                        maybeStartWebRTC()
                     }
                 }
                 return
@@ -801,6 +940,7 @@ class ControllerActivity : AppCompatActivity(), TextureView.SurfaceTextureListen
 
     override fun onDestroy() {
         super.onDestroy()
+        stopCameraCapture()
         webRTCManager?.close()
         webRTCManager = null
 

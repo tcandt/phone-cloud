@@ -28,6 +28,7 @@ type StreamerBridge struct {
 	timelineMu     sync.Mutex
 	hasCommonEpoch bool
 	basePtsUs      uint64
+	baseWallClock  time.Time
 
 	// Video PTS Timeline Tracking
 	prevVideoPtsUs uint64
@@ -56,25 +57,102 @@ func (sb *StreamerBridge) ResetTimeline() {
 	defer sb.timelineMu.Unlock()
 	sb.hasCommonEpoch = false
 	sb.basePtsUs = 0
+	sb.baseWallClock = time.Time{}
 	sb.hasVideoPrev = false
 	sb.prevVideoPtsUs = 0
 	sb.hasAudioPrev = false
 	sb.prevAudioPtsUs = 0
 }
 
-// establishOrGetEpoch maps microsecond presentation timestamps to a shared reference clock
-func (sb *StreamerBridge) establishOrGetEpoch(ptsUs uint64) (uint64, bool) {
+// processVideoTimestamp maps video PTS to the shared reference clock, returns sample duration and common wall clock timestamp
+func (sb *StreamerBridge) processVideoTimestamp(ptsUs uint64, nominalDuration time.Duration) (time.Duration, time.Time) {
 	sb.timelineMu.Lock()
 	defer sb.timelineMu.Unlock()
+
+	now := time.Now()
 	if !sb.hasCommonEpoch {
 		sb.basePtsUs = ptsUs
+		sb.baseWallClock = now
 		sb.hasCommonEpoch = true
-		return 0, true
 	}
+
+	var relUs uint64
 	if ptsUs >= sb.basePtsUs {
-		return ptsUs - sb.basePtsUs, false
+		relUs = ptsUs - sb.basePtsUs
+	} else {
+		// Timestamp reset / backwards: re-anchor epoch
+		sb.basePtsUs = ptsUs
+		sb.baseWallClock = now
+		relUs = 0
 	}
-	return 0, false
+	targetWallClock := sb.baseWallClock.Add(time.Duration(relUs) * time.Microsecond)
+
+	var sampleDuration time.Duration
+	if !sb.hasVideoPrev {
+		sampleDuration = nominalDuration
+		sb.hasVideoPrev = true
+	} else if ptsUs > sb.prevVideoPtsUs {
+		deltaUs := ptsUs - sb.prevVideoPtsUs
+		if deltaUs > 3000000 {
+			// Discontinuity > 3s: re-anchor epoch
+			sb.basePtsUs = ptsUs
+			sb.baseWallClock = now
+			targetWallClock = now
+			sampleDuration = nominalDuration
+		} else {
+			sampleDuration = time.Duration(deltaUs) * time.Microsecond
+		}
+	} else {
+		// Timestamp reset
+		sb.basePtsUs = ptsUs
+		sb.baseWallClock = now
+		targetWallClock = now
+		sampleDuration = nominalDuration
+	}
+	sb.prevVideoPtsUs = ptsUs
+
+	return sampleDuration, targetWallClock
+}
+
+// processAudioTimestamp maps audio PTS to the shared reference clock, returns sample duration and common wall clock timestamp
+func (sb *StreamerBridge) processAudioTimestamp(audioPtsUs uint64, nominalDuration time.Duration) (time.Duration, time.Time) {
+	sb.timelineMu.Lock()
+	defer sb.timelineMu.Unlock()
+
+	now := time.Now()
+	if !sb.hasCommonEpoch {
+		sb.basePtsUs = audioPtsUs
+		sb.baseWallClock = now
+		sb.hasCommonEpoch = true
+	}
+
+	var relUs uint64
+	if audioPtsUs >= sb.basePtsUs {
+		relUs = audioPtsUs - sb.basePtsUs
+	} else {
+		sb.basePtsUs = audioPtsUs
+		sb.baseWallClock = now
+		relUs = 0
+	}
+	targetWallClock := sb.baseWallClock.Add(time.Duration(relUs) * time.Microsecond)
+
+	var audioDuration time.Duration
+	if !sb.hasAudioPrev {
+		audioDuration = nominalDuration
+		sb.hasAudioPrev = true
+	} else if audioPtsUs > sb.prevAudioPtsUs {
+		deltaUs := audioPtsUs - sb.prevAudioPtsUs
+		if deltaUs > 1000000 || deltaUs < 1000 {
+			audioDuration = nominalDuration
+		} else {
+			audioDuration = time.Duration(deltaUs) * time.Microsecond
+		}
+	} else {
+		audioDuration = nominalDuration
+	}
+	sb.prevAudioPtsUs = audioPtsUs
+
+	return audioDuration, targetWallClock
 }
 
 func (sb *StreamerBridge) SetPreviewStreamer(p *PreviewStreamer) {
@@ -131,7 +209,7 @@ func (sb *StreamerBridge) StreamVideo(conn net.Conn) {
 	log.Printf("[Streamer] Video Header: Codec=0x%x, Dimensions=%dx%d", codecID, width, height)
 
 	frameHeader := make([]byte, 12)
-	nominalDuration := time.Duration(1000/sb.fps) * time.Millisecond
+	nominalDuration := time.Duration(1000000/sb.fps) * time.Microsecond
 
 	for sb.running {
 		// 2. Read Frame Header: PTS (8B) + Packet Size (4B) = 12 Bytes
@@ -173,36 +251,13 @@ func (sb *StreamerBridge) StreamVideo(conn net.Conn) {
 			continue
 		}
 
-		// Calculate frame duration from microsecond PTS delta and map to shared media timeline
-		relPtsUs, _ := sb.establishOrGetEpoch(ptsUs)
-		_ = relPtsUs
-
-		var sampleDuration time.Duration
-		if !sb.hasVideoPrev {
-			sampleDuration = nominalDuration
-			sb.hasVideoPrev = true
-		} else if ptsUs > sb.prevVideoPtsUs {
-			deltaUs := ptsUs - sb.prevVideoPtsUs
-			// Discontinuity check: if gap > 3 seconds, reset timeline to nominal
-			if deltaUs > 3000000 {
-				log.Printf("[Streamer] Video discontinuity detected (%d us gap), resetting timeline epoch", deltaUs)
-				sb.ResetTimeline()
-				sampleDuration = nominalDuration
-			} else {
-				// Microsecond delta is converted to time.Duration.
-				// Pion's TrackLocalStaticSample uses this duration to advance RTP timestamp (90 kHz for H.264 video).
-				sampleDuration = time.Duration(deltaUs) * time.Microsecond
-			}
-		} else {
-			// PTS reset / wrap / backward timestamp: reset base and use nominal duration
-			sb.ResetTimeline()
-			sampleDuration = nominalDuration
-		}
-		sb.prevVideoPtsUs = ptsUs
+		// Map to shared media timeline epoch and calculate sample duration
+		sampleDuration, wallClock := sb.processVideoTimestamp(ptsUs, nominalDuration)
 
 		sample := media.Sample{
-			Data:     payload,
-			Duration: sampleDuration,
+			Data:      payload,
+			Timestamp: wallClock,
+			Duration:  sampleDuration,
 		}
 
 		// WebRTC RTP Track Fan-out (Non-blocking bounded queue)
@@ -251,31 +306,13 @@ func (sb *StreamerBridge) StreamAudio(conn net.Conn, preview *PreviewStreamer) {
 			break
 		}
 
-		// Dynamic Audio Frame Duration from PTS mapped onto shared timeline
-		relAudioPtsUs, _ := sb.establishOrGetEpoch(audioPtsUs)
-		_ = relAudioPtsUs
-
-		var audioDuration time.Duration
-		if !sb.hasAudioPrev {
-			audioDuration = nominalAudioDuration
-			sb.hasAudioPrev = true
-		} else if audioPtsUs > sb.prevAudioPtsUs {
-			deltaUs := audioPtsUs - sb.prevAudioPtsUs
-			if deltaUs > 1000000 || deltaUs < 1000 {
-				audioDuration = nominalAudioDuration
-			} else {
-				// Microsecond delta is converted to time.Duration.
-				// Pion advances RTP timestamp according to Opus's 48 kHz clock rate.
-				audioDuration = time.Duration(deltaUs) * time.Microsecond
-			}
-		} else {
-			audioDuration = nominalAudioDuration
-		}
-		sb.prevAudioPtsUs = audioPtsUs
+		// Map to shared media timeline epoch and calculate sample duration
+		audioDuration, wallClock := sb.processAudioTimestamp(audioPtsUs, nominalAudioDuration)
 
 		sample := media.Sample{
-			Data:     payload,
-			Duration: audioDuration,
+			Data:      payload,
+			Timestamp: wallClock,
+			Duration:  audioDuration,
 		}
 
 		// WebRTC RTP Track Fan-out

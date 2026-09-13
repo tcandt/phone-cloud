@@ -226,31 +226,43 @@ func (s *APIServer) handleConnectClient(w http.ResponseWriter, r *http.Request) 
 	var clientCaps map[string]interface{}
 	if activeShare != nil {
 		clientCaps = map[string]interface{}{
-			"can_view":      true,
-			"can_control":   !activeShare.ViewOnly,
-			"can_clipboard": activeShare.AllowClipboard,
-			"can_file":      activeShare.AllowFileTx,
-			"can_shell":     false,
-			"expires_at":    activeShare.ExpiresAt,
-			"session_id":    clientID,
+			"can_view":        true,
+			"can_control":     !activeShare.ViewOnly,
+			"can_clipboard":   activeShare.AllowClipboard,
+			"can_file":        activeShare.AllowFileTx,
+			"can_shell":       false,
+			"can_camera":      !activeShare.ViewOnly,
+			"can_audio":       true,
+			"can_record":      !activeShare.ViewOnly,
+			"can_install_apk": false,
+			"expires_at":      activeShare.ExpiresAt,
+			"session_id":      clientID,
 		}
 	} else if user != nil {
 		clientCaps = map[string]interface{}{
-			"can_view":      true,
-			"can_control":   true,
-			"can_clipboard": true,
-			"can_file":      true,
-			"can_shell":     user.Role == "admin",
-			"session_id":    clientID,
+			"can_view":        true,
+			"can_control":     true,
+			"can_clipboard":   true,
+			"can_file":        true,
+			"can_shell":       user.Role == "admin",
+			"can_camera":      true,
+			"can_audio":       true,
+			"can_record":      true,
+			"can_install_apk": user.Role == "admin",
+			"session_id":      clientID,
 		}
 	} else {
 		clientCaps = map[string]interface{}{
-			"can_view":      true,
-			"can_control":   true,
-			"can_clipboard": true,
-			"can_file":      true,
-			"can_shell":     false,
-			"session_id":    clientID,
+			"can_view":        true,
+			"can_control":     true,
+			"can_clipboard":   true,
+			"can_file":        true,
+			"can_shell":       false,
+			"can_camera":      true,
+			"can_audio":       true,
+			"can_record":      true,
+			"can_install_apk": false,
+			"session_id":      clientID,
 		}
 	}
 
@@ -321,6 +333,13 @@ func (s *APIServer) handleConnectClient(w http.ResponseWriter, r *http.Request) 
 		switch msgType {
 		case "connect":
 			client.ActiveDevice = deviceID
+			// Sync client capabilities to agent via side-channel
+			s.hub.ForwardToAgent(deviceID, map[string]interface{}{
+				"action":       "update_caps",
+				"type":         "update_caps",
+				"client_id":    client.ID,
+				"capabilities": clientCaps,
+			})
 			if dev, ok := s.hub.GetDevice(deviceID); ok {
 				_ = conn.WriteJSON(SignalingMessage{
 					MessageType: "device_info",
@@ -330,6 +349,18 @@ func (s *APIServer) handleConnectClient(w http.ResponseWriter, r *http.Request) 
 		case "forward":
 			if deviceID != "" {
 				client.ActiveDevice = deviceID
+				// If payload is request-offer, ensure capabilities are synced before or alongside
+				if p, ok := msg["payload"].(map[string]interface{}); ok && p != nil {
+					pType, _ := p["type"].(string)
+					if pType == "request-offer" {
+						s.hub.ForwardToAgent(deviceID, map[string]interface{}{
+							"action":       "update_caps",
+							"type":         "update_caps",
+							"client_id":    client.ID,
+							"capabilities": clientCaps,
+						})
+					}
+				}
 				s.hub.ForwardToAgent(deviceID, map[string]interface{}{
 					"message_type": "forward",
 					"client_id":    client.ID,

@@ -33,7 +33,49 @@ var (
 	cameraFps          = 30
 	cameraFrameChan    = make(chan []byte, 16)
 	cameraStateMu      sync.RWMutex
+
+	cameraFrameConsumerOnce sync.Once
+	cameraConsumerCb        func([]byte)
+	cameraConsumerCbMu      sync.RWMutex
 )
+
+// SetCameraFrameConsumer registers a callback to receive incoming camera frames (e.g. virtual camera device / sink)
+func SetCameraFrameConsumer(cb func([]byte)) {
+	cameraConsumerCbMu.Lock()
+	cameraConsumerCb = cb
+	cameraConsumerCbMu.Unlock()
+}
+
+func initCameraBridgeConsumer() {
+	cameraFrameConsumerOnce.Do(func() {
+		go func() {
+			var frameCount int
+			lastStatTime := time.Now()
+			for frame := range cameraFrameChan {
+				frameCount++
+				now := time.Now()
+				elapsed := now.Sub(lastStatTime)
+				if elapsed >= 1*time.Second {
+					measuredFps := int(float64(frameCount) / elapsed.Seconds())
+					if measuredFps > 0 {
+						cameraStateMu.Lock()
+						cameraFps = measuredFps
+						cameraStateMu.Unlock()
+					}
+					frameCount = 0
+					lastStatTime = now
+				}
+
+				cameraConsumerCbMu.RLock()
+				cb := cameraConsumerCb
+				cameraConsumerCbMu.RUnlock()
+				if cb != nil {
+					cb(frame)
+				}
+			}
+		}()
+	})
+}
 
 // generateTestPatternJpeg generates a valid JPEG test frame with color gradient
 func generateTestPatternJpeg(width, height int) []byte {
@@ -688,6 +730,8 @@ func setupCameraChannel(dc *webrtc.DataChannel, s *WebRTCSession) {
 		return
 	}
 
+	initCameraBridgeConsumer()
+
 	dc.OnMessage(func(msg webrtc.DataChannelMessage) {
 		if s != nil {
 			s.mu.RLock()
@@ -705,30 +749,28 @@ func setupCameraChannel(dc *webrtc.DataChannel, s *WebRTCSession) {
 		}
 
 		// 1. Binary Frame Path: Browser client sends raw JPEG ArrayBuffer at ~30 FPS
-		if !msg.IsString {
+		if len(msg.Data) >= 2 && msg.Data[0] == 0xFF && msg.Data[1] == 0xD8 {
 			data := msg.Data
-			if len(data) >= 4 && data[0] == 0xFF && data[1] == 0xD8 {
-				latestCameraJpegMu.Lock()
-				latestCameraJpeg = make([]byte, len(data))
-				copy(latestCameraJpeg, data)
-				latestCameraJpegMu.Unlock()
+			latestCameraJpegMu.Lock()
+			latestCameraJpeg = make([]byte, len(data))
+			copy(latestCameraJpeg, data)
+			latestCameraJpegMu.Unlock()
 
-				cameraStateMu.Lock()
-				cameraStreaming = true
-				cameraStateMu.Unlock()
+			cameraStateMu.Lock()
+			cameraStreaming = true
+			cameraStateMu.Unlock()
 
-				// Distribute to internal camera socket / virtual device channel if listening
+			// Distribute to internal camera socket / virtual device channel if listening
+			select {
+			case cameraFrameChan <- data:
+			default:
+				select {
+				case <-cameraFrameChan:
+				default:
+				}
 				select {
 				case cameraFrameChan <- data:
 				default:
-					select {
-					case <-cameraFrameChan:
-					default:
-					}
-					select {
-					case cameraFrameChan <- data:
-					default:
-					}
 				}
 			}
 			return
@@ -754,7 +796,7 @@ func setupCameraChannel(dc *webrtc.DataChannel, s *WebRTCSession) {
 			cameraStateMu.Unlock()
 
 			// Proactively signal client over DataChannel to begin streaming camera frames
-			_ = dc.Send([]byte(`{"action":"start"}`))
+			_ = dc.SendText(`{"action":"start"}`)
 
 			resp, _ := json.Marshal(map[string]interface{}{
 				"status":     "success",
@@ -763,7 +805,7 @@ func setupCameraChannel(dc *webrtc.DataChannel, s *WebRTCSession) {
 				"active":     true,
 				"streaming":  true,
 			})
-			_ = dc.Send(resp)
+			_ = dc.SendText(string(resp))
 
 		case "camera_stop", "stop":
 			cameraStateMu.Lock()
@@ -771,7 +813,7 @@ func setupCameraChannel(dc *webrtc.DataChannel, s *WebRTCSession) {
 			cameraStateMu.Unlock()
 
 			// Signal client to stop camera capture
-			_ = dc.Send([]byte(`{"action":"stop"}`))
+			_ = dc.SendText(`{"action":"stop"}`)
 
 			resp, _ := json.Marshal(map[string]interface{}{
 				"status":     "success",
@@ -780,7 +822,7 @@ func setupCameraChannel(dc *webrtc.DataChannel, s *WebRTCSession) {
 				"active":     false,
 				"streaming":  false,
 			})
-			_ = dc.Send(resp)
+			_ = dc.SendText(string(resp))
 
 		case "camera_switch", "switch":
 			cameraStateMu.Lock()
@@ -812,7 +854,7 @@ func setupCameraChannel(dc *webrtc.DataChannel, s *WebRTCSession) {
 				"lens":   lens,
 				"facing": facing,
 			})
-			_ = dc.Send(switchCmd)
+			_ = dc.SendText(string(switchCmd))
 
 			resp, _ := json.Marshal(map[string]interface{}{
 				"status":     "success",
@@ -821,7 +863,7 @@ func setupCameraChannel(dc *webrtc.DataChannel, s *WebRTCSession) {
 				"lens":       lens,
 				"facing":     facing,
 			})
-			_ = dc.Send(resp)
+			_ = dc.SendText(string(resp))
 
 		case "camera_status", "status":
 			cameraStateMu.RLock()
@@ -844,7 +886,7 @@ func setupCameraChannel(dc *webrtc.DataChannel, s *WebRTCSession) {
 				"fps":        fps,
 				"has_frame":  hasFrame,
 			})
-			_ = dc.Send(resp)
+			_ = dc.SendText(string(resp))
 
 		case "camera_snapshot", "snapshot":
 			latestCameraJpegMu.RLock()
@@ -855,9 +897,16 @@ func setupCameraChannel(dc *webrtc.DataChannel, s *WebRTCSession) {
 			}
 			latestCameraJpegMu.RUnlock()
 
-			// If no frame has been streamed yet, generate a valid test JPEG image
+			// Strict Parity: If no frame has been streamed yet, return no_frame_available error
 			if len(jpegData) == 0 {
-				jpegData = generateTestPatternJpeg(640, 480)
+				resp, _ := json.Marshal(map[string]interface{}{
+					"status":     "error",
+					"action":     "camera_snapshot",
+					"request_id": cmd.RequestID,
+					"error":      "no_frame_available",
+				})
+				_ = dc.SendText(string(resp))
+				return
 			}
 
 			imgBase64 := base64.StdEncoding.EncodeToString(jpegData)
@@ -870,7 +919,7 @@ func setupCameraChannel(dc *webrtc.DataChannel, s *WebRTCSession) {
 				"mime_type":    "image/jpeg",
 				"image_base64": imgBase64,
 			})
-			_ = dc.Send(resp)
+			_ = dc.SendText(string(resp))
 
 		default:
 			resp, _ := json.Marshal(map[string]interface{}{
@@ -878,7 +927,7 @@ func setupCameraChannel(dc *webrtc.DataChannel, s *WebRTCSession) {
 				"action":     cmd.Action,
 				"request_id": cmd.RequestID,
 			})
-			_ = dc.Send(resp)
+			_ = dc.SendText(string(resp))
 		}
 	})
 }

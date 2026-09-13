@@ -84,6 +84,18 @@ class WebRTCManager(
     fun setIceServers(servers: List<PeerConnection.IceServer>) {
         this.currentIceServers = servers
         Log.i(TAG, "Configured ${servers.size} ICE/TURN servers for WebRTC")
+        peerConnection?.let { pc ->
+            try {
+                val rtcConfig = PeerConnection.RTCConfiguration(servers).apply {
+                    sdpSemantics = PeerConnection.SdpSemantics.UNIFIED_PLAN
+                    continualGatheringPolicy = PeerConnection.ContinualGatheringPolicy.GATHER_CONTINUALLY
+                }
+                pc.setConfiguration(rtcConfig)
+                Log.i(TAG, "Successfully updated RTCConfiguration on active PeerConnection")
+            } catch (e: Throwable) {
+                Log.w(TAG, "Could not dynamically update RTCConfiguration: ${e.message}")
+            }
+        }
     }
 
     fun startConnection(deviceId: String, iceServersList: List<PeerConnection.IceServer>? = null) {
@@ -102,10 +114,8 @@ class WebRTCManager(
 
         peerConnection = factory?.createPeerConnection(rtcConfig, peerObserver)
 
-        // Pre-create all 6 standard DataChannels
-        createDataChannelInternal("input-channel", ordered = true)
-        createDataChannelInternal("clipboard-channel", ordered = true)
-        createDataChannelInternal("camera-channel", ordered = true)
+        // Client-initiated DataChannels per Original specification (file, adb, ai)
+        // Agent initiates input-channel, clipboard-channel, camera-channel received in onDataChannel
         createDataChannelInternal("file-channel", ordered = true)
         createDataChannelInternal("adb-channel", ordered = true)
         createDataChannelInternal("ai-command-channel", ordered = true)

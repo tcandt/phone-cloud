@@ -252,7 +252,7 @@ func NewWebRTCSession(ctrl *ControlWriter, iceServersRaw string) (*WebRTCSession
 		}
 	})
 
-	// Create channels that web-app expects from agent (pc.ondatachannel)
+	// Create channels that web-app and Android Controller expect from agent (pc.ondatachannel)
 	session.inputDC, _ = pc.CreateDataChannel("input-channel", nil)
 	session.clipDC, _ = pc.CreateDataChannel("clipboard-channel", nil)
 	session.cameraDC, _ = pc.CreateDataChannel("camera-channel", nil)
@@ -261,17 +261,7 @@ func NewWebRTCSession(ctrl *ControlWriter, iceServersRaw string) (*WebRTCSession
 	session.setupClipboardChannel(session.clipDC)
 	setupCameraChannel(session.cameraDC, session)
 
-	// Pre-create file and command channels for direct readiness
-	fileDC, _ := pc.CreateDataChannel("file-channel", nil)
-	if fileDC != nil {
-		setupFileChannel(fileDC, session)
-	}
-	aiCmdDC, _ := pc.CreateDataChannel("ai-command-channel", nil)
-	if aiCmdDC != nil {
-		setupAiCommandChannel(aiCmdDC, session)
-	}
-
-	// Listen for browser-created DataChannels (file-channel, ai-command-channel, adb-channel, camera-channel)
+	// Listen for client/browser-created DataChannels (file-channel, ai-command-channel, adb-channel)
 	pc.OnDataChannel(func(dc *webrtc.DataChannel) {
 		label := dc.Label()
 		log.Printf("[WebRTC] Remote DataChannel opened: %s", label)

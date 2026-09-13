@@ -98,6 +98,8 @@ func main() {
 
 	var sessionsMu sync.RWMutex
 	sessions := make(map[string]*WebRTCSession)
+	var clientCapsMu sync.RWMutex
+	clientCapsCache := make(map[string]SessionCapabilities)
 	previewStreamer := NewPreviewStreamer(cfg.DeviceID)
 	ctrl := scrcpy.GetControlWriter()
 	streamer := NewStreamerBridge(ctrl, cfg.MaxFPS)
@@ -215,9 +217,11 @@ func main() {
 						})
 					})
 
-					// Apply session capabilities forwarded by signaling
+					// Apply session capabilities forwarded by signaling or cached by clientID
+					var caps SessionCapabilities
+					var hasCaps bool
 					if capsMap, ok := msg["capabilities"].(map[string]interface{}); ok && capsMap != nil {
-						var caps SessionCapabilities
+						hasCaps = true
 						if v, ok := capsMap["can_control"].(bool); ok {
 							caps.CanControl = v
 						}
@@ -242,8 +246,30 @@ func main() {
 						if v, ok := capsMap["can_install_apk"].(bool); ok {
 							caps.CanInstallAPK = v
 						}
-						session.SetCapabilities(caps)
 					}
+					if !hasCaps {
+						clientCapsMu.RLock()
+						cached, found := clientCapsCache[clientID]
+						clientCapsMu.RUnlock()
+						if found {
+							caps = cached
+							hasCaps = true
+						}
+					}
+					if !hasCaps {
+						// Standard default permissions when no specific restriction is signaled
+						caps = SessionCapabilities{
+							CanControl:   true,
+							CanClipboard: true,
+							CanFile:      true,
+							CanShell:     false,
+							CanCamera:    true,
+							CanAudio:     true,
+							CanRecord:    true,
+							CanInstallAPK: false,
+						}
+					}
+					session.SetCapabilities(caps)
 
 					sessions[clientID] = session
 					streamer.RegisterSession(clientID, session)
@@ -308,7 +334,7 @@ func main() {
 						})
 					}
 				}
-			} else if action == "update_caps" {
+			} else if action == "update_caps" || msgType == "update_caps" || action == "session_caps" {
 				targetClientID, _ := msg["client_id"].(string)
 				if capsMap, ok := msg["capabilities"].(map[string]interface{}); ok && capsMap != nil {
 					var caps SessionCapabilities
@@ -336,6 +362,11 @@ func main() {
 					if v, ok := capsMap["can_install_apk"].(bool); ok {
 						caps.CanInstallAPK = v
 					}
+
+					clientCapsMu.Lock()
+					clientCapsCache[targetClientID] = caps
+					clientCapsMu.Unlock()
+
 					sessionsMu.RLock()
 					if sess, ok := sessions[targetClientID]; ok {
 						sess.SetCapabilities(caps)
