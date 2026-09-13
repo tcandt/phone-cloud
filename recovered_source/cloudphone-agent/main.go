@@ -257,15 +257,16 @@ func main() {
 						}
 					}
 					if !hasCaps {
-						// Standard default permissions when no specific restriction is signaled
+						// Strict Fail-Closed / Default-Deny for authenticated security posture:
+						// If capabilities are not provided in payload nor found in verified cache, deny sensitive capabilities
 						caps = SessionCapabilities{
-							CanControl:   true,
-							CanClipboard: true,
-							CanFile:      true,
+							CanControl:   false,
+							CanClipboard: false,
+							CanFile:      false,
 							CanShell:     false,
-							CanCamera:    true,
-							CanAudio:     true,
-							CanRecord:    true,
+							CanCamera:    false,
+							CanAudio:     false,
+							CanRecord:    false,
 							CanInstallAPK: false,
 						}
 					}

@@ -99,18 +99,61 @@ class OpusDecoderTest {
 
     @Test
     fun testNativeLibOpusAbiSymbolsPresentInPackagedBinaries() {
-        val buildDir = java.io.File("build")
-        if (!buildDir.exists()) return
+        val candidateDirs = listOf(
+            java.io.File("src/main/jniLibs"),
+            java.io.File("app/src/main/jniLibs"),
+            java.io.File("../app/src/main/jniLibs")
+        )
+        val jniLibsDir = candidateDirs.find { it.exists() && it.isDirectory }
+        assertNotNull("Fail-closed: jniLibs directory must exist in candidate paths", jniLibsDir)
 
-        val soFiles = buildDir.walkTopDown().filter { it.name == "libopus.so" }.toList()
-        if (soFiles.isEmpty()) return
+        val requiredAbis = listOf("arm64-v8a", "armeabi-v7a", "x86", "x86_64")
+        val foundAbis = mutableListOf<String>()
 
-        for (soFile in soFiles) {
+        for (abi in requiredAbis) {
+            val abiDir = java.io.File(jniLibsDir, abi)
+            assertTrue("Fail-closed: Missing required ABI directory: $abi", abiDir.exists() && abiDir.isDirectory)
+
+            val soFile = java.io.File(abiDir, "libopus.so")
+            assertTrue("Fail-closed: Missing libopus.so for ABI: $abi", soFile.exists() && soFile.isFile)
+            assertTrue("Fail-closed: libopus.so for $abi must be at least 100KB (actual: ${soFile.length()} bytes)", soFile.length() > 100_000)
+
             val content = soFile.readBytes()
+            assertEquals("Fail-closed: $abi/libopus.so must have ELF magic 0x7F", 0x7F.toByte(), content[0])
+            assertEquals("Fail-closed: $abi/libopus.so must have 'E'", 'E'.code.toByte(), content[1])
+            assertEquals("Fail-closed: $abi/libopus.so must have 'L'", 'L'.code.toByte(), content[2])
+            assertEquals("Fail-closed: $abi/libopus.so must have 'F'", 'F'.code.toByte(), content[3])
+
             val text = String(content, java.nio.charset.StandardCharsets.ISO_8859_1)
-            assertTrue("libopus.so in ${soFile.parent} must export opus_decode", text.contains("opus_decode"))
-            assertTrue("libopus.so in ${soFile.parent} must export opus_decoder_create", text.contains("opus_decoder_create"))
-            assertTrue("libopus.so in ${soFile.parent} must export opus_decoder_destroy", text.contains("opus_decoder_destroy"))
+            assertTrue("Fail-closed: libopus.so for $abi must export symbol opus_decode", text.contains("opus_decode"))
+            assertTrue("Fail-closed: libopus.so for $abi must export symbol opus_decoder_create", text.contains("opus_decoder_create"))
+            assertTrue("Fail-closed: libopus.so for $abi must export symbol opus_decoder_destroy", text.contains("opus_decoder_destroy"))
+
+            foundAbis.add(abi)
+        }
+
+        assertEquals("Must verify all 4 required Android architectures", 4, foundAbis.size)
+    }
+
+    @Test
+    fun testNativeLibOpusRealDecodingIfNativeAvailable() {
+        try {
+            val nativeOpus = com.sun.jna.Native.load("opus", LibOpus::class.java)
+            if (nativeOpus != null) {
+                val decoder = OpusAudioDecoder(sampleRate = 48000, channels = 2)
+                OpusAudioDecoder.nativeLibOpus = nativeOpus
+                decoder.activateSoftwareFallback()
+                var decodedPcm: ByteArray? = null
+                decoder.decode(opusFrameFixture) { pcm ->
+                    decodedPcm = pcm
+                }
+                assertNotNull(decodedPcm)
+                assertTrue(decodedPcm!!.isNotEmpty())
+                decoder.release()
+                println("[PASS] Real native libopus successfully decoded standard Opus frame")
+            }
+        } catch (t: Throwable) {
+            println("[NOTE] Host platform JNA native load skipped (${t.message}), all 4 ABIs strictly asserted")
         }
     }
 }

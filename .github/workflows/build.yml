@@ -25,10 +25,10 @@ jobs:
           cd recovered_source/webrtc-signaling
           go test -v -timeout 60s -run TestProtocolConformance .
 
-      - name: Run Agent Conformance & TURN Relay Tests
+      - name: Run Agent Conformance, TURN Relay & WebRTC End-to-End Integration Tests
         run: |
           cd recovered_source/cloudphone-agent
-          go test -v -timeout 60s -run "TestAgentConformance|TestTURNRelay" .
+          go test -v -timeout 90s -run "TestAgentConformance|TestTURNRelay|TestWebRTC_EndToEndIntegration" .
 
       - name: Run Differential Parity Tests (Original vs Recovered)
         run: |
@@ -121,6 +121,26 @@ jobs:
           cd recovered_source/android-helper
           chmod +x gradlew
           ./gradlew clean assembleHelper
+
+      - name: Verify Opus ABI Libraries & Exported Symbols (Fail-Closed)
+        run: |
+          for abi in arm64-v8a armeabi-v7a x86 x86_64; do
+            so_file="recovered_source/android-app/app/src/main/jniLibs/$abi/libopus.so"
+            if [ ! -f "$so_file" ]; then
+              echo "ERROR: Missing $so_file for ABI $abi"
+              exit 1
+            fi
+            file_size=$(wc -c < "$so_file")
+            if [ "$file_size" -lt 100000 ]; then
+              echo "ERROR: $so_file is too small ($file_size bytes)"
+              exit 1
+            fi
+            echo "PASS: Found $so_file ($file_size bytes)"
+            readelf -Ws "$so_file" | grep -q "opus_decode" || { echo "ERROR: Missing opus_decode symbol in $so_file"; exit 1; }
+            readelf -Ws "$so_file" | grep -q "opus_decoder_create" || { echo "ERROR: Missing opus_decoder_create symbol in $so_file"; exit 1; }
+            readelf -Ws "$so_file" | grep -q "opus_decoder_destroy" || { echo "ERROR: Missing opus_decoder_destroy symbol in $so_file"; exit 1; }
+            echo "PASS: Verified opus_decode, opus_decoder_create, opus_decoder_destroy in $abi/libopus.so"
+          done
 
       - name: Run Android Unit Tests
         run: |

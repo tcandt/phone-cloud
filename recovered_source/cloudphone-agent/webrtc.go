@@ -8,15 +8,15 @@ import (
 	"sync"
 	"time"
 
+	"github.com/pion/rtp"
 	"github.com/pion/webrtc/v3"
-	"github.com/pion/webrtc/v3/pkg/media"
 )
 
 type WebRTCSession struct {
 	ClientID         string
 	pc               *webrtc.PeerConnection
-	videoTrack       *webrtc.TrackLocalStaticSample
-	audioTrack       *webrtc.TrackLocalStaticSample
+	videoTrack       *webrtc.TrackLocalStaticRTP
+	audioTrack       *webrtc.TrackLocalStaticRTP
 	ctrl             *ControlWriter
 	inputDC          *webrtc.DataChannel
 	clipDC           *webrtc.DataChannel
@@ -25,8 +25,8 @@ type WebRTCSession struct {
 	mu               sync.RWMutex
 
 	// Media queues for non-blocking distribution
-	videoQueue       chan media.Sample
-	audioQueue       chan media.Sample
+	videoQueue       chan *rtp.Packet
+	audioQueue       chan *rtp.Packet
 	closed           bool
 	closeOnce        sync.Once
 
@@ -44,40 +44,39 @@ func (s *WebRTCSession) SetOnLocalCandidate(cb func(candidate *webrtc.ICECandida
 	s.onLocalCandidate = cb
 }
 
-func (s *WebRTCSession) EnqueueVideoSample(sample media.Sample, isKeyFrame bool) {
+func (s *WebRTCSession) EnqueueVideoPacket(packet *rtp.Packet, isKeyFrame bool) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	if s.closed || s.videoTrack == nil {
+	if s.closed || s.videoTrack == nil || packet == nil {
 		return
 	}
 	select {
-	case s.videoQueue <- sample:
+	case s.videoQueue <- packet:
 	default:
-		// Queue is full: if keyframe or config, drop oldest from queue and push
-		if isKeyFrame || sample.Duration == 0 {
+		// Queue is full: if keyframe, drop oldest stale packet and push
+		if isKeyFrame {
 			select {
-			case <-s.videoQueue: // drop oldest stale delta frame
+			case <-s.videoQueue:
 			default:
 			}
 			select {
-			case s.videoQueue <- sample:
+			case s.videoQueue <- packet:
 			default:
 			}
 		}
-		// Otherwise, drop this delta frame to avoid latency buildup
 	}
 }
 
-func (s *WebRTCSession) EnqueueAudioSample(sample media.Sample) {
+func (s *WebRTCSession) EnqueueAudioPacket(packet *rtp.Packet) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	if s.closed || s.audioTrack == nil {
+	if s.closed || s.audioTrack == nil || packet == nil {
 		return
 	}
 	select {
-	case s.audioQueue <- sample:
+	case s.audioQueue <- packet:
 	default:
-		// Drop audio packet on congested network to avoid audio lag
+		// Congestion: drop audio packet to prevent latency accumulation
 	}
 }
 
@@ -169,8 +168,8 @@ func NewWebRTCSession(ctrl *ControlWriter, iceServersRaw string) (*WebRTCSession
 		return nil, err
 	}
 
-	// Create Tracks
-	vTrack, err := webrtc.NewTrackLocalStaticSample(webrtc.RTPCodecCapability{MimeType: webrtc.MimeTypeH264}, "video", "cloudphone-video")
+	// Create Tracks using TrackLocalStaticRTP for direct hardware PTS passthrough
+	vTrack, err := webrtc.NewTrackLocalStaticRTP(webrtc.RTPCodecCapability{MimeType: webrtc.MimeTypeH264}, "video", "cloudphone-video")
 	if err != nil {
 		pc.Close()
 		return nil, err
@@ -181,7 +180,7 @@ func NewWebRTCSession(ctrl *ControlWriter, iceServersRaw string) (*WebRTCSession
 		return nil, err
 	}
 
-	aTrack, err := webrtc.NewTrackLocalStaticSample(webrtc.RTPCodecCapability{MimeType: webrtc.MimeTypeOpus}, "audio", "cloudphone-audio")
+	aTrack, err := webrtc.NewTrackLocalStaticRTP(webrtc.RTPCodecCapability{MimeType: webrtc.MimeTypeOpus}, "audio", "cloudphone-audio")
 	if err == nil {
 		_, _ = pc.AddTrack(aTrack)
 	}
@@ -191,32 +190,32 @@ func NewWebRTCSession(ctrl *ControlWriter, iceServersRaw string) (*WebRTCSession
 		videoTrack: vTrack,
 		audioTrack: aTrack,
 		ctrl:       ctrl,
-		videoQueue: make(chan media.Sample, 60),
-		audioQueue: make(chan media.Sample, 60),
+		videoQueue: make(chan *rtp.Packet, 120),
+		audioQueue: make(chan *rtp.Packet, 120),
 	}
 
-	// Non-blocking worker goroutine for video dispatch
+	// Non-blocking worker goroutine for video RTP packet dispatch
 	go func() {
-		for sample := range session.videoQueue {
+		for packet := range session.videoQueue {
 			session.mu.RLock()
 			vt := session.videoTrack
 			closed := session.closed
 			session.mu.RUnlock()
 			if !closed && vt != nil {
-				_ = vt.WriteSample(sample)
+				_ = vt.WriteRTP(packet)
 			}
 		}
 	}()
 
-	// Non-blocking worker goroutine for audio dispatch
+	// Non-blocking worker goroutine for audio RTP packet dispatch
 	go func() {
-		for sample := range session.audioQueue {
+		for packet := range session.audioQueue {
 			session.mu.RLock()
 			at := session.audioTrack
 			closed := session.closed
 			session.mu.RUnlock()
 			if !closed && at != nil {
-				_ = at.WriteSample(sample)
+				_ = at.WriteRTP(packet)
 			}
 		}
 	}()

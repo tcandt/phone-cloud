@@ -19,6 +19,7 @@ import android.os.Handler
 import android.os.HandlerThread
 import android.os.Looper
 import android.util.Log
+import android.util.Size
 import android.view.MotionEvent
 import android.view.Surface
 import android.view.TextureView
@@ -45,6 +46,7 @@ class ControllerActivity : AppCompatActivity(), TextureView.SurfaceTextureListen
     companion object {
         private const val TAG = "ControllerActivity"
         private const val PREV_HEADER_LEN = 49
+        private const val REQUEST_CAMERA_PERMISSION = 101
     }
 
     private val mainHandler = Handler(Looper.getMainLooper())
@@ -70,13 +72,24 @@ class ControllerActivity : AppCompatActivity(), TextureView.SurfaceTextureListen
     private var isWebRTCStarted = false
     private var iceConfigFallbackRunnable: Runnable? = null
 
-    // Camera2 streaming pipeline
+    data class CameraLensInfo(
+        val id: String,
+        val facing: Int,
+        val facingName: String,
+        val supportedResolutions: List<Size>
+    )
+
+    // Camera2 Surveillance pipeline state
     private var cameraDevice: CameraDevice? = null
     private var cameraCaptureSession: CameraCaptureSession? = null
     private var cameraImageReader: ImageReader? = null
     private var isCameraCapturing = false
     private var cameraHandlerThread: HandlerThread? = null
     private var cameraHandler: Handler? = null
+    private var currentSelectedCameraId: String? = null
+    private var currentSelectedLensFacing: Int = CameraCharacteristics.LENS_FACING_BACK
+    private var currentCaptureWidth = 1280
+    private var currentCaptureHeight = 720
 
     private var targetDeviceId: String = ""
     private var serverUrl: String = ""
@@ -216,26 +229,68 @@ class ControllerActivity : AppCompatActivity(), TextureView.SurfaceTextureListen
         }
     }
 
+    private fun queryAvailableCameraLenses(): List<CameraLensInfo> {
+        val cameraManager = getSystemService(Context.CAMERA_SERVICE) as? CameraManager ?: return emptyList()
+        val result = mutableListOf<CameraLensInfo>()
+        try {
+            for (id in cameraManager.cameraIdList) {
+                val chars = cameraManager.getCameraCharacteristics(id)
+                val facing = chars.get(CameraCharacteristics.LENS_FACING) ?: CameraCharacteristics.LENS_FACING_BACK
+                val facingName = when (facing) {
+                    CameraCharacteristics.LENS_FACING_FRONT -> "Front"
+                    CameraCharacteristics.LENS_FACING_BACK -> "Back"
+                    CameraCharacteristics.LENS_FACING_EXTERNAL -> "External"
+                    else -> "Lens $id"
+                }
+                val map = chars.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP)
+                val sizes = map?.getOutputSizes(ImageFormat.JPEG)?.toList() ?: emptyList()
+                result.add(CameraLensInfo(id, facing, facingName, sizes))
+            }
+        } catch (e: Throwable) {
+            Log.w(TAG, "Error querying camera lenses: ${e.message}")
+        }
+        return result
+    }
+
+    private fun selectBestResolution(sizes: List<Size>, targetWidth: Int, targetHeight: Int): Size {
+        if (sizes.isEmpty()) return Size(targetWidth, targetHeight)
+        return sizes.find { it.width == targetWidth && it.height == targetHeight }
+            ?: sizes.minByOrNull { Math.abs(it.width * it.height - targetWidth * targetHeight) }
+            ?: sizes[0]
+    }
+
     private fun startCameraCapture() {
         if (isCameraCapturing) return
         if (checkSelfPermission(Manifest.permission.CAMERA) != PackageManager.PERMISSION_GRANTED) {
-            Log.w(TAG, "Camera permission not granted, unable to start camera capture")
+            Log.w(TAG, "Camera permission not granted, requesting permission from user")
+            requestPermissions(arrayOf(Manifest.permission.CAMERA), REQUEST_CAMERA_PERMISSION)
             return
         }
         val cameraManager = getSystemService(Context.CAMERA_SERVICE) as? CameraManager ?: return
         try {
-            val cameraIdList = cameraManager.cameraIdList
-            if (cameraIdList.isEmpty()) {
+            val lenses = queryAvailableCameraLenses()
+            if (lenses.isEmpty()) {
                 Log.w(TAG, "No camera devices found on device")
                 return
             }
-            val selectedCameraId = cameraIdList[0]
+
+            // Select camera matching currentSelectedLensFacing or currentSelectedCameraId
+            val selectedLens = (if (currentSelectedCameraId != null) {
+                lenses.find { it.id == currentSelectedCameraId }
+            } else null) ?: lenses.find { it.facing == currentSelectedLensFacing } ?: lenses[0]
+
+            currentSelectedCameraId = selectedLens.id
+            currentSelectedLensFacing = selectedLens.facing
+
+            val chosenSize = selectBestResolution(selectedLens.supportedResolutions, currentCaptureWidth, currentCaptureHeight)
+            Log.i(TAG, "Starting camera capture on lens ${selectedLens.id} (${selectedLens.facingName}) at ${chosenSize.width}x${chosenSize.height}")
+
             val thread = HandlerThread("CameraCaptureThread").apply { start() }
             cameraHandlerThread = thread
             val handler = Handler(thread.looper)
             cameraHandler = handler
 
-            val reader = ImageReader.newInstance(640, 480, ImageFormat.JPEG, 2)
+            val reader = ImageReader.newInstance(chosenSize.width, chosenSize.height, ImageFormat.JPEG, 2)
             cameraImageReader = reader
             reader.setOnImageAvailableListener({ imgReader ->
                 val image = imgReader.acquireLatestImage() ?: return@setOnImageAvailableListener
@@ -252,7 +307,7 @@ class ControllerActivity : AppCompatActivity(), TextureView.SurfaceTextureListen
                 }
             }, handler)
 
-            cameraManager.openCamera(selectedCameraId, object : CameraDevice.StateCallback() {
+            cameraManager.openCamera(selectedLens.id, object : CameraDevice.StateCallback() {
                 override fun onOpened(camera: CameraDevice) {
                     cameraDevice = camera
                     isCameraCapturing = true
@@ -268,7 +323,7 @@ class ControllerActivity : AppCompatActivity(), TextureView.SurfaceTextureListen
                                 cameraCaptureSession = session
                                 try {
                                     session.setRepeatingRequest(captureRequestBuilder.build(), null, handler)
-                                    Log.i(TAG, "Camera capture repeating request active at ~30 FPS")
+                                    Log.i(TAG, "Camera capture repeating request active at ~30 FPS on lens ${selectedLens.id}")
                                 } catch (e: Throwable) {
                                     Log.e(TAG, "Failed to start camera repeating request: ${e.message}")
                                 }
@@ -307,6 +362,89 @@ class ControllerActivity : AppCompatActivity(), TextureView.SurfaceTextureListen
         cameraHandlerThread = null
         cameraHandler = null
         Log.i(TAG, "Camera capture stopped and released")
+    }
+
+    private fun switchCameraFacing(targetFacing: Int? = null, targetCameraId: String? = null) {
+        val lenses = queryAvailableCameraLenses()
+        if (lenses.size <= 1 && targetCameraId == null && targetFacing == null) {
+            Toast.makeText(this, "Only one camera lens available", Toast.LENGTH_SHORT).show()
+            return
+        }
+
+        if (targetCameraId != null) {
+            currentSelectedCameraId = targetCameraId
+            val found = lenses.find { it.id == targetCameraId }
+            if (found != null) currentSelectedLensFacing = found.facing
+        } else if (targetFacing != null) {
+            currentSelectedLensFacing = targetFacing
+            currentSelectedCameraId = lenses.find { it.facing == targetFacing }?.id
+        } else {
+            // Toggle between FRONT and BACK
+            val nextFacing = if (currentSelectedLensFacing == CameraCharacteristics.LENS_FACING_BACK) {
+                CameraCharacteristics.LENS_FACING_FRONT
+            } else {
+                CameraCharacteristics.LENS_FACING_BACK
+            }
+            val match = lenses.find { it.facing == nextFacing } ?: lenses.find { it.id != currentSelectedCameraId }
+            if (match != null) {
+                currentSelectedLensFacing = match.facing
+                currentSelectedCameraId = match.id
+            }
+        }
+
+        val lensName = lenses.find { it.id == currentSelectedCameraId }?.facingName ?: "Selected"
+        Toast.makeText(this, "Switched to $lensName camera", Toast.LENGTH_SHORT).show()
+
+        if (isCameraCapturing) {
+            stopCameraCapture()
+            startCameraCapture()
+        }
+    }
+
+    private fun configureCameraCapture(params: JsonObject) {
+        val resolution = params.get("resolution")?.asString?.lowercase()
+        if (resolution != null) {
+            when (resolution) {
+                "4k" -> { currentCaptureWidth = 3840; currentCaptureHeight = 2160 }
+                "1080p" -> { currentCaptureWidth = 1920; currentCaptureHeight = 1080 }
+                "720p" -> { currentCaptureWidth = 1280; currentCaptureHeight = 720 }
+                "480p" -> { currentCaptureWidth = 640; currentCaptureHeight = 480 }
+            }
+        }
+        if (params.has("width") && params.has("height")) {
+            currentCaptureWidth = params.get("width").asInt
+            currentCaptureHeight = params.get("height").asInt
+        }
+        if (params.has("facing")) {
+            val facingStr = params.get("facing").asString.lowercase()
+            val targetFacing = when (facingStr) {
+                "front" -> CameraCharacteristics.LENS_FACING_FRONT
+                "back" -> CameraCharacteristics.LENS_FACING_BACK
+                "external" -> CameraCharacteristics.LENS_FACING_EXTERNAL
+                else -> null
+            }
+            if (targetFacing != null) {
+                currentSelectedLensFacing = targetFacing
+                currentSelectedCameraId = null
+            }
+        }
+        Toast.makeText(this, "Camera configured: ${currentCaptureWidth}x${currentCaptureHeight}", Toast.LENGTH_SHORT).show()
+        if (isCameraCapturing) {
+            stopCameraCapture()
+            startCameraCapture()
+        }
+    }
+
+    override fun onRequestPermissionsResult(requestCode: Int, permissions: Array<out String>, grantResults: IntArray) {
+        super.onRequestPermissionsResult(requestCode, permissions, grantResults)
+        if (requestCode == REQUEST_CAMERA_PERMISSION) {
+            if (grantResults.isNotEmpty() && grantResults[0] == PackageManager.PERMISSION_GRANTED) {
+                Log.i(TAG, "Camera permission granted by user")
+                startCameraCapture()
+            } else {
+                Toast.makeText(this, "Camera permission required for surveillance camera mode", Toast.LENGTH_LONG).show()
+            }
+        }
     }
 
     private fun setupToolbar() {
@@ -417,6 +555,24 @@ class ControllerActivity : AppCompatActivity(), TextureView.SurfaceTextureListen
                     runOnUiThread {
                         Toast.makeText(this@ControllerActivity, "Remote camera streaming stopped", Toast.LENGTH_SHORT).show()
                         stopCameraCapture()
+                    }
+                }
+
+                override fun onCameraSwitchRequested(facing: String) {
+                    runOnUiThread {
+                        val targetFacing = when (facing.lowercase()) {
+                            "front" -> CameraCharacteristics.LENS_FACING_FRONT
+                            "back" -> CameraCharacteristics.LENS_FACING_BACK
+                            "external" -> CameraCharacteristics.LENS_FACING_EXTERNAL
+                            else -> null
+                        }
+                        switchCameraFacing(targetFacing = targetFacing)
+                    }
+                }
+
+                override fun onCameraConfigureRequested(params: JsonObject) {
+                    runOnUiThread {
+                        configureCameraCapture(params)
                     }
                 }
             })
@@ -684,25 +840,95 @@ class ControllerActivity : AppCompatActivity(), TextureView.SurfaceTextureListen
     }
 
     private fun showCameraControlDialog() {
+        val lenses = queryAvailableCameraLenses()
+        val currentLensName = lenses.find { it.id == currentSelectedCameraId }?.facingName ?: "Back"
         val options = arrayOf(
-            "Switch Camera (Front / Back)",
-            "Capture Snapshot",
-            "Start Camera Stream",
-            "Stop Camera Stream",
-            "Camera Status"
+            "Switch Lens (Current: $currentLensName)",
+            "Change Resolution (Current: ${currentCaptureWidth}x${currentCaptureHeight})",
+            "Take Surveillance Snapshot",
+            if (isCameraCapturing) "Stop Camera Streaming" else "Start Camera Streaming",
+            "Camera Surveillance Status"
         )
         AlertDialog.Builder(this)
-            .setTitle("Camera Remote Control")
+            .setTitle("Surveillance Camera Control")
             .setItems(options) { _, which ->
                 when (which) {
-                    0 -> webRTCManager?.sendCameraCommand("camera_switch")
-                    1 -> webRTCManager?.sendCameraCommand("camera_snapshot")
-                    2 -> webRTCManager?.sendCameraCommand("camera_start")
-                    3 -> webRTCManager?.sendCameraCommand("camera_stop")
-                    4 -> webRTCManager?.sendCameraCommand("camera_status")
+                    0 -> showLensSelectionDialog(lenses)
+                    1 -> showResolutionSelectionDialog()
+                    2 -> {
+                        webRTCManager?.sendCameraCommand("camera_snapshot")
+                        Toast.makeText(this, "Requested snapshot from camera...", Toast.LENGTH_SHORT).show()
+                    }
+                    3 -> {
+                        if (isCameraCapturing) {
+                            stopCameraCapture()
+                            webRTCManager?.sendCameraCommand("camera_stop")
+                        } else {
+                            startCameraCapture()
+                            webRTCManager?.sendCameraCommand("camera_start")
+                        }
+                    }
+                    4 -> showCameraStatusDialog(currentLensName)
                 }
             }
             .setNegativeButton("Close", null)
+            .show()
+    }
+
+    private fun showLensSelectionDialog(lenses: List<CameraLensInfo>) {
+        if (lenses.isEmpty()) {
+            Toast.makeText(this, "No cameras available", Toast.LENGTH_SHORT).show()
+            return
+        }
+        val items = lenses.map { "${it.facingName} Camera (ID: ${it.id})" }.toTypedArray()
+        AlertDialog.Builder(this)
+            .setTitle("Select Camera Lens")
+            .setItems(items) { _, which ->
+                val selected = lenses[which]
+                switchCameraFacing(targetFacing = selected.facing, targetCameraId = selected.id)
+                val params = JsonObject().apply {
+                    addProperty("facing", selected.facingName.lowercase())
+                    addProperty("camera_id", selected.id)
+                }
+                webRTCManager?.sendCameraCommand("camera_switch", params = params)
+            }
+            .setNegativeButton("Cancel", null)
+            .show()
+    }
+
+    private fun showResolutionSelectionDialog() {
+        val resOptions = arrayOf("4K (3840x2160)", "1080p (1920x1080)", "720p (1280x720)", "480p (640x480)")
+        AlertDialog.Builder(this)
+            .setTitle("Select Camera Resolution")
+            .setItems(resOptions) { _, which ->
+                val resKey = when (which) {
+                    0 -> "4k"
+                    1 -> "1080p"
+                    2 -> "720p"
+                    else -> "480p"
+                }
+                val params = JsonObject().apply {
+                    addProperty("resolution", resKey)
+                }
+                configureCameraCapture(params)
+                webRTCManager?.sendCameraCommand("camera_configure", params = params)
+            }
+            .setNegativeButton("Cancel", null)
+            .show()
+    }
+
+    private fun showCameraStatusDialog(currentLensName: String) {
+        val status = """
+            Status: ${if (isCameraCapturing) "Streaming Active (~30 FPS)" else "Idle / Standby"}
+            Current Lens: $currentLensName (ID: ${currentSelectedCameraId ?: "auto"})
+            Resolution: ${currentCaptureWidth}x${currentCaptureHeight}
+            Format: JPEG Over WebRTC DataChannel
+            Direct PTS Sync: Enabled
+        """.trimIndent()
+        AlertDialog.Builder(this)
+            .setTitle("Surveillance Camera Diagnostics")
+            .setMessage(status)
+            .setPositiveButton("OK", null)
             .show()
     }
 

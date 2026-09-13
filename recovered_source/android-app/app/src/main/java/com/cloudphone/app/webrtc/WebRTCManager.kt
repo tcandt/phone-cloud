@@ -33,6 +33,8 @@ class WebRTCManager(
         fun onAiCommandResponse(response: JsonObject) {}
         fun onCameraStreamStarted() {}
         fun onCameraStreamStopped() {}
+        fun onCameraSwitchRequested(facing: String) {}
+        fun onCameraConfigureRequested(params: JsonObject) {}
     }
 
     private var factory: PeerConnectionFactory? = null
@@ -92,6 +94,11 @@ class WebRTCManager(
                 }
                 pc.setConfiguration(rtcConfig)
                 Log.i(TAG, "Successfully updated RTCConfiguration on active PeerConnection")
+                if (currentState == WebRTCConnectionState.NEGOTIATING || currentState == WebRTCConnectionState.ICE_CONNECTING) {
+                    Log.i(TAG, "Restarting ICE due to late arrival of TURN configuration")
+                    restartIce()
+                }
+                Unit
             } catch (e: Throwable) {
                 Log.w(TAG, "Could not dynamically update RTCConfiguration: ${e.message}")
             }
@@ -203,10 +210,16 @@ class WebRTCManager(
                     try {
                         val json = Gson().fromJson(str, JsonObject::class.java)
                         val action = json.get("action")?.asString
-                        if (action == "start") {
+                        if (action == "start" || action == "camera_start") {
                             mainHandler.post { listener.onCameraStreamStarted() }
-                        } else if (action == "stop") {
+                        } else if (action == "stop" || action == "camera_stop") {
                             mainHandler.post { listener.onCameraStreamStopped() }
+                        } else if (action == "switch" || action == "camera_switch") {
+                            val facing = json.get("facing")?.asString ?: json.get("params")?.asJsonObject?.get("facing")?.asString ?: ""
+                            mainHandler.post { listener.onCameraSwitchRequested(facing) }
+                        } else if (action == "configure" || action == "camera_configure") {
+                            val params = json.getAsJsonObject("params") ?: json
+                            mainHandler.post { listener.onCameraConfigureRequested(params) }
                         }
                         mainHandler.post { listener.onCameraResponse(json) }
                     } catch (e: Throwable) {

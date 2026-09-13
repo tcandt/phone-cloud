@@ -29,6 +29,7 @@ var (
 	latestCameraJpegMu sync.RWMutex
 	cameraStreaming    bool
 	cameraFacing       = "environment" // "environment" or "user"
+	cameraResolution   = "720p"         // "4k", "1080p", "720p", "480p"
 	cameraOrientation  = 0
 	cameraFps          = 30
 	cameraFrameChan    = make(chan []byte, 16)
@@ -865,11 +866,39 @@ func setupCameraChannel(dc *webrtc.DataChannel, s *WebRTCSession) {
 			})
 			_ = dc.SendText(string(resp))
 
+		case "camera_configure", "configure":
+			cameraStateMu.Lock()
+			res := "720p"
+			if cmd.Params != nil && cmd.Params["resolution"] != nil {
+				res = fmt.Sprintf("%v", cmd.Params["resolution"])
+			}
+			cameraResolution = res
+			cameraStateMu.Unlock()
+
+			// Forward configuration to peer (Android controller) over DataChannel
+			confCmd, _ := json.Marshal(map[string]interface{}{
+				"action":     "configure",
+				"resolution": res,
+			})
+			_ = dc.SendText(string(confCmd))
+
+			resp, _ := json.Marshal(map[string]interface{}{
+				"status":     "success",
+				"action":     "camera_configure",
+				"request_id": cmd.RequestID,
+				"resolution": res,
+			})
+			_ = dc.SendText(string(resp))
+
 		case "camera_status", "status":
 			cameraStateMu.RLock()
 			streaming := cameraStreaming
 			facing := cameraFacing
 			fps := cameraFps
+			res := cameraResolution
+			if res == "" {
+				res = "720p"
+			}
 			cameraStateMu.RUnlock()
 
 			latestCameraJpegMu.RLock()
@@ -877,14 +906,17 @@ func setupCameraChannel(dc *webrtc.DataChannel, s *WebRTCSession) {
 			latestCameraJpegMu.RUnlock()
 
 			resp, _ := json.Marshal(map[string]interface{}{
-				"status":     "success",
-				"action":     "camera_status",
-				"request_id": cmd.RequestID,
-				"supported":  true,
-				"streaming":  streaming,
-				"facing":     facing,
-				"fps":        fps,
-				"has_frame":  hasFrame,
+				"status":                "success",
+				"action":                "camera_status",
+				"request_id":            cmd.RequestID,
+				"supported":             true,
+				"streaming":             streaming,
+				"facing":                facing,
+				"fps":                   fps,
+				"has_frame":             hasFrame,
+				"current_resolution":    res,
+				"supported_resolutions": []string{"4k", "1080p", "720p", "480p"},
+				"supported_lenses":      []string{"back", "front", "external"},
 			})
 			_ = dc.SendText(string(resp))
 
