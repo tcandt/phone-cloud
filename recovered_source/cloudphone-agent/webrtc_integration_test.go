@@ -245,12 +245,12 @@ func TestWebRTC_EndToEndIntegration(t *testing.T) {
 		t.Fatalf("Failed to send touch over input-channel: %v", err)
 	}
 
-	controlPacket, err := readControlPacket(28, 2*time.Second)
+	controlPacket, err := readControlPacket(32, 2*time.Second)
 	if err != nil {
 		t.Fatalf("Failed to read scrcpy control packet from net.Pipe: %v", err)
 	}
 
-	// Validate 28-byte scrcpy touch event structure
+	// Validate 32-byte scrcpy touch event structure
 	if controlPacket[0] != 2 { // INJECT_TOUCH_EVENT = 2
 		t.Fatalf("Expected scrcpy event type 2, got %d", controlPacket[0])
 	}
@@ -262,8 +262,13 @@ func TestWebRTC_EndToEndIntegration(t *testing.T) {
 	if touchX != 300 || touchY != 600 {
 		t.Fatalf("Expected touch coords (300, 600), got (%d, %d)", touchX, touchY)
 	}
-	t.Logf("[PASS] Genuine scrcpy binary touch packet asserted from net.Pipe: type=%d, action=%d, coords=(%d,%d)",
-		controlPacket[0], controlPacket[1], touchX, touchY)
+	actionButton := binary.BigEndian.Uint32(controlPacket[24:28])
+	buttons := binary.BigEndian.Uint32(controlPacket[28:32])
+	if actionButton != 0 || buttons != 0 {
+		t.Fatalf("Expected actionButton and buttons to be 0, got (%d, %d)", actionButton, buttons)
+	}
+	t.Logf("[PASS] Genuine scrcpy binary touch packet (32 bytes) asserted from net.Pipe: type=%d, action=%d, coords=(%d,%d), actionButton=%d, buttons=%d",
+		controlPacket[0], controlPacket[1], touchX, touchY, actionButton, buttons)
 
 	// 9. Test binary camera frame streaming on camera-channel
 	cameraDC := receivedChannels["camera-channel"]
@@ -321,19 +326,21 @@ func TestWebRTC_EndToEndIntegration(t *testing.T) {
 		t.Fatal("Timeout waiting for camera_snapshot response")
 	}
 
-	// 11. Test Media Streaming (broadcasting video RTP packet with direct PTS)
+	// 11. Test Media Streaming through Timeline PTS calculation
+	testPtsUs := uint64(1000000) // 1.0 second hardware PTS
+	computedTs := streamer.computeVideoRtpTimestamp(testPtsUs)
 	syntheticNalu := []byte{0x00, 0x00, 0x00, 0x01, 0x65, 0x88, 0x84, 0x00, 0x10, 0xFF}
-	streamer.packetizeAndBroadcastVideo(syntheticNalu, 90000, true)
+	streamer.packetizeAndBroadcastVideo(syntheticNalu, computedTs, true)
 
 	select {
 	case pkt := <-videoPacketsReceived:
 		if pkt.PayloadType != 96 {
 			t.Fatalf("Expected RTP PayloadType 96 (H.264), got %d", pkt.PayloadType)
 		}
-		if pkt.Timestamp != 90000 {
-			t.Fatalf("Expected RTP Timestamp 90000, got %d", pkt.Timestamp)
+		if pkt.Timestamp != computedTs {
+			t.Fatalf("Expected RTP Timestamp %d, got %d", computedTs, pkt.Timestamp)
 		}
-		t.Logf("[PASS] Video RTP packet received by client: PT=%d, TS=%d, Seq=%d, PayloadLen=%d",
+		t.Logf("[PASS] Video RTP packet received by client with computed PTS: PT=%d, TS=%d, Seq=%d, PayloadLen=%d",
 			pkt.PayloadType, pkt.Timestamp, pkt.SequenceNumber, len(pkt.Payload))
 	case <-time.After(3 * time.Second):
 		t.Fatal("FAIL: Timeout waiting for Video RTP packet from StreamerBridge")
@@ -344,4 +351,176 @@ func TestWebRTC_EndToEndIntegration(t *testing.T) {
 	_ = clientAiDC
 	_ = clientAdbDC
 	t.Log("[PASS] WebRTC End-to-End full integration test complete!")
+}
+
+// TestMediaTimeline_PTSMapping rigorously tests the hardware PTS mapper:
+// 1. Exact 90 kHz video clock conversion (33,333 us delta -> ~3000 ticks)
+// 2. Exact 48 kHz audio clock conversion (20,000 us delta -> 960 ticks)
+// 3. Shared immutable epoch across video and audio
+// 4. Startup skew invariance (audio arriving before video or vice versa)
+func TestMediaTimeline_PTSMapping(t *testing.T) {
+	vBase := uint32(10000)
+	aBase := uint32(20000)
+	tl := NewMediaTimeline(vBase, aBase)
+
+	// Step 1: Video arrives first at PTS = 1,000,000 us (epoch anchor)
+	tsV0 := tl.ComputeVideoTimestamp(1000000)
+	if tsV0 != vBase {
+		t.Fatalf("Expected initial video timestamp to equal vBase (%d), got %d", vBase, tsV0)
+	}
+
+	// Step 2: Next video frame arrives at PTS = 1,033,333 us (30 FPS, delta = 33,333 us)
+	tsV1 := tl.ComputeVideoTimestamp(1033333)
+	deltaV := tsV1 - tsV0
+	// (33333 * 90000) / 1000000 = 2999 ticks (~3000 ticks at 90 kHz)
+	expectedDeltaV := uint32((33333 * 90000) / 1000000)
+	if deltaV != expectedDeltaV {
+		t.Fatalf("Expected video RTP delta %d, got %d", expectedDeltaV, deltaV)
+	}
+	t.Logf("[PASS] Video 90kHz PTS mapping verified: deltaUs=33333 -> deltaRtp=%d ticks", deltaV)
+
+	// Step 3: Audio frame arrives at PTS = 1,020,000 us (20ms after video epoch anchor)
+	tsA0 := tl.ComputeAudioTimestamp(1020000)
+	// deltaUs = 20000 -> (20000 * 48000) / 1000000 = 960 ticks
+	expectedA0 := aBase + 960
+	if tsA0 != expectedA0 {
+		t.Fatalf("Expected audio RTP timestamp %d, got %d", expectedA0, tsA0)
+	}
+	t.Logf("[PASS] Audio 48kHz PTS mapping relative to shared epoch verified: tsA0=%d (delta=+960)", tsA0)
+
+	// Step 4: Next audio frame arrives at PTS = 1,040,000 us (20ms Opus frame)
+	tsA1 := tl.ComputeAudioTimestamp(1040000)
+	deltaA := tsA1 - tsA0
+	if deltaA != 960 {
+		t.Fatalf("Expected 20ms Opus audio delta of 960 samples, got %d", deltaA)
+	}
+	t.Logf("[PASS] Audio 20ms Opus frame sample delta verified: %d samples at 48kHz", deltaA)
+
+	// Step 5: Verify that audio arrival did NOT shift the video epoch anchor
+	tsV2 := tl.ComputeVideoTimestamp(1066666) // 66.666ms after epoch
+	deltaV2 := tsV2 - tsV0
+	expectedDeltaV2 := uint32((66666 * 90000) / 1000000)
+	if deltaV2 != expectedDeltaV2 {
+		t.Fatalf("Video timeline drifted after audio processing: expected delta %d, got %d", expectedDeltaV2, deltaV2)
+	}
+	t.Log("[PASS] Timeline epoch is strictly immutable; audio stream processing did not disturb video timeline")
+
+	// Step 6: Test Startup Skew: Audio arrives BEFORE video
+	tlSkew := NewMediaTimeline(50000, 60000)
+	// Audio arrives first at PTS = 980,000 us
+	tsA_skew := tlSkew.ComputeAudioTimestamp(980000)
+	if tsA_skew != 60000 {
+		t.Fatalf("Expected initial audio timestamp to equal aBase (60000), got %d", tsA_skew)
+	}
+	// Video arrives at PTS = 1,000,000 us (20,000 us after audio)
+	tsV_skew := tlSkew.ComputeVideoTimestamp(1000000)
+	expectedV_skew := uint32(50000 + (20000*90000)/1000000) // 50000 + 1800 = 51800
+	if tsV_skew != expectedV_skew {
+		t.Fatalf("Expected skewed video timestamp %d, got %d", expectedV_skew, tsV_skew)
+	}
+	t.Logf("[PASS] Startup skew verified: audio-first startup correctly anchored epoch; video TS = %d (delta=+1800 ticks)", tsV_skew)
+}
+
+// TestPerSessionRTPSequence validates that each WebRTCSession maintains an independent,
+// strictly monotonic RTP sequence space without artificial packet loss caused by new viewers joining
+func TestPerSessionRTPSequence(t *testing.T) {
+	streamer := NewStreamerBridge(nil, 30)
+	streamer.cachedCodecConfig = []byte{
+		0x00, 0x00, 0x00, 0x01, 0x67, 0x42, 0x00, 0x1f, 0x68, 0xce, 0x3c, 0x80, // SPS
+		0x00, 0x00, 0x00, 0x01, 0x68, 0xce, 0x3c, 0x80,                         // PPS
+	}
+
+	vTrackA, err := webrtc.NewTrackLocalStaticRTP(webrtc.RTPCodecCapability{MimeType: webrtc.MimeTypeH264}, "video", "cloudphone-video")
+	if err != nil {
+		t.Fatalf("Failed to create video track: %v", err)
+	}
+	sessA := &WebRTCSession{
+		ClientID:   "viewer_A",
+		videoTrack: vTrackA,
+		videoQueue: make(chan *rtp.Packet, 100),
+		audioQueue: make(chan *rtp.Packet, 100),
+		videoSeq:   1000, // Starts at 1000
+	}
+	streamer.RegisterSession("viewer_A", sessA)
+
+	// Read initial cached SPS/PPS packet from Viewer A
+	var pktA0 *rtp.Packet
+	select {
+	case pktA0 = <-sessA.videoQueue:
+	default:
+		t.Fatal("Viewer A did not receive initial cached codec config packet")
+	}
+	initSeqA := pktA0.SequenceNumber
+	if initSeqA != 1001 {
+		t.Fatalf("Expected initial sequence for Viewer A to be 1001, got %d", initSeqA)
+	}
+
+	// Broadcast Frame 1
+	syntheticNalu1 := []byte{0x00, 0x00, 0x00, 0x01, 0x41, 0x9A}
+	streamer.packetizeAndBroadcastVideo(syntheticNalu1, 10000, false)
+
+	var pktA1 *rtp.Packet
+	select {
+	case pktA1 = <-sessA.videoQueue:
+	default:
+		t.Fatal("Viewer A did not receive frame 1")
+	}
+	if pktA1.SequenceNumber != initSeqA+1 {
+		t.Fatalf("Expected Viewer A sequence %d, got %d", initSeqA+1, pktA1.SequenceNumber)
+	}
+
+	// Viewer B joins NOW! Receives cached SPS/PPS
+	vTrackB, err := webrtc.NewTrackLocalStaticRTP(webrtc.RTPCodecCapability{MimeType: webrtc.MimeTypeH264}, "video", "cloudphone-video")
+	if err != nil {
+		t.Fatalf("Failed to create video track: %v", err)
+	}
+	sessB := &WebRTCSession{
+		ClientID:   "viewer_B",
+		videoTrack: vTrackB,
+		videoQueue: make(chan *rtp.Packet, 100),
+		audioQueue: make(chan *rtp.Packet, 100),
+		videoSeq:   5000, // Starts at 5000
+	}
+	streamer.RegisterSession("viewer_B", sessB)
+
+	var pktB0 *rtp.Packet
+	select {
+	case pktB0 = <-sessB.videoQueue:
+	default:
+		t.Fatal("Viewer B did not receive initial cached codec config packet")
+	}
+	if pktB0.SequenceNumber != 5001 {
+		t.Fatalf("Expected Viewer B sequence 5001, got %d", pktB0.SequenceNumber)
+	}
+
+	// Broadcast Frame 2 to BOTH viewers
+	syntheticNalu2 := []byte{0x00, 0x00, 0x00, 0x01, 0x41, 0x9B}
+	streamer.packetizeAndBroadcastVideo(syntheticNalu2, 13000, false)
+
+	// CRITICAL ASSERTION: Viewer A must receive next consecutive sequence number (initSeqA+2 = 1003)
+	// with NO gap or jump caused by Viewer B's joining!
+	var pktA2 *rtp.Packet
+	select {
+	case pktA2 = <-sessA.videoQueue:
+	default:
+		t.Fatal("Viewer A did not receive frame 2")
+	}
+	if pktA2.SequenceNumber != pktA1.SequenceNumber+1 {
+		t.Fatalf("CRITICAL: Viewer A experienced sequence jump/gap! Expected %d, got %d",
+			pktA1.SequenceNumber+1, pktA2.SequenceNumber)
+	}
+
+	// Viewer B also receives its own consecutive sequence number (5002)
+	var pktB1 *rtp.Packet
+	select {
+	case pktB1 = <-sessB.videoQueue:
+	default:
+		t.Fatal("Viewer B did not receive frame 2")
+	}
+	if pktB1.SequenceNumber != 5002 {
+		t.Fatalf("Expected Viewer B sequence 5002, got %d", pktB1.SequenceNumber)
+	}
+
+	t.Logf("[PASS] Per-session sequence isolation verified: Viewer A seq=(%d, %d, %d), Viewer B seq=(%d, %d)",
+		pktA0.SequenceNumber, pktA1.SequenceNumber, pktA2.SequenceNumber, pktB0.SequenceNumber, pktB1.SequenceNumber)
 }

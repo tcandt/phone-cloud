@@ -1,6 +1,8 @@
 package main
 
 import (
+	"crypto/rand"
+	"encoding/binary"
 	"encoding/json"
 	"log"
 	"net/url"
@@ -24,6 +26,11 @@ type WebRTCSession struct {
 	Caps             SessionCapabilities
 	mu               sync.RWMutex
 
+	// Per-session RTP sequence numbers (monotonic, isolated per viewer)
+	seqMu    sync.Mutex
+	videoSeq uint16
+	audioSeq uint16
+
 	// Media queues for non-blocking distribution
 	videoQueue       chan *rtp.Packet
 	audioQueue       chan *rtp.Packet
@@ -36,6 +43,32 @@ type WebRTCSession struct {
 	// PLI Throttling
 	lastPliTime      time.Time
 	pliMu            sync.Mutex
+}
+
+func (s *WebRTCSession) NextVideoSeq() uint16 {
+	s.seqMu.Lock()
+	defer s.seqMu.Unlock()
+	s.videoSeq++
+	return s.videoSeq
+}
+
+func (s *WebRTCSession) NextAudioSeq() uint16 {
+	s.seqMu.Lock()
+	defer s.seqMu.Unlock()
+	s.audioSeq++
+	return s.audioSeq
+}
+
+func (s *WebRTCSession) CurrentVideoSeq() uint16 {
+	s.seqMu.Lock()
+	defer s.seqMu.Unlock()
+	return s.videoSeq
+}
+
+func (s *WebRTCSession) CurrentAudioSeq() uint16 {
+	s.seqMu.Lock()
+	defer s.seqMu.Unlock()
+	return s.audioSeq
 }
 
 func (s *WebRTCSession) SetOnLocalCandidate(cb func(candidate *webrtc.ICECandidate)) {
@@ -185,6 +218,11 @@ func NewWebRTCSession(ctrl *ControlWriter, iceServersRaw string) (*WebRTCSession
 		_, _ = pc.AddTrack(aTrack)
 	}
 
+	var seqBytes [4]byte
+	_, _ = rand.Read(seqBytes[:])
+	vSeqInit := binary.BigEndian.Uint16(seqBytes[0:2])
+	aSeqInit := binary.BigEndian.Uint16(seqBytes[2:4])
+
 	session := &WebRTCSession{
 		pc:         pc,
 		videoTrack: vTrack,
@@ -192,6 +230,8 @@ func NewWebRTCSession(ctrl *ControlWriter, iceServersRaw string) (*WebRTCSession
 		ctrl:       ctrl,
 		videoQueue: make(chan *rtp.Packet, 120),
 		audioQueue: make(chan *rtp.Packet, 120),
+		videoSeq:   vSeqInit,
+		audioSeq:   aSeqInit,
 	}
 
 	// Non-blocking worker goroutine for video RTP packet dispatch

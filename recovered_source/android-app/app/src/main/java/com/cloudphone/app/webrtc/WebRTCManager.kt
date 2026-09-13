@@ -35,6 +35,8 @@ class WebRTCManager(
         fun onCameraStreamStopped() {}
         fun onCameraSwitchRequested(facing: String) {}
         fun onCameraConfigureRequested(params: JsonObject) {}
+        fun onCameraZoomRequested(zoom: Float) {}
+        fun onCameraRotateRequested(degrees: Int) {}
     }
 
     private var factory: PeerConnectionFactory? = null
@@ -220,6 +222,12 @@ class WebRTCManager(
                         } else if (action == "configure" || action == "camera_configure") {
                             val params = json.getAsJsonObject("params") ?: json
                             mainHandler.post { listener.onCameraConfigureRequested(params) }
+                        } else if (action == "zoom" || action == "camera_zoom") {
+                            val zoom = json.get("zoom")?.asFloat ?: json.get("params")?.asJsonObject?.get("zoom")?.asFloat ?: 1.0f
+                            mainHandler.post { listener.onCameraZoomRequested(zoom) }
+                        } else if (action == "rotate" || action == "camera_rotate") {
+                            val degrees = json.get("degrees")?.asInt ?: json.get("rotation")?.asInt ?: json.get("params")?.asJsonObject?.get("degrees")?.asInt ?: 0
+                            mainHandler.post { listener.onCameraRotateRequested(degrees) }
                         }
                         mainHandler.post { listener.onCameraResponse(json) }
                     } catch (e: Throwable) {
@@ -431,6 +439,16 @@ class WebRTCManager(
         if (dc.state() != DataChannel.State.OPEN) return false
         val buffer = DataChannel.Buffer(ByteBuffer.wrap(jpegBytes), true)
         return dc.send(buffer)
+    }
+
+    fun sendCameraZoom(zoom: Float): Boolean {
+        val params = JsonObject().apply { addProperty("zoom", zoom) }
+        return sendCameraCommand("camera_zoom", params = params)
+    }
+
+    fun sendCameraRotate(degrees: Int): Boolean {
+        val params = JsonObject().apply { addProperty("degrees", degrees) }
+        return sendCameraCommand("camera_rotate", params = params)
     }
 
     fun sendAdbData(bytes: ByteArray): Boolean {

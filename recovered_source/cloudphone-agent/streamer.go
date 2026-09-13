@@ -7,7 +7,6 @@ import (
 	"log"
 	"net"
 	"sync"
-	"time"
 
 	"github.com/pion/rtp"
 	"github.com/pion/rtp/codecs"
@@ -26,27 +25,95 @@ type StreamerBridge struct {
 	cachedCodecConfig []byte
 	configMu          sync.RWMutex
 
-	// Shared Media Timeline Epoch & Reference Clock
-	timelineMu     sync.Mutex
-	hasCommonEpoch bool
-	basePtsUs      uint64
-	baseWallClock  time.Time
+	// Shared Media Timeline Epoch & Reference Clock (immutable after initial packet)
+	timeline *MediaTimeline
 
 	// Video RTP State (90,000 Hz clock)
 	videoPayloader codecs.H264Payloader
-	videoSeq       uint16
-	videoRtpBase   uint32
 	videoSSRC      uint32
-	prevVideoPtsUs uint64
-	hasVideoPrev   bool
 
 	// Audio RTP State (48,000 Hz clock)
 	audioPayloader codecs.OpusPayloader
-	audioSeq       uint16
-	audioRtpBase   uint32
 	audioSSRC      uint32
-	prevAudioPtsUs uint64
-	hasAudioPrev   bool
+}
+
+// MediaTimeline manages an immutable common temporal origin epoch (microsecond hardware PTS)
+// and maps both Video (90 kHz) and Audio (48 kHz) to synchronized RTP timestamps.
+type MediaTimeline struct {
+	mu           sync.RWMutex
+	initialized  bool
+	epochPtsUs   int64  // Immutable reference origin in microseconds
+	videoRtpBase uint32 // 90 kHz base RTP timestamp
+	audioRtpBase uint32 // 48 kHz base RTP timestamp
+	generation   uint32 // Monotonic discontinuity generation counter
+	lastVideoPts int64
+	lastAudioPts int64
+}
+
+func NewMediaTimeline(vBase, aBase uint32) *MediaTimeline {
+	return &MediaTimeline{
+		videoRtpBase: vBase,
+		audioRtpBase: aBase,
+	}
+}
+
+// Reset atomically resets the common timeline origin upon major discontinuity
+func (mt *MediaTimeline) Reset() {
+	mt.mu.Lock()
+	defer mt.mu.Unlock()
+	mt.initialized = false
+	mt.epochPtsUs = 0
+	mt.generation++
+	mt.lastVideoPts = 0
+	mt.lastAudioPts = 0
+}
+
+// ComputeVideoTimestamp maps video PTS (microseconds) to 90 kHz RTP timestamp relative to common epoch
+func (mt *MediaTimeline) ComputeVideoTimestamp(ptsUs uint64) uint32 {
+	mt.mu.Lock()
+	defer mt.mu.Unlock()
+
+	pts := int64(ptsUs)
+	if !mt.initialized {
+		mt.epochPtsUs = pts
+		mt.initialized = true
+	}
+	mt.lastVideoPts = pts
+
+	diffUs := pts - mt.epochPtsUs
+	// H.264 Clock Rate: 90,000 Hz
+	offset := (diffUs * 90000) / 1000000
+	return mt.videoRtpBase + uint32(offset)
+}
+
+// ComputeAudioTimestamp maps audio PTS (microseconds) to 48 kHz RTP timestamp relative to common epoch
+func (mt *MediaTimeline) ComputeAudioTimestamp(audioPtsUs uint64) uint32 {
+	mt.mu.Lock()
+	defer mt.mu.Unlock()
+
+	pts := int64(audioPtsUs)
+	if !mt.initialized {
+		mt.epochPtsUs = pts
+		mt.initialized = true
+	}
+	mt.lastAudioPts = pts
+
+	diffUs := pts - mt.epochPtsUs
+	// Opus Audio Clock Rate: 48,000 Hz
+	offset := (diffUs * 48000) / 1000000
+	return mt.audioRtpBase + uint32(offset)
+}
+
+func (mt *MediaTimeline) IsInitialized() bool {
+	mt.mu.RLock()
+	defer mt.mu.RUnlock()
+	return mt.initialized
+}
+
+func (mt *MediaTimeline) EpochPtsUs() int64 {
+	mt.mu.RLock()
+	defer mt.mu.RUnlock()
+	return mt.epochPtsUs
 }
 
 func NewStreamerBridge(ctrl *ControlWriter, fps int) *StreamerBridge {
@@ -64,98 +131,29 @@ func NewStreamerBridge(ctrl *ControlWriter, fps int) *StreamerBridge {
 	aSSRC := binary.BigEndian.Uint32(b[:])
 
 	return &StreamerBridge{
-		sessions:     make(map[string]*WebRTCSession),
-		control:      ctrl,
-		fps:          fps,
-		running:      true,
-		videoRtpBase: vBase,
-		audioRtpBase: aBase,
-		videoSSRC:    vSSRC,
-		audioSSRC:    aSSRC,
+		sessions:       make(map[string]*WebRTCSession),
+		control:        ctrl,
+		fps:            fps,
+		running:        true,
+		timeline:       NewMediaTimeline(vBase, aBase),
+		videoSSRC:      vSSRC,
+		audioSSRC:      aSSRC,
 	}
 }
 
 // ResetTimeline resets the shared media timeline epoch on reconnect or major discontinuity
 func (sb *StreamerBridge) ResetTimeline() {
-	sb.timelineMu.Lock()
-	defer sb.timelineMu.Unlock()
-	sb.hasCommonEpoch = false
-	sb.basePtsUs = 0
-	sb.baseWallClock = time.Time{}
-	sb.hasVideoPrev = false
-	sb.prevVideoPtsUs = 0
-	sb.hasAudioPrev = false
-	sb.prevAudioPtsUs = 0
+	sb.timeline.Reset()
 }
 
 // computeVideoRtpTimestamp maps video PTS (microseconds) to 90 kHz RTP timestamp relative to common epoch
 func (sb *StreamerBridge) computeVideoRtpTimestamp(ptsUs uint64) uint32 {
-	sb.timelineMu.Lock()
-	defer sb.timelineMu.Unlock()
-
-	now := time.Now()
-	if !sb.hasCommonEpoch {
-		sb.basePtsUs = ptsUs
-		sb.baseWallClock = now
-		sb.hasCommonEpoch = true
-	}
-
-	var elapsedUs uint64
-	if ptsUs >= sb.basePtsUs {
-		elapsedUs = ptsUs - sb.basePtsUs
-	} else {
-		// Timestamp backwards: re-anchor epoch
-		sb.basePtsUs = ptsUs
-		sb.baseWallClock = now
-		elapsedUs = 0
-	}
-
-	// Discontinuity check (> 3s gap)
-	if sb.hasVideoPrev && ptsUs > sb.prevVideoPtsUs && (ptsUs-sb.prevVideoPtsUs) > 3000000 {
-		sb.basePtsUs = ptsUs
-		sb.baseWallClock = now
-		elapsedUs = 0
-	}
-	sb.prevVideoPtsUs = ptsUs
-	sb.hasVideoPrev = true
-
-	// H.264 Clock Rate: 90,000 Hz
-	rtpOffset := uint32((elapsedUs * 90000) / 1000000)
-	return sb.videoRtpBase + rtpOffset
+	return sb.timeline.ComputeVideoTimestamp(ptsUs)
 }
 
 // computeAudioRtpTimestamp maps audio PTS (microseconds) to 48 kHz RTP timestamp relative to common epoch
 func (sb *StreamerBridge) computeAudioRtpTimestamp(audioPtsUs uint64) uint32 {
-	sb.timelineMu.Lock()
-	defer sb.timelineMu.Unlock()
-
-	now := time.Now()
-	if !sb.hasCommonEpoch {
-		sb.basePtsUs = audioPtsUs
-		sb.baseWallClock = now
-		sb.hasCommonEpoch = true
-	}
-
-	var elapsedUs uint64
-	if audioPtsUs >= sb.basePtsUs {
-		elapsedUs = audioPtsUs - sb.basePtsUs
-	} else {
-		sb.basePtsUs = audioPtsUs
-		sb.baseWallClock = now
-		elapsedUs = 0
-	}
-
-	if sb.hasAudioPrev && audioPtsUs > sb.prevAudioPtsUs && (audioPtsUs-sb.prevAudioPtsUs) > 3000000 {
-		sb.basePtsUs = audioPtsUs
-		sb.baseWallClock = now
-		elapsedUs = 0
-	}
-	sb.prevAudioPtsUs = audioPtsUs
-	sb.hasAudioPrev = true
-
-	// Opus Audio Clock Rate: 48,000 Hz
-	rtpOffset := uint32((elapsedUs * 48000) / 1000000)
-	return sb.audioRtpBase + rtpOffset
+	return sb.timeline.ComputeAudioTimestamp(audioPtsUs)
 }
 
 func (sb *StreamerBridge) SetPreviewStreamer(p *PreviewStreamer) {
@@ -170,19 +168,18 @@ func (sb *StreamerBridge) RegisterSession(clientID string, sess *WebRTCSession) 
 	sb.sessionsMu.Unlock()
 
 	// Immediately deliver cached SPS/PPS codec configuration to the new session as RTP packets
+	// using the session's own monotonic sequence numbering (isolated from other viewers)
 	sb.configMu.RLock()
 	if len(sb.cachedCodecConfig) > 0 {
-		configPacketsData := sb.videoPayloader.Payload(1200, sb.cachedCodecConfig)
-		sb.timelineMu.Lock()
+		configPacketsData := parseH264ConfigPackets(sb.cachedCodecConfig)
 		for i, pData := range configPacketsData {
-			sb.videoSeq++
 			isLast := (i == len(configPacketsData)-1)
 			pkt := &rtp.Packet{
 				Header: rtp.Header{
 					Version:        2,
 					PayloadType:    96,
-					SequenceNumber: sb.videoSeq,
-					Timestamp:      sb.videoRtpBase,
+					SequenceNumber: sess.NextVideoSeq(),
+					Timestamp:      sb.timeline.videoRtpBase,
 					SSRC:           sb.videoSSRC,
 					Marker:         isLast,
 				},
@@ -190,7 +187,6 @@ func (sb *StreamerBridge) RegisterSession(clientID string, sess *WebRTCSession) 
 			}
 			sess.EnqueueVideoPacket(pkt, true)
 		}
-		sb.timelineMu.Unlock()
 	}
 	sb.configMu.RUnlock()
 
@@ -209,70 +205,66 @@ func (sb *StreamerBridge) UnregisterSession(clientID string) {
 	log.Printf("[Streamer] Unregistered WebRTC session for client: %s (Remaining active: %d)", clientID, len(sb.sessions))
 }
 
-// packetizeAndBroadcastVideo packetizes H.264 payload into MTU fragments with the exact PTS RTP timestamp and broadcasts
+// packetizeAndBroadcastVideo packetizes H.264 payload into MTU fragments with exact PTS RTP timestamp
+// and delivers to each active session using isolated per-session sequence numbers
 func (sb *StreamerBridge) packetizeAndBroadcastVideo(payload []byte, rtpTimestamp uint32, isKeyFrame bool) {
 	packetsData := sb.videoPayloader.Payload(1200, payload)
 	if len(packetsData) == 0 {
 		return
 	}
 
-	sb.timelineMu.Lock()
-	packets := make([]*rtp.Packet, len(packetsData))
-	for i, pData := range packetsData {
-		sb.videoSeq++
-		isLast := (i == len(packetsData)-1)
-		packets[i] = &rtp.Packet{
-			Header: rtp.Header{
-				Version:        2,
-				PayloadType:    96,
-				SequenceNumber: sb.videoSeq,
-				Timestamp:      rtpTimestamp,
-				SSRC:           sb.videoSSRC,
-				Marker:         isLast,
-			},
-			Payload: pData,
-		}
-	}
-	sb.timelineMu.Unlock()
-
 	sb.sessionsMu.RLock()
 	defer sb.sessionsMu.RUnlock()
+	if len(sb.sessions) == 0 {
+		return
+	}
+
 	for _, sess := range sb.sessions {
-		for _, pkt := range packets {
+		for i, pData := range packetsData {
+			isLast := (i == len(packetsData)-1)
+			pkt := &rtp.Packet{
+				Header: rtp.Header{
+					Version:        2,
+					PayloadType:    96,
+					SequenceNumber: sess.NextVideoSeq(),
+					Timestamp:      rtpTimestamp,
+					SSRC:           sb.videoSSRC,
+					Marker:         isLast,
+				},
+				Payload: pData,
+			}
 			sess.EnqueueVideoPacket(pkt, isKeyFrame)
 		}
 	}
 }
 
-// packetizeAndBroadcastAudio packetizes Opus payload into RTP packets with the exact PTS RTP timestamp and broadcasts
+// packetizeAndBroadcastAudio packetizes Opus payload into RTP packets with exact PTS RTP timestamp
+// and delivers to each active session using isolated per-session sequence numbers
 func (sb *StreamerBridge) packetizeAndBroadcastAudio(payload []byte, rtpTimestamp uint32) {
 	packetsData := sb.audioPayloader.Payload(1200, payload)
 	if len(packetsData) == 0 {
 		return
 	}
 
-	sb.timelineMu.Lock()
-	packets := make([]*rtp.Packet, len(packetsData))
-	for i, pData := range packetsData {
-		sb.audioSeq++
-		packets[i] = &rtp.Packet{
-			Header: rtp.Header{
-				Version:        2,
-				PayloadType:    111,
-				SequenceNumber: sb.audioSeq,
-				Timestamp:      rtpTimestamp,
-				SSRC:           sb.audioSSRC,
-				Marker:         false,
-			},
-			Payload: pData,
-		}
-	}
-	sb.timelineMu.Unlock()
-
 	sb.sessionsMu.RLock()
 	defer sb.sessionsMu.RUnlock()
+	if len(sb.sessions) == 0 {
+		return
+	}
+
 	for _, sess := range sb.sessions {
-		for _, pkt := range packets {
+		for _, pData := range packetsData {
+			pkt := &rtp.Packet{
+				Header: rtp.Header{
+					Version:        2,
+					PayloadType:    111,
+					SequenceNumber: sess.NextAudioSeq(),
+					Timestamp:      rtpTimestamp,
+					SSRC:           sb.audioSSRC,
+					Marker:         true,
+				},
+				Payload: pData,
+			}
 			sess.EnqueueAudioPacket(pkt)
 		}
 	}
@@ -385,3 +377,80 @@ func (sb *StreamerBridge) Stop() {
 	defer sb.mu.Unlock()
 	sb.running = false
 }
+
+// parseH264ConfigPackets parses cached SPS/PPS NAL units and formats them for immediate RTP transmission.
+// If both SPS and PPS are present, it wraps them into an RFC 6184 STAP-A aggregation packet.
+func parseH264ConfigPackets(config []byte) [][]byte {
+	if len(config) == 0 {
+		return nil
+	}
+	// Split Annex B stream by start codes 0x000001 or 0x00000001
+	var nalus [][]byte
+	start := -1
+	for i := 0; i < len(config); {
+		if i+3 <= len(config) && config[i] == 0x00 && config[i+1] == 0x00 && config[i+2] == 0x01 {
+			if start != -1 && i > start {
+				nalus = append(nalus, config[start:i])
+			}
+			i += 3
+			start = i
+			continue
+		}
+		if i+4 <= len(config) && config[i] == 0x00 && config[i+1] == 0x00 && config[i+2] == 0x00 && config[i+3] == 0x01 {
+			if start != -1 && i > start {
+				nalus = append(nalus, config[start:i])
+			}
+			i += 4
+			start = i
+			continue
+		}
+		i++
+	}
+	if start != -1 && start < len(config) {
+		nalus = append(nalus, config[start:])
+	}
+	if len(nalus) == 0 {
+		nalus = append(nalus, config)
+	}
+
+	var sps, pps []byte
+	var otherNalus [][]byte
+	for _, nalu := range nalus {
+		if len(nalu) == 0 {
+			continue
+		}
+		naluType := nalu[0] & 0x1F
+		if naluType == 7 {
+			sps = nalu
+		} else if naluType == 8 {
+			pps = nalu
+		} else {
+			otherNalus = append(otherNalus, nalu)
+		}
+	}
+
+	var packets [][]byte
+	// If both SPS and PPS are present, bundle into RFC 6184 STAP-A (Type 24)
+	if len(sps) > 0 && len(pps) > 0 {
+		stapA := make([]byte, 1+2+len(sps)+2+len(pps))
+		stapA[0] = 0x78 // STAP-A: F=0, NRI=3, Type=24
+		binary.BigEndian.PutUint16(stapA[1:3], uint16(len(sps)))
+		copy(stapA[3:3+len(sps)], sps)
+		offset := 3 + len(sps)
+		binary.BigEndian.PutUint16(stapA[offset:offset+2], uint16(len(pps)))
+		copy(stapA[offset+2:], pps)
+		packets = append(packets, stapA)
+	} else {
+		if len(sps) > 0 {
+			packets = append(packets, sps)
+		}
+		if len(pps) > 0 {
+			packets = append(packets, pps)
+		}
+	}
+	for _, n := range otherNalus {
+		packets = append(packets, n)
+	}
+	return packets
+}
+

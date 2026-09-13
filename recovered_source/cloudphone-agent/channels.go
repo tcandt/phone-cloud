@@ -890,6 +890,48 @@ func setupCameraChannel(dc *webrtc.DataChannel, s *WebRTCSession) {
 			})
 			_ = dc.SendText(string(resp))
 
+		case "camera_zoom", "zoom":
+			ratio := 1.0
+			if cmd.Params != nil && cmd.Params["zoom"] != nil {
+				if r, ok := cmd.Params["zoom"].(float64); ok {
+					ratio = r
+				}
+			}
+			zoomCmd, _ := json.Marshal(map[string]interface{}{
+				"action": "zoom",
+				"zoom":   ratio,
+			})
+			_ = dc.SendText(string(zoomCmd))
+
+			resp, _ := json.Marshal(map[string]interface{}{
+				"status":     "success",
+				"action":     "camera_zoom",
+				"request_id": cmd.RequestID,
+				"zoom":       ratio,
+			})
+			_ = dc.SendText(string(resp))
+
+		case "camera_rotate", "rotate":
+			deg := 0
+			if cmd.Params != nil && cmd.Params["rotation"] != nil {
+				if d, ok := cmd.Params["rotation"].(float64); ok {
+					deg = int(d)
+				}
+			}
+			rotCmd, _ := json.Marshal(map[string]interface{}{
+				"action":   "rotate",
+				"rotation": deg,
+			})
+			_ = dc.SendText(string(rotCmd))
+
+			resp, _ := json.Marshal(map[string]interface{}{
+				"status":     "success",
+				"action":     "camera_rotate",
+				"request_id": cmd.RequestID,
+				"rotation":   deg,
+			})
+			_ = dc.SendText(string(resp))
+
 		case "camera_status", "status":
 			cameraStateMu.RLock()
 			streaming := cameraStreaming

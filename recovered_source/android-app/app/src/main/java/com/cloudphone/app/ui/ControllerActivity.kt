@@ -6,6 +6,7 @@ import android.content.ClipboardManager
 import android.content.Context
 import android.content.pm.PackageManager
 import android.graphics.ImageFormat
+import android.graphics.Rect
 import android.graphics.SurfaceTexture
 import android.hardware.camera2.*
 import android.media.AudioAttributes
@@ -14,10 +15,15 @@ import android.media.AudioTrack
 import android.media.ImageReader
 import android.media.MediaCodec
 import android.media.MediaFormat
+import android.os.Build
 import android.os.Bundle
+import android.os.Environment
 import android.os.Handler
 import android.os.HandlerThread
 import android.os.Looper
+import android.os.PowerManager
+import java.io.File
+import java.io.FileOutputStream
 import android.util.Log
 import android.util.Size
 import android.view.MotionEvent
@@ -90,6 +96,17 @@ class ControllerActivity : AppCompatActivity(), TextureView.SurfaceTextureListen
     private var currentSelectedLensFacing: Int = CameraCharacteristics.LENS_FACING_BACK
     private var currentCaptureWidth = 1280
     private var currentCaptureHeight = 720
+    private var currentCaptureRequestBuilder: CaptureRequest.Builder? = null
+
+    // Surveillance Advanced Features: PTZ Digital Zoom, Rotation, Instant Recording & WakeLock
+    private var currentZoomRatio: Float = 1.0f
+    private var currentCameraRotation: Int = 0
+    private var cameraWakeLock: PowerManager.WakeLock? = null
+    private var isRecording: Boolean = false
+    private var recordingOutputFile: File? = null
+    private var recordingOutputStream: FileOutputStream? = null
+    private var recordingStartTimeMs: Long = 0L
+    private var recordedFrameCount: Long = 0L
 
     private var targetDeviceId: String = ""
     private var serverUrl: String = ""
@@ -285,6 +302,18 @@ class ControllerActivity : AppCompatActivity(), TextureView.SurfaceTextureListen
             val chosenSize = selectBestResolution(selectedLens.supportedResolutions, currentCaptureWidth, currentCaptureHeight)
             Log.i(TAG, "Starting camera capture on lens ${selectedLens.id} (${selectedLens.facingName}) at ${chosenSize.width}x${chosenSize.height}")
 
+            // Acquire Partial WakeLock to maintain surveillance camera operation with screen off
+            if (cameraWakeLock == null) {
+                try {
+                    val pm = getSystemService(Context.POWER_SERVICE) as? PowerManager
+                    cameraWakeLock = pm?.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "CloudPhone:SurveillanceWakeLock")
+                    cameraWakeLock?.acquire(4 * 3600 * 1000L) // Keep surveillance active for up to 4 hours
+                    Log.i(TAG, "Surveillance partial WakeLock acquired (screen-off background streaming enabled)")
+                } catch (e: Throwable) {
+                    Log.w(TAG, "Failed to acquire surveillance WakeLock: ${e.message}")
+                }
+            }
+
             val thread = HandlerThread("CameraCaptureThread").apply { start() }
             cameraHandlerThread = thread
             val handler = Handler(thread.looper)
@@ -300,6 +329,16 @@ class ControllerActivity : AppCompatActivity(), TextureView.SurfaceTextureListen
                     val bytes = ByteArray(buffer.remaining())
                     buffer.get(bytes)
                     webRTCManager?.sendCameraFrame(bytes)
+
+                    // Write to instant recording file if active
+                    if (isRecording && recordingOutputStream != null) {
+                        try {
+                            recordingOutputStream?.write(bytes)
+                            recordedFrameCount++
+                        } catch (e: Throwable) {
+                            Log.w(TAG, "Error writing instant recording frame: ${e.message}")
+                        }
+                    }
                 } catch (e: Throwable) {
                     Log.w(TAG, "Camera frame capture error: ${e.message}")
                 } finally {
@@ -316,7 +355,10 @@ class ControllerActivity : AppCompatActivity(), TextureView.SurfaceTextureListen
                         val captureRequestBuilder = camera.createCaptureRequest(CameraDevice.TEMPLATE_PREVIEW).apply {
                             addTarget(surface)
                             set(CaptureRequest.CONTROL_MODE, CameraMetadata.CONTROL_MODE_AUTO)
+                            set(CaptureRequest.JPEG_ORIENTATION, currentCameraRotation)
+                            applyZoomToBuilder(this, currentZoomRatio, selectedLens.id)
                         }
+                        currentCaptureRequestBuilder = captureRequestBuilder
                         camera.createCaptureSession(listOf(surface), object : CameraCaptureSession.StateCallback() {
                             override fun onConfigured(session: CameraCaptureSession) {
                                 if (cameraDevice == null) return
@@ -350,7 +392,11 @@ class ControllerActivity : AppCompatActivity(), TextureView.SurfaceTextureListen
     }
 
     private fun stopCameraCapture() {
+        if (isRecording) {
+            stopRecording()
+        }
         isCameraCapturing = false
+        currentCaptureRequestBuilder = null
         try { cameraCaptureSession?.stopRepeating() } catch (e: Throwable) {}
         try { cameraCaptureSession?.close() } catch (e: Throwable) {}
         cameraCaptureSession = null
@@ -361,6 +407,16 @@ class ControllerActivity : AppCompatActivity(), TextureView.SurfaceTextureListen
         try { cameraHandlerThread?.quitSafely() } catch (e: Throwable) {}
         cameraHandlerThread = null
         cameraHandler = null
+
+        // Release WakeLock
+        try {
+            if (cameraWakeLock?.isHeld == true) {
+                cameraWakeLock?.release()
+                Log.i(TAG, "Surveillance WakeLock released")
+            }
+        } catch (e: Throwable) {}
+        cameraWakeLock = null
+
         Log.i(TAG, "Camera capture stopped and released")
     }
 
@@ -428,10 +484,119 @@ class ControllerActivity : AppCompatActivity(), TextureView.SurfaceTextureListen
                 currentSelectedCameraId = null
             }
         }
+        if (params.has("zoom")) {
+            setCameraZoom(params.get("zoom").asFloat)
+        }
+        if (params.has("rotation")) {
+            setCameraRotation(params.get("rotation").asInt)
+        } else if (params.has("degrees")) {
+            setCameraRotation(params.get("degrees").asInt)
+        }
         Toast.makeText(this, "Camera configured: ${currentCaptureWidth}x${currentCaptureHeight}", Toast.LENGTH_SHORT).show()
-        if (isCameraCapturing) {
+        if (isCameraCapturing && (params.has("resolution") || params.has("width") || params.has("height") || params.has("facing"))) {
             stopCameraCapture()
             startCameraCapture()
+        }
+    }
+
+    private fun applyZoomToBuilder(builder: CaptureRequest.Builder, zoomRatio: Float, cameraId: String) {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            builder.set(CaptureRequest.CONTROL_ZOOM_RATIO, zoomRatio)
+        } else {
+            val cameraManager = getSystemService(Context.CAMERA_SERVICE) as? CameraManager
+            if (cameraManager != null) {
+                try {
+                    val chars = cameraManager.getCameraCharacteristics(cameraId)
+                    val rect = chars.get(CameraCharacteristics.SENSOR_INFO_ACTIVE_ARRAY_SIZE)
+                    if (rect != null) {
+                        val cropW = (rect.width() / zoomRatio).toInt()
+                        val cropH = (rect.height() / zoomRatio).toInt()
+                        val cropX = (rect.width() - cropW) / 2
+                        val cropY = (rect.height() - cropH) / 2
+                        builder.set(CaptureRequest.SCALER_CROP_REGION, Rect(cropX, cropY, cropX + cropW, cropY + cropH))
+                    }
+                } catch (e: Throwable) {
+                    Log.w(TAG, "Failed applying SCALER_CROP_REGION: ${e.message}")
+                }
+            }
+        }
+    }
+
+    private fun setCameraZoom(zoomRatio: Float) {
+        currentZoomRatio = zoomRatio.coerceIn(1.0f, 10.0f)
+        val builder = currentCaptureRequestBuilder
+        val session = cameraCaptureSession
+        val handler = cameraHandler
+        val camId = currentSelectedCameraId ?: ""
+        if (builder != null && session != null && isCameraCapturing) {
+            try {
+                applyZoomToBuilder(builder, currentZoomRatio, camId)
+                session.setRepeatingRequest(builder.build(), null, handler)
+                Log.i(TAG, "Camera digital zoom set to ${currentZoomRatio}x")
+            } catch (e: Throwable) {
+                Log.e(TAG, "Failed to apply camera zoom: ${e.message}")
+            }
+        }
+    }
+
+    private fun setCameraRotation(degrees: Int) {
+        currentCameraRotation = when (degrees % 360) {
+            90 -> 90
+            180 -> 180
+            270 -> 270
+            else -> 0
+        }
+        val builder = currentCaptureRequestBuilder
+        val session = cameraCaptureSession
+        val handler = cameraHandler
+        if (builder != null && session != null && isCameraCapturing) {
+            try {
+                builder.set(CaptureRequest.JPEG_ORIENTATION, currentCameraRotation)
+                session.setRepeatingRequest(builder.build(), null, handler)
+                Log.i(TAG, "Camera JPEG orientation set to ${currentCameraRotation}°")
+            } catch (e: Throwable) {
+                Log.e(TAG, "Failed to apply camera rotation: ${e.message}")
+            }
+        }
+    }
+
+    private fun startRecording() {
+        if (!isCameraCapturing) {
+            Toast.makeText(this, "Start camera streaming before recording", Toast.LENGTH_SHORT).show()
+            return
+        }
+        try {
+            val recDir = getExternalFilesDir(Environment.DIRECTORY_MOVIES) ?: filesDir
+            val recFile = File(recDir, "surveillance_${System.currentTimeMillis()}.mjpeg")
+            recordingOutputFile = recFile
+            recordingOutputStream = FileOutputStream(recFile)
+            recordingStartTimeMs = System.currentTimeMillis()
+            recordedFrameCount = 0L
+            isRecording = true
+            Toast.makeText(this, "Instant recording started: ${recFile.name}", Toast.LENGTH_SHORT).show()
+        } catch (e: Throwable) {
+            Toast.makeText(this, "Failed to start recording: ${e.message}", Toast.LENGTH_SHORT).show()
+        }
+    }
+
+    private fun stopRecording() {
+        if (!isRecording) return
+        isRecording = false
+        try {
+            recordingOutputStream?.flush()
+            recordingOutputStream?.close()
+        } catch (e: Throwable) {}
+        recordingOutputStream = null
+        val durationSec = (System.currentTimeMillis() - recordingStartTimeMs) / 1000
+        val sizeKb = (recordingOutputFile?.length() ?: 0) / 1024
+        Toast.makeText(this, "Recording saved: ${recordedFrameCount} frames (${sizeKb} KB, ${durationSec}s)", Toast.LENGTH_LONG).show()
+    }
+
+    private fun toggleRecording() {
+        if (isRecording) {
+            stopRecording()
+        } else {
+            startRecording()
         }
     }
 
@@ -573,6 +738,20 @@ class ControllerActivity : AppCompatActivity(), TextureView.SurfaceTextureListen
                 override fun onCameraConfigureRequested(params: JsonObject) {
                     runOnUiThread {
                         configureCameraCapture(params)
+                    }
+                }
+
+                override fun onCameraZoomRequested(zoom: Float) {
+                    runOnUiThread {
+                        setCameraZoom(zoom)
+                        Toast.makeText(this@ControllerActivity, "Digital Zoom: ${zoom}x", Toast.LENGTH_SHORT).show()
+                    }
+                }
+
+                override fun onCameraRotateRequested(degrees: Int) {
+                    runOnUiThread {
+                        setCameraRotation(degrees)
+                        Toast.makeText(this@ControllerActivity, "Camera Orientation: ${degrees}°", Toast.LENGTH_SHORT).show()
                     }
                 }
             })
@@ -845,9 +1024,12 @@ class ControllerActivity : AppCompatActivity(), TextureView.SurfaceTextureListen
         val options = arrayOf(
             "Switch Lens (Current: $currentLensName)",
             "Change Resolution (Current: ${currentCaptureWidth}x${currentCaptureHeight})",
+            "PTZ Digital Zoom (Current: ${currentZoomRatio}x)",
+            "Rotate Camera (${currentCameraRotation}°)",
             "Take Surveillance Snapshot",
+            if (isRecording) "Stop Instant Recording (Active: $recordedFrameCount frames)" else "Start Instant Recording",
             if (isCameraCapturing) "Stop Camera Streaming" else "Start Camera Streaming",
-            "Camera Surveillance Status"
+            "Camera Surveillance Diagnostics"
         )
         AlertDialog.Builder(this)
             .setTitle("Surveillance Camera Control")
@@ -855,11 +1037,14 @@ class ControllerActivity : AppCompatActivity(), TextureView.SurfaceTextureListen
                 when (which) {
                     0 -> showLensSelectionDialog(lenses)
                     1 -> showResolutionSelectionDialog()
-                    2 -> {
+                    2 -> showZoomSelectionDialog()
+                    3 -> showRotationSelectionDialog()
+                    4 -> {
                         webRTCManager?.sendCameraCommand("camera_snapshot")
                         Toast.makeText(this, "Requested snapshot from camera...", Toast.LENGTH_SHORT).show()
                     }
-                    3 -> {
+                    5 -> toggleRecording()
+                    6 -> {
                         if (isCameraCapturing) {
                             stopCameraCapture()
                             webRTCManager?.sendCameraCommand("camera_stop")
@@ -868,10 +1053,47 @@ class ControllerActivity : AppCompatActivity(), TextureView.SurfaceTextureListen
                             webRTCManager?.sendCameraCommand("camera_start")
                         }
                     }
-                    4 -> showCameraStatusDialog(currentLensName)
+                    7 -> showCameraStatusDialog(currentLensName)
                 }
             }
             .setNegativeButton("Close", null)
+            .show()
+    }
+
+    private fun showZoomSelectionDialog() {
+        val zoomLevels = arrayOf(
+            "1.0x (Standard Wide)",
+            "1.5x",
+            "2.0x (2x Tele)",
+            "3.0x (3x Tele)",
+            "5.0x (5x Extreme Zoom)",
+            "10.0x (Max Digital Zoom)"
+        )
+        val zoomValues = arrayOf(1.0f, 1.5f, 2.0f, 3.0f, 5.0f, 10.0f)
+        AlertDialog.Builder(this)
+            .setTitle("PTZ Digital Zoom")
+            .setItems(zoomLevels) { _, which ->
+                val zoom = zoomValues[which]
+                setCameraZoom(zoom)
+                webRTCManager?.sendCameraZoom(zoom)
+                Toast.makeText(this, "Zoom set to ${zoom}x", Toast.LENGTH_SHORT).show()
+            }
+            .setNegativeButton("Cancel", null)
+            .show()
+    }
+
+    private fun showRotationSelectionDialog() {
+        val rotOptions = arrayOf("0° (Normal)", "90° (Clockwise)", "180° (Inverted)", "270° (Counter-Clockwise)")
+        val rotValues = arrayOf(0, 90, 180, 270)
+        AlertDialog.Builder(this)
+            .setTitle("Rotate Camera Orientation")
+            .setItems(rotOptions) { _, which ->
+                val deg = rotValues[which]
+                setCameraRotation(deg)
+                webRTCManager?.sendCameraRotate(deg)
+                Toast.makeText(this, "Rotation set to ${deg}°", Toast.LENGTH_SHORT).show()
+            }
+            .setNegativeButton("Cancel", null)
             .show()
     }
 
@@ -922,6 +1144,10 @@ class ControllerActivity : AppCompatActivity(), TextureView.SurfaceTextureListen
             Status: ${if (isCameraCapturing) "Streaming Active (~30 FPS)" else "Idle / Standby"}
             Current Lens: $currentLensName (ID: ${currentSelectedCameraId ?: "auto"})
             Resolution: ${currentCaptureWidth}x${currentCaptureHeight}
+            PTZ Digital Zoom: ${currentZoomRatio}x
+            Orientation: ${currentCameraRotation}°
+            Screen-Off Mode: ${if (cameraWakeLock?.isHeld == true) "Active (WakeLock held)" else "Inactive"}
+            Instant Recording: ${if (isRecording) "RECORDING (${recordedFrameCount} frames)" else "Standby"}
             Format: JPEG Over WebRTC DataChannel
             Direct PTS Sync: Enabled
         """.trimIndent()

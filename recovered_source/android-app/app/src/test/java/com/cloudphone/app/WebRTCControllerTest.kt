@@ -105,7 +105,7 @@ class WebRTCControllerTest {
 
     @Test
     fun testCameraChannelCommands() {
-        val cameraActions = listOf("camera_start", "camera_stop", "camera_switch", "camera_snapshot", "camera_status")
+        val cameraActions = listOf("camera_start", "camera_stop", "camera_switch", "camera_snapshot", "camera_status", "camera_zoom", "camera_rotate")
         for (action in cameraActions) {
             val cmd = JsonObject().apply {
                 addProperty("action", action)
@@ -114,5 +114,26 @@ class WebRTCControllerTest {
             assertEquals(action, cmd.get("action").asString)
             assertEquals("cam_req_101", cmd.get("request_id").asString)
         }
+    }
+
+    @Test
+    fun testCameraPTZAndRotation() {
+        val zoomCmd = JsonObject().apply {
+            addProperty("action", "camera_zoom")
+            addProperty("request_id", "req_zoom_1")
+            val params = JsonObject().apply { addProperty("zoom", 2.5f) }
+            add("params", params)
+        }
+        assertEquals("camera_zoom", zoomCmd.get("action").asString)
+        assertEquals(2.5f, zoomCmd.getAsJsonObject("params").get("zoom").asFloat, 0.001f)
+
+        val rotCmd = JsonObject().apply {
+            addProperty("action", "camera_rotate")
+            addProperty("request_id", "req_rot_1")
+            val params = JsonObject().apply { addProperty("degrees", 180) }
+            add("params", params)
+        }
+        assertEquals("camera_rotate", rotCmd.get("action").asString)
+        assertEquals(180, rotCmd.getAsJsonObject("params").get("degrees").asInt)
     }
 }
