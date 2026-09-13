@@ -1,5 +1,7 @@
 package main
 
+import "encoding/json"
+
 // Scrcpy Control Message Types (matching com.android.helper.control.ControlMessage)
 const (
 	ControlMsgInjectKeycode            = 0
@@ -69,9 +71,49 @@ type ScrcpyOptions struct {
 	PowerOff          bool    `json:"power_off"`
 	MaxSize           int     `json:"max_size"`
 	VideoBitRate      int     `json:"video_bit_rate"`
+	Bitrate           int     `json:"bitrate"` // Alias used by Original Web client
+	MinBitrate        int     `json:"min_bitrate"`
+	MaxBitrate        int     `json:"max_bitrate"`
+	BWE               bool    `json:"bwe"`
 	MaxFPS            int     `json:"max_fps"`
 	Audio             *bool   `json:"audio"`
+	AudioGain         int     `json:"audio_gain"`
 	AudioSource       string  `json:"audio_source"`
+	AudioDup          bool    `json:"audio_dup"`
+	AudioLowLatency   bool    `json:"audio_low_latency"`
+	VideoCodecOptions string  `json:"video_codec_options"`
+	ViewOnly          bool    `json:"view_only"`
+}
+
+// UnmarshalJSON normalizes bitrate aliases and legacy property names
+func (o *ScrcpyOptions) UnmarshalJSON(data []byte) error {
+	type Alias ScrcpyOptions
+	aux := &struct {
+		RawBitrate *int `json:"bitrate"`
+		*Alias
+	}{
+		Alias: (*Alias)(o),
+	}
+	if err := json.Unmarshal(data, aux); err != nil {
+		return err
+	}
+	if aux.RawBitrate != nil && *aux.RawBitrate > 0 {
+		o.Bitrate = *aux.RawBitrate
+		if o.VideoBitRate == 0 {
+			o.VideoBitRate = *aux.RawBitrate
+		}
+	} else if o.VideoBitRate > 0 && o.Bitrate == 0 {
+		o.Bitrate = o.VideoBitRate
+	}
+	return nil
+}
+
+// CameraInfo describes a hardware camera lens available on the remote Android device
+type CameraInfo struct {
+	ID        string   `json:"id"`
+	Facing    string   `json:"facing"` // "back", "front", "external"
+	Sizes     []string `json:"sizes,omitempty"`
+	FPSRanges []int    `json:"fps_ranges,omitempty"`
 }
 
 // SessionCapabilities defines permissions granted to a client session

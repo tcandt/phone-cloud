@@ -14,6 +14,14 @@ type DisplayInfo struct {
 	YRes int `json:"y_res"`
 }
 
+// CameraInfo represents hardware camera metadata reported by the Agent
+type CameraInfo struct {
+	ID        string   `json:"id"`
+	Facing    string   `json:"facing"`
+	Sizes     []string `json:"sizes,omitempty"`
+	FPSRanges []int    `json:"fps_ranges,omitempty"`
+}
+
 // DeviceHardwareInfo represents device metadata reported by the Agent
 type DeviceHardwareInfo struct {
 	AndroidModel   string        `json:"android_model,omitempty"`
@@ -21,6 +29,7 @@ type DeviceHardwareInfo struct {
 	AndroidVersion string        `json:"android_version,omitempty"`
 	AppVersion     string        `json:"app_version,omitempty"`
 	Displays       []DisplayInfo `json:"displays,omitempty"`
+	Cameras        []CameraInfo  `json:"cameras,omitempty"`
 }
 
 // Device represents a registered Android agent device

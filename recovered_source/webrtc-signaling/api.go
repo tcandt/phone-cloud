@@ -630,6 +630,9 @@ func (s *APIServer) handleRegisterAgent(w http.ResponseWriter, r *http.Request) 
 			if len(infoBytes) <= 4 {
 				infoBytes, _ = json.Marshal(payload["info"])
 			}
+			if len(infoBytes) <= 4 {
+				infoBytes, _ = json.Marshal(payload["hw_info"])
+			}
 			var hwInfo DeviceHardwareInfo
 			_ = json.Unmarshal(infoBytes, &hwInfo)
 			dev.Info = &hwInfo

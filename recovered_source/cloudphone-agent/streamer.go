@@ -160,6 +160,25 @@ func (sb *StreamerBridge) ResetTimeline() {
 	sb.timeline.Reset()
 }
 
+// ResetSourceGeneration atomically clears cached SPS/PPS codec configuration and resets the media timeline.
+// This ensures that when switching sources (Display <-> Camera), new viewers do not receive stale config
+// and the timeline epoch cleanly re-anchors to the new source's PTS timestamps.
+func (sb *StreamerBridge) ResetSourceGeneration() {
+	sb.configMu.Lock()
+	sb.cachedCodecConfig = nil
+	sb.configMu.Unlock()
+
+	sb.timeline.Reset()
+	log.Printf("[Streamer] Reset media source generation: cleared cached SPS/PPS and reset MediaTimeline")
+}
+
+// HasCodecConfig returns true if cached SPS/PPS configuration is currently available
+func (sb *StreamerBridge) HasCodecConfig() bool {
+	sb.configMu.RLock()
+	defer sb.configMu.RUnlock()
+	return len(sb.cachedCodecConfig) > 0
+}
+
 // computeVideoRtpTimestamp maps video PTS (microseconds) to 90 kHz RTP timestamp relative to common epoch
 func (sb *StreamerBridge) computeVideoRtpTimestamp(ptsUs uint64) uint32 {
 	return sb.timeline.ComputeVideoTimestamp(ptsUs)

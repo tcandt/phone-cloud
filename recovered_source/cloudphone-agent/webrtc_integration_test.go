@@ -688,3 +688,170 @@ func TestCachedConfig_LastVideoRtpTs(t *testing.T) {
 		t.Fatal("No cached config packet delivered to new session")
 	}
 }
+
+func TestControlProtocol_ClipboardFraming(t *testing.T) {
+	serverConn, clientConn := net.Pipe()
+	defer serverConn.Close()
+	defer clientConn.Close()
+
+	cw := NewControlWriter(serverConn)
+	testText := "Antigravity Clipboard Parity"
+
+	go func() {
+		_ = cw.SetClipboard(testText, true)
+	}()
+
+	// Protocol layout: [type: 1B][seq: 8B][len: 4B][text: N B][paste: 1B]
+	expectedLen := 1 + 8 + 4 + len(testText) + 1
+	buf := make([]byte, expectedLen)
+	n, err := clientConn.Read(buf)
+	if err != nil || n != expectedLen {
+		t.Fatalf("Failed to read SetClipboard packet: n=%d, expected=%d, err=%v", n, expectedLen, err)
+	}
+
+	if buf[0] != ControlMsgSetClipboard {
+		t.Fatalf("Expected msg type %d, got %d", ControlMsgSetClipboard, buf[0])
+	}
+	seq := binary.BigEndian.Uint64(buf[1:9])
+	if seq != 1 {
+		t.Fatalf("Expected sequence 1, got %d", seq)
+	}
+	textLen := binary.BigEndian.Uint32(buf[9:13])
+	if int(textLen) != len(testText) {
+		t.Fatalf("Expected text length %d, got %d", len(testText), textLen)
+	}
+	recText := string(buf[13 : 13+len(testText)])
+	if recText != testText {
+		t.Fatalf("Expected text %q, got %q", testText, recText)
+	}
+	pasteByte := buf[13+len(testText)]
+	if pasteByte != 1 {
+		t.Fatalf("Expected trailing paste byte 1, got %d", pasteByte)
+	}
+
+	t.Logf("[PASS] Clipboard binary framing matches ControlMessageReader.java: type(1B) -> seq(8B) -> len(4B) -> text(%dB) -> paste(1B)", len(testText))
+}
+
+func TestControlProtocol_ScrollFraming(t *testing.T) {
+	serverConn, clientConn := net.Pipe()
+	defer serverConn.Close()
+	defer clientConn.Close()
+
+	cw := NewControlWriter(serverConn)
+
+	go func() {
+		_ = cw.SendScroll(500, 800, 1080, 2400, 1.5, -2.0)
+	}()
+
+	// Protocol layout: [type: 1B][x: 4B][y: 4B][w: 2B][h: 2B][hScroll: 2B (int16 fixed)][vScroll: 2B (int16 fixed)][buttons: 4B]
+	expectedLen := 21
+	buf := make([]byte, expectedLen)
+	n, err := clientConn.Read(buf)
+	if err != nil || n != expectedLen {
+		t.Fatalf("Failed to read SendScroll packet: n=%d, expected=%d, err=%v", n, expectedLen, err)
+	}
+
+	if buf[0] != ControlMsgInjectScrollEvent {
+		t.Fatalf("Expected msg type %d, got %d", ControlMsgInjectScrollEvent, buf[0])
+	}
+	x := binary.BigEndian.Uint32(buf[1:5])
+	y := binary.BigEndian.Uint32(buf[5:9])
+	w := binary.BigEndian.Uint16(buf[9:11])
+	h := binary.BigEndian.Uint16(buf[11:13])
+	if x != 500 || y != 800 || w != 1080 || h != 2400 {
+		t.Fatalf("Unexpected Position: x=%d, y=%d, w=%d, h=%d", x, y, w, h)
+	}
+
+	hScroll := int16(binary.BigEndian.Uint16(buf[13:15]))
+	vScroll := int16(binary.BigEndian.Uint16(buf[15:17]))
+	buttons := binary.BigEndian.Uint32(buf[17:21])
+
+	// Scale factor is 2048: 1.5 * 2048 = 3072, -2.0 * 2048 = -4096
+	if hScroll != 3072 {
+		t.Fatalf("Expected hScroll 3072, got %d", hScroll)
+	}
+	if vScroll != -4096 {
+		t.Fatalf("Expected vScroll -4096, got %d", vScroll)
+	}
+	if buttons != 0 {
+		t.Fatalf("Expected buttons 0, got %d", buttons)
+	}
+
+	t.Log("[PASS] Scroll binary framing matches ControlMessageReader.java: 21 bytes with position, int16 fixed-point (x2048), and uint32 buttons")
+}
+
+func TestScrcpyOptions_BitrateAliasAndNeedsRestart(t *testing.T) {
+	jsonPayload := `{
+		"bitrate": 5000000,
+		"audio_source": "mic",
+		"audio_dup": true,
+		"stay_awake": true,
+		"video_codec_options": "profile=1",
+		"max_fps": 60
+	}`
+	var opts ScrcpyOptions
+	if err := json.Unmarshal([]byte(jsonPayload), &opts); err != nil {
+		t.Fatalf("Failed to unmarshal ScrcpyOptions: %v", err)
+	}
+
+	// Assert bitrate alias sets both Bitrate and VideoBitRate
+	if opts.Bitrate != 5000000 || opts.VideoBitRate != 5000000 {
+		t.Fatalf("Expected Bitrate & VideoBitRate 5000000, got Bitrate=%d, VideoBitRate=%d", opts.Bitrate, opts.VideoBitRate)
+	}
+
+	cfg := &AgentConfig{
+		DeviceID: "test_dev_restart",
+		Bitrate:  8000000,
+		MaxFPS:   30,
+	}
+	proc := NewScrcpyProcess(cfg)
+
+	// NeedsRestart checks
+	if !proc.NeedsRestart(ScrcpyOptions{Bitrate: 4000000}) {
+		t.Fatal("Expected NeedsRestart=true on Bitrate change")
+	}
+	if !proc.NeedsRestart(ScrcpyOptions{MaxFPS: 120}) {
+		t.Fatal("Expected NeedsRestart=true on MaxFPS change")
+	}
+	if !proc.NeedsRestart(ScrcpyOptions{AudioSource: "mic"}) {
+		t.Fatal("Expected NeedsRestart=true on AudioSource change")
+	}
+	if !proc.NeedsRestart(ScrcpyOptions{AudioDup: true}) {
+		t.Fatal("Expected NeedsRestart=true on AudioDup change")
+	}
+	if !proc.NeedsRestart(ScrcpyOptions{StayAwake: true}) {
+		t.Fatal("Expected NeedsRestart=true on StayAwake change")
+	}
+	if !proc.NeedsRestart(ScrcpyOptions{VideoCodecOptions: "level=4.1"}) {
+		t.Fatal("Expected NeedsRestart=true on VideoCodecOptions change")
+	}
+
+	t.Log("[PASS] ScrcpyOptions bitrate alias and comprehensive NeedsRestart triggers verified")
+}
+
+func TestStreamerBridge_ResetSourceGeneration(t *testing.T) {
+	streamer := NewStreamerBridge(nil, 30)
+
+	// Set cached config and advance timeline
+	streamer.cachedCodecConfig = []byte{0x00, 0x00, 0x00, 0x01, 0x67, 0x42}
+	_ = streamer.computeVideoRtpTimestamp(500000)
+
+	if !streamer.HasCodecConfig() {
+		t.Fatal("Expected HasCodecConfig=true before reset")
+	}
+
+	// Perform source generation reset
+	streamer.ResetSourceGeneration()
+
+	if streamer.HasCodecConfig() {
+		t.Fatal("Expected HasCodecConfig=false after ResetSourceGeneration")
+	}
+	if streamer.cachedCodecConfig != nil {
+		t.Fatal("Expected cachedCodecConfig=nil after ResetSourceGeneration")
+	}
+	if streamer.timeline.IsInitialized() {
+		t.Fatal("Expected IsInitialized()=false after ResetSourceGeneration")
+	}
+
+	t.Log("[PASS] StreamerBridge.ResetSourceGeneration atomically flushed SPS/PPS and reset timeline epoch")
+}

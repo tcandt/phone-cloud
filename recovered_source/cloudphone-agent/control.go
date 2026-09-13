@@ -9,8 +9,9 @@ import (
 
 // ControlWriter serializes input events into the binary protocol expected by scrcpy-server
 type ControlWriter struct {
-	conn net.Conn
-	mu   sync.Mutex
+	conn         net.Conn
+	mu           sync.Mutex
+	clipboardSeq uint64
 }
 
 func NewControlWriter(conn net.Conn) *ControlWriter {
@@ -82,21 +83,40 @@ func (cw *ControlWriter) SendText(text string) error {
 	return err
 }
 
-// SendScroll injects horizontal/vertical scroll wheel events
+// SendScroll injects horizontal/vertical scroll wheel events matching ControlMessageReader.java:
+// [type:1B][position:12B][hScroll:2B (int16)][vScroll:2B (int16)][buttons:4B (uint32)]
+// Position: [x:4B][y:4B][w:2B][h:2B]
+// Fixed-point: Helper decodes float val = (short / 32768.0) * 16.0 = short / 2048.0
+// Therefore short = clamp(val * 2048.0, -32768, 32767)
 func (cw *ControlWriter) SendScroll(x, y, w, h int, hScroll, vScroll float32) error {
+	return cw.SendScrollWithButtons(x, y, w, h, hScroll, vScroll, 0)
+}
+
+func (cw *ControlWriter) SendScrollWithButtons(x, y, w, h int, hScroll, vScroll float32, buttons uint32) error {
 	cw.mu.Lock()
 	defer cw.mu.Unlock()
 
 	buf := make([]byte, 21)
-	buf[0] = ControlMsgInjectScrollEvent
+	buf[0] = ControlMsgInjectScrollEvent // 3
 	binary.BigEndian.PutUint32(buf[1:5], uint32(x))
 	binary.BigEndian.PutUint32(buf[5:9], uint32(y))
 	binary.BigEndian.PutUint16(buf[9:11], uint16(w))
 	binary.BigEndian.PutUint16(buf[11:13], uint16(h))
 
-	// Fixed-point 16.16 conversion
-	binary.BigEndian.PutUint32(buf[13:17], uint32(int32(hScroll*65536.0)))
-	binary.BigEndian.PutUint32(buf[17:21], uint32(int32(vScroll*65536.0)))
+	clampShort := func(val float32) int16 {
+		scaled := val * 2048.0
+		if scaled > 32767.0 {
+			return 32767
+		}
+		if scaled < -32768.0 {
+			return -32768
+		}
+		return int16(scaled)
+	}
+
+	binary.BigEndian.PutUint16(buf[13:15], uint16(clampShort(hScroll)))
+	binary.BigEndian.PutUint16(buf[15:17], uint16(clampShort(vScroll)))
+	binary.BigEndian.PutUint32(buf[17:21], buttons)
 
 	if cw.conn == nil {
 		return nil
@@ -133,22 +153,24 @@ func (cw *ControlWriter) RequestKeyframe() error {
 	return err
 }
 
-// SetClipboard sends text to the Android clipboard
+// SetClipboard sends text to the Android clipboard matching ControlMessageReader.java:
+// [type:1B][sequence:8B][text_length:4B][text:N B][paste:1B]
 func (cw *ControlWriter) SetClipboard(text string, paste bool) error {
 	cw.mu.Lock()
 	defer cw.mu.Unlock()
 
 	textBytes := []byte(text)
 	buf := make([]byte, 14+len(textBytes))
-	buf[0] = ControlMsgSetClipboard
-	binary.BigEndian.PutUint64(buf[1:9], 0) // sequence
+	buf[0] = ControlMsgSetClipboard // 9
+	cw.clipboardSeq++
+	binary.BigEndian.PutUint64(buf[1:9], cw.clipboardSeq)
+	binary.BigEndian.PutUint32(buf[9:13], uint32(len(textBytes)))
+	copy(buf[13:13+len(textBytes)], textBytes)
 	if paste {
-		buf[9] = 1
+		buf[13+len(textBytes)] = 1
 	} else {
-		buf[9] = 0
+		buf[13+len(textBytes)] = 0
 	}
-	binary.BigEndian.PutUint32(buf[10:14], uint32(len(textBytes)))
-	copy(buf[14:], textBytes)
 
 	if cw.conn == nil {
 		return nil

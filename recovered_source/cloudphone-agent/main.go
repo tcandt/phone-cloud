@@ -1,12 +1,14 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"flag"
 	"fmt"
 	"log"
 	"os"
 	"os/exec"
+	"regexp"
 	"strconv"
 	"strings"
 	"sync"
@@ -44,6 +46,102 @@ func getAndroidProp(prop string) string {
 		return strings.TrimSpace(string(out))
 	}
 	return "unknown"
+}
+
+// queryCameraInventory discovers hardware camera lenses and capabilities on Android
+func queryCameraInventory() []CameraInfo {
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	// 1. Try dumpsys media.camera
+	out, err := exec.CommandContext(ctx, "dumpsys", "media.camera").Output()
+	if err == nil && len(out) > 0 {
+		cams := parseDumpsysCameras(string(out))
+		if len(cams) > 0 {
+			return cams
+		}
+	}
+
+	// 2. Try scrcpy-server list_cameras
+	outHelper, errHelper := exec.CommandContext(ctx, "app_process", "/", "com.android.helper.CoreService", "list_cameras=true").CombinedOutput()
+	if errHelper == nil && len(outHelper) > 0 {
+		cams := parseHelperCameras(string(outHelper))
+		if len(cams) > 0 {
+			return cams
+		}
+	}
+
+	// 3. Fallback standard physical lenses on Android devices
+	return []CameraInfo{
+		{
+			ID:        "0",
+			Facing:    "back",
+			Sizes:     []string{"1920x1080", "1280x720", "640x480"},
+			FPSRanges: []int{15, 30, 60},
+		},
+		{
+			ID:        "1",
+			Facing:    "front",
+			Sizes:     []string{"1920x1080", "1280x720", "640x480"},
+			FPSRanges: []int{15, 30},
+		},
+	}
+}
+
+func parseHelperCameras(output string) []CameraInfo {
+	var cameras []CameraInfo
+	re := regexp.MustCompile(`--camera-id=([^\s]+)\s+\((back|front|external)[^)]*\)`)
+	matches := re.FindAllStringSubmatch(output, -1)
+	for _, m := range matches {
+		if len(m) >= 3 {
+			cameras = append(cameras, CameraInfo{
+				ID:        m[1],
+				Facing:    strings.ToLower(m[2]),
+				Sizes:     []string{"1920x1080", "1280x720", "640x480"},
+				FPSRanges: []int{15, 30},
+			})
+		}
+	}
+	return cameras
+}
+
+func parseDumpsysCameras(output string) []CameraInfo {
+	var cameras []CameraInfo
+	lines := strings.Split(output, "\n")
+	var currentID string
+	var currentFacing string
+	for _, line := range lines {
+		line = strings.TrimSpace(line)
+		if strings.HasPrefix(line, "Camera ID:") || strings.HasPrefix(line, "Device ") {
+			parts := strings.Fields(line)
+			for i, p := range parts {
+				if (p == "ID:" || p == "Device") && i+1 < len(parts) {
+					currentID = strings.Trim(parts[i+1], ":,")
+				}
+			}
+		}
+		if strings.Contains(strings.ToLower(line), "facing") {
+			lower := strings.ToLower(line)
+			if strings.Contains(lower, "back") {
+				currentFacing = "back"
+			} else if strings.Contains(lower, "front") {
+				currentFacing = "front"
+			} else if strings.Contains(lower, "external") {
+				currentFacing = "external"
+			}
+		}
+		if currentID != "" && currentFacing != "" {
+			cameras = append(cameras, CameraInfo{
+				ID:        currentID,
+				Facing:    currentFacing,
+				Sizes:     []string{"1920x1080", "1280x720", "640x480"},
+				FPSRanges: []int{15, 30},
+			})
+			currentID = ""
+			currentFacing = ""
+		}
+	}
+	return cameras
 }
 
 func main() {
@@ -89,12 +187,8 @@ func main() {
 	log.Printf("   Signaling: %s", cfg.SignalingURL)
 	log.Printf("====================================================")
 
-	// 1. Launch scrcpy-server helper process
+	// 1. Initialize streamer bridge and launch scrcpy-server helper process
 	scrcpy := NewScrcpyProcess(cfg)
-	if err := scrcpy.Start(); err != nil {
-		log.Printf("[Agent] Warning starting scrcpy: %v", err)
-	}
-	defer scrcpy.Close()
 
 	var sessionsMu sync.RWMutex
 	sessions := make(map[string]*WebRTCSession)
@@ -104,12 +198,11 @@ func main() {
 	ctrl := scrcpy.GetControlWriter()
 	streamer := NewStreamerBridge(ctrl, cfg.MaxFPS)
 	streamer.SetPreviewStreamer(previewStreamer)
-	if scrcpy.videoConn != nil {
-		go streamer.StreamVideo(scrcpy.videoConn)
-		if scrcpy.audioConn != nil {
-			go streamer.StreamAudio(scrcpy.audioConn, previewStreamer)
-		}
+
+	if err := scrcpy.Start(streamer); err != nil {
+		log.Printf("[Agent] Warning starting scrcpy: %v", err)
 	}
+	defer scrcpy.Close()
 
 	signalingDialer := NewSignalingDialer(getEnvBool("CP_AGENT_INSECURE_TLS", false))
 	backoff := NewBackoffTracker()
@@ -145,11 +238,14 @@ func main() {
 			"sdk":          getAndroidProp("ro.build.version.sdk"),
 			"serial":       getAndroidProp("ro.serialno"),
 			"manufacturer": getAndroidProp("ro.product.manufacturer"),
+			"cameras":      queryCameraInventory(),
 		}
 		_ = ws.WriteJSON(map[string]interface{}{
-			"action":    "register",
-			"device_id": cfg.DeviceID,
-			"hw_info":   hwInfo,
+			"action":      "register",
+			"device_id":   cfg.DeviceID,
+			"hw_info":     hwInfo,
+			"device_info": hwInfo,
+			"info":        hwInfo,
 		})
 
 		// Message handling loop
@@ -186,65 +282,7 @@ func main() {
 				case "request-offer":
 					log.Printf("[Agent] Received request-offer from client: %s", clientID)
 
-					// Parse scrcpy_options if provided by client (Surveillance Camera Mode / Custom Streaming Settings)
-					if scrcpyOptsRaw, hasOpts := payload["scrcpy_options"]; hasOpts && scrcpyOptsRaw != nil {
-						if optsJSON, err := json.Marshal(scrcpyOptsRaw); err == nil {
-							var clientOpts ScrcpyOptions
-							if err := json.Unmarshal(optsJSON, &clientOpts); err == nil {
-								if scrcpy.NeedsRestart(clientOpts) {
-									log.Printf("[Agent] Client %s requested stream reconfiguration (VideoSource=%s, Facing=%s, Size=%s)",
-										clientID, clientOpts.VideoSource, clientOpts.CameraFacing, clientOpts.CameraSize)
-									if err := scrcpy.Restart(clientOpts, streamer); err != nil {
-										log.Printf("[Agent] Failed to reconfigure scrcpy: %v", err)
-									} else {
-										ctrl = scrcpy.GetControlWriter()
-									}
-								}
-								// If client requested screen-off (power_off = true), turn off remote phone screen
-								if clientOpts.PowerOff {
-									if cw := scrcpy.GetControlWriter(); cw != nil {
-										_ = cw.SetDisplayPower(false)
-										log.Printf("[Agent] Screen power off applied for remote surveillance mode")
-									}
-								}
-							}
-						}
-					}
-
-					sessionsMu.Lock()
-					if oldSess, exists := sessions[clientID]; exists {
-						oldSess.Close()
-						streamer.UnregisterSession(clientID)
-						delete(sessions, clientID)
-					}
-
-					ctrl = scrcpy.GetControlWriter()
-					session, err := NewWebRTCSession(ctrl, cfg.IceServers)
-					if err != nil {
-						sessionsMu.Unlock()
-						log.Printf("[Agent] Failed to create WebRTC session: %v", err)
-						continue
-					}
-					session.ClientID = clientID
-
-					// Forward locally gathered ICE candidates via trickle to client
-					session.SetOnLocalCandidate(func(c *webrtc.ICECandidate) {
-						if c == nil {
-							return
-						}
-						candJSON := c.ToJSON()
-						_ = ws.WriteJSON(map[string]interface{}{
-							"type":      "ice-candidate",
-							"client_id": clientID,
-							"candidate": map[string]interface{}{
-								"candidate":     candJSON.Candidate,
-								"sdpMid":        candJSON.SDPMid,
-								"sdpMLineIndex": candJSON.SDPMLineIndex,
-							},
-						})
-					})
-
-					// Apply session capabilities forwarded by signaling or cached by clientID
+					// 1. Resolve session capabilities forwarded by signaling or cached by clientID first
 					var caps SessionCapabilities
 					var hasCaps bool
 					if capsMap, ok := msg["capabilities"].(map[string]interface{}); ok && capsMap != nil {
@@ -297,6 +335,76 @@ func main() {
 							CanInstallAPK: false,
 						}
 					}
+					clientCapsMu.Lock()
+					clientCapsCache[clientID] = caps
+					clientCapsMu.Unlock()
+
+					// 2. Parse scrcpy_options if provided by client (Surveillance Camera Mode / Custom Streaming Settings)
+					if scrcpyOptsRaw, hasOpts := payload["scrcpy_options"]; hasOpts && scrcpyOptsRaw != nil {
+						if optsJSON, err := json.Marshal(scrcpyOptsRaw); err == nil {
+							var clientOpts ScrcpyOptions
+							if err := json.Unmarshal(optsJSON, &clientOpts); err == nil {
+								// Security Permission Gate: camera streaming requires verified CanCamera capability
+								if clientOpts.VideoSource == "camera" && !caps.CanCamera {
+									log.Printf("[Agent] Security alert: Client %s attempted camera stream reconfiguration without CanCamera capability; reverting to display", clientID)
+									clientOpts.VideoSource = "display"
+								}
+
+								if scrcpy.NeedsRestart(clientOpts) {
+									log.Printf("[Agent] Client %s requested stream reconfiguration (VideoSource=%s, Facing=%s, Size=%s)",
+										clientID, clientOpts.VideoSource, clientOpts.CameraFacing, clientOpts.CameraSize)
+									if err := scrcpy.Restart(clientOpts, streamer); err != nil {
+										log.Printf("[Agent] Failed to reconfigure scrcpy: %v", err)
+									} else {
+										ctrl = scrcpy.GetControlWriter()
+									}
+								}
+								// Security Permission Gate: screen power_off requires CanControl capability
+								if clientOpts.PowerOff {
+									if !caps.CanControl {
+										log.Printf("[Agent] Security alert: Client %s attempted screen power_off without CanControl capability; denied", clientID)
+									} else if cw := scrcpy.GetControlWriter(); cw != nil {
+										_ = cw.SetDisplayPower(false)
+										log.Printf("[Agent] Screen power off applied for remote surveillance mode")
+									}
+								}
+							}
+						}
+					}
+
+					sessionsMu.Lock()
+					if oldSess, exists := sessions[clientID]; exists {
+						oldSess.Close()
+						streamer.UnregisterSession(clientID)
+						delete(sessions, clientID)
+					}
+
+					ctrl = scrcpy.GetControlWriter()
+					session, err := NewWebRTCSession(ctrl, cfg.IceServers)
+					if err != nil {
+						sessionsMu.Unlock()
+						log.Printf("[Agent] Failed to create WebRTC session: %v", err)
+						continue
+					}
+					session.ClientID = clientID
+
+					// Forward locally gathered ICE candidates via trickle to client
+					session.SetOnLocalCandidate(func(c *webrtc.ICECandidate) {
+						if c == nil {
+							return
+						}
+						candJSON := c.ToJSON()
+						_ = ws.WriteJSON(map[string]interface{}{
+							"type":      "ice-candidate",
+							"client_id": clientID,
+							"candidate": map[string]interface{}{
+								"candidate":     candJSON.Candidate,
+								"sdpMid":        candJSON.SDPMid,
+								"sdpMLineIndex": candJSON.SDPMLineIndex,
+							},
+						})
+					})
+
 					session.SetCapabilities(caps)
 
 					sessions[clientID] = session

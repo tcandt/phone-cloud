@@ -14,7 +14,9 @@ import android.media.AudioFormat
 import android.media.AudioTrack
 import android.media.ImageReader
 import android.media.MediaCodec
+import android.media.MediaCodecInfo
 import android.media.MediaFormat
+import android.media.MediaMuxer
 import android.os.Build
 import android.os.Bundle
 import android.os.Environment
@@ -41,6 +43,7 @@ import com.cloudphone.app.webrtc.WebRTCConnectionState
 import com.cloudphone.app.webrtc.WebRTCManager
 import com.google.gson.Gson
 import com.google.gson.JsonObject
+import com.google.gson.JsonParser
 import okhttp3.*
 import okio.ByteString
 import org.webrtc.EglBase
@@ -129,12 +132,22 @@ class ControllerActivity : AppCompatActivity(), TextureView.SurfaceTextureListen
     private var lastTouchY: Float = 0f
     private var isPanning: Boolean = false
 
-    // Remote Surveillance Stream Recording & Snapshot
+    // Remote Surveillance Stream MP4 Recording & Snapshot
     private var isRemoteRecording = false
+    private var remoteMp4Recorder: RemoteStreamMp4Recorder? = null
+    private var remoteRecordingOutputFile: File? = null
     private var remoteRecordingHandler: Handler? = null
     private var remoteRecordingRunnable: Runnable? = null
-    private var remoteRecordingSessionDir: File? = null
     private var remoteRecordingFrameCount = 0L
+
+    // Dynamic Remote Device Camera Inventory
+    data class RemoteCameraItem(
+        val id: String,
+        val facing: String,
+        val title: String,
+        val zoomRatio: Float = 1.0f
+    )
+    private val remoteCameraInventory = mutableListOf<RemoteCameraItem>()
 
     private var targetDeviceId: String = ""
     private var serverUrl: String = ""
@@ -171,6 +184,7 @@ class ControllerActivity : AppCompatActivity(), TextureView.SurfaceTextureListen
         }
 
         val turnUrl = "$httpUrl/api/turn"
+        fetchRemoteDeviceInfo(httpUrl)
         val request = Request.Builder()
             .url(turnUrl)
             .apply {
@@ -197,6 +211,62 @@ class ControllerActivity : AppCompatActivity(), TextureView.SurfaceTextureListen
                 }
             }
         })
+    }
+
+    private fun fetchRemoteDeviceInfo(httpUrl: String) {
+        val devUrl = "$httpUrl/devices"
+        val req = Request.Builder().url(devUrl).apply {
+            if (token.isNotEmpty()) addHeader("Authorization", "Bearer $token")
+        }.build()
+        client.newCall(req).enqueue(object : Callback {
+            override fun onFailure(call: Call, e: java.io.IOException) {
+                Log.w(TAG, "Failed to fetch /devices for camera inventory: ${e.message}")
+            }
+            override fun onResponse(call: Call, response: Response) {
+                response.use {
+                    if (response.isSuccessful) {
+                        val body = response.body?.string() ?: ""
+                        parseRemoteDeviceCameras(body)
+                    }
+                }
+            }
+        })
+    }
+
+    private fun parseRemoteDeviceCameras(jsonStr: String) {
+        try {
+            val jsonArray = JsonParser.parseString(jsonStr).asJsonArray
+            for (elem in jsonArray) {
+                if (!elem.isJsonObject) continue
+                val obj = elem.asJsonObject
+                val dId = obj.get("device_id")?.asString ?: obj.get("id")?.asString ?: ""
+                if (dId == targetDeviceId) {
+                    val infoObj = obj.getAsJsonObject("device_info") ?: obj.getAsJsonObject("info")
+                    val camsArray = infoObj?.getAsJsonArray("cameras")
+                    if (camsArray != null && camsArray.size() > 0) {
+                        synchronized(remoteCameraInventory) {
+                            remoteCameraInventory.clear()
+                            for (cElem in camsArray) {
+                                if (!cElem.isJsonObject) continue
+                                val cObj = cElem.asJsonObject
+                                val id = cObj.get("id")?.asString ?: "0"
+                                val facing = cObj.get("facing")?.asString?.lowercase() ?: "back"
+                                val title = when (facing) {
+                                    "front" -> "Front Selfie Lens (ID: $id)"
+                                    "external" -> "External Camera Lens (ID: $id)"
+                                    else -> "Back Camera Lens (ID: $id)"
+                                }
+                                remoteCameraInventory.add(RemoteCameraItem(id, facing, title))
+                            }
+                        }
+                        Log.i(TAG, "Loaded ${remoteCameraInventory.size} remote hardware cameras from device metadata")
+                    }
+                    break
+                }
+            }
+        } catch (e: Throwable) {
+            Log.w(TAG, "Error parsing remote camera inventory: ${e.message}")
+        }
     }
 
     private fun fetchIceServersFallback(httpUrl: String) {
@@ -1122,13 +1192,21 @@ class ControllerActivity : AppCompatActivity(), TextureView.SurfaceTextureListen
     }
 
     private fun showRemoteLensSelectionDialog() {
-        val lenses = arrayOf(
-            "Back Main Lens (1.0x)" to ("back" to "0"),
-            "Back Ultra-Wide Lens (0.5x)" to ("back" to "0"),
-            "Back Telephoto Lens (2.0x)" to ("back" to "0"),
-            "Front Selfie Camera (1.0x)" to ("front" to "1"),
-            "External Camera Lens" to ("external" to "")
-        )
+        val lenses: List<Pair<String, Pair<String, String>>> = synchronized(remoteCameraInventory) {
+            if (remoteCameraInventory.isNotEmpty()) {
+                remoteCameraInventory.map { item ->
+                    item.title to (item.facing to item.id)
+                }
+            } else {
+                listOf(
+                    "Back Main Lens (1.0x)" to ("back" to "0"),
+                    "Back Ultra-Wide Lens (0.5x)" to ("back" to "0"),
+                    "Back Telephoto Lens (2.0x)" to ("back" to "0"),
+                    "Front Selfie Camera (1.0x)" to ("front" to "1"),
+                    "External Camera Lens" to ("external" to "")
+                )
+            }
+        }
         val titles = lenses.map { it.first }.toTypedArray()
         AlertDialog.Builder(this)
             .setTitle("Select Remote Camera Lens")
@@ -1136,15 +1214,15 @@ class ControllerActivity : AppCompatActivity(), TextureView.SurfaceTextureListen
                 val chosen = lenses[which]
                 remoteCameraFacing = chosen.second.first
                 remoteCameraId = chosen.second.second
-                when (which) {
-                    0 -> remoteCameraZoomRatio = 1.0f
-                    1 -> remoteCameraZoomRatio = 0.5f
-                    2 -> remoteCameraZoomRatio = 2.0f
-                    3 -> {
-                        remoteCameraZoomRatio = 1.0f
-                        viewportMirror = true // Front selfie defaults to mirror flip
-                    }
-                    4 -> remoteCameraZoomRatio = 1.0f
+                if (chosen.first.contains("0.5x")) {
+                    remoteCameraZoomRatio = 0.5f
+                } else if (chosen.first.contains("2.0x")) {
+                    remoteCameraZoomRatio = 2.0f
+                } else if (remoteCameraFacing == "front") {
+                    remoteCameraZoomRatio = 1.0f
+                    viewportMirror = true // Front selfie defaults to mirror flip
+                } else {
+                    remoteCameraZoomRatio = 1.0f
                 }
                 applyViewportTransform()
                 Toast.makeText(this, "Selected ${chosen.first}", Toast.LENGTH_SHORT).show()
@@ -1265,48 +1343,165 @@ class ControllerActivity : AppCompatActivity(), TextureView.SurfaceTextureListen
         }
     }
 
+    class RemoteStreamMp4Recorder(
+        private val outputFile: File,
+        private val width: Int,
+        private val height: Int,
+        private val fps: Int = 30,
+        private val bitrate: Int = 4_000_000
+    ) {
+        private var mediaCodec: MediaCodec? = null
+        private var mediaMuxer: MediaMuxer? = null
+        private var inputSurface: Surface? = null
+        private var trackIndex = -1
+        private var isMuxerStarted = false
+        private val bufferInfo = MediaCodec.BufferInfo()
+        private var isRunning = false
+        private var drainThread: Thread? = null
+
+        fun start() {
+            val w = if (width % 2 != 0) width - 1 else width
+            val h = if (height % 2 != 0) height - 1 else height
+            val format = MediaFormat.createVideoFormat(MediaFormat.MIMETYPE_VIDEO_AVC, w, h).apply {
+                setInteger(MediaFormat.KEY_COLOR_FORMAT, MediaCodecInfo.CodecCapabilities.COLOR_FormatSurface)
+                setInteger(MediaFormat.KEY_BIT_RATE, bitrate)
+                setInteger(MediaFormat.KEY_FRAME_RATE, fps)
+                setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, 1)
+            }
+            mediaCodec = MediaCodec.createEncoderByType(MediaFormat.MIMETYPE_VIDEO_AVC).apply {
+                configure(format, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
+                inputSurface = createInputSurface()
+                start()
+            }
+            mediaMuxer = MediaMuxer(outputFile.absolutePath, MediaMuxer.OutputFormat.MUXER_OUTPUT_MPEG_4)
+            isRunning = true
+            drainThread = Thread({ drainEncoder() }, "RemoteStreamMp4RecorderDrain")
+            drainThread?.start()
+        }
+
+        fun getInputSurface(): Surface? = inputSurface
+
+        private fun drainEncoder() {
+            while (isRunning) {
+                val codec = mediaCodec ?: break
+                val muxer = mediaMuxer ?: break
+                val outIndex = try {
+                    codec.dequeueOutputBuffer(bufferInfo, 10_000)
+                } catch (_: Throwable) {
+                    -1
+                }
+                if (outIndex == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED) {
+                    if (!isMuxerStarted) {
+                        trackIndex = muxer.addTrack(codec.outputFormat)
+                        muxer.start()
+                        isMuxerStarted = true
+                    }
+                } else if (outIndex >= 0) {
+                    val encodedData = codec.getOutputBuffer(outIndex)
+                    if (encodedData != null && bufferInfo.size > 0 && isMuxerStarted) {
+                        encodedData.position(bufferInfo.offset)
+                        encodedData.limit(bufferInfo.offset + bufferInfo.size)
+                        muxer.writeSampleData(trackIndex, encodedData, bufferInfo)
+                    }
+                    codec.releaseOutputBuffer(outIndex, false)
+                    if ((bufferInfo.flags and MediaCodec.BUFFER_FLAG_END_OF_STREAM) != 0) {
+                        break
+                    }
+                }
+            }
+        }
+
+        fun stop() {
+            isRunning = false
+            try {
+                mediaCodec?.signalEndOfInputStream()
+                drainThread?.join(1000)
+            } catch (_: Throwable) {}
+            try {
+                mediaCodec?.stop()
+                mediaCodec?.release()
+            } catch (_: Throwable) {}
+            mediaCodec = null
+            try {
+                if (isMuxerStarted) {
+                    mediaMuxer?.stop()
+                }
+                mediaMuxer?.release()
+            } catch (_: Throwable) {}
+            mediaMuxer = null
+            inputSurface?.release()
+            inputSurface = null
+        }
+    }
+
     private fun toggleRemoteRecording() {
         if (isRemoteRecording) {
             isRemoteRecording = false
             remoteRecordingRunnable?.let { remoteRecordingHandler?.removeCallbacks(it) }
             remoteRecordingRunnable = null
-            Toast.makeText(this, "Remote recording stopped. Saved $remoteRecordingFrameCount frames to ${remoteRecordingSessionDir?.name}", Toast.LENGTH_LONG).show()
+            remoteMp4Recorder?.stop()
+            remoteMp4Recorder = null
+            val file = remoteRecordingOutputFile
+            val msg = if (file != null && file.exists()) {
+                "Remote MP4 video saved: ${file.name} (${file.length()} bytes)"
+            } else {
+                "Remote recording stopped. Saved $remoteRecordingFrameCount frames"
+            }
+            Toast.makeText(this, msg, Toast.LENGTH_LONG).show()
         } else {
-            val timestamp = System.currentTimeMillis()
-            val dir = File(getExternalFilesDir(Environment.DIRECTORY_MOVIES) ?: filesDir, "surveillance_rec_$timestamp")
-            dir.mkdirs()
-            remoteRecordingSessionDir = dir
-            remoteRecordingFrameCount = 0L
-            isRemoteRecording = true
-
             val view = binding.webrtcVideoView
-            if (remoteRecordingHandler == null) {
-                val thread = HandlerThread("RemoteRecordingThread")
-                thread.start()
-                remoteRecordingHandler = Handler(thread.looper)
+            if (view.width <= 0 || view.height <= 0) {
+                Toast.makeText(this, "Remote video view is not active", Toast.LENGTH_SHORT).show()
+                return
             }
+            val timestamp = System.currentTimeMillis()
+            val moviesDir = getExternalFilesDir(Environment.DIRECTORY_MOVIES) ?: filesDir
+            val mp4File = File(moviesDir, "surveillance_rec_$timestamp.mp4")
+            remoteRecordingOutputFile = mp4File
+            remoteRecordingFrameCount = 0L
 
-            remoteRecordingRunnable = object : Runnable {
-                override fun run() {
-                    if (!isRemoteRecording) return
-                    if (view.width > 0 && view.height > 0 && Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
-                        val bmp = android.graphics.Bitmap.createBitmap(view.width, view.height, android.graphics.Bitmap.Config.ARGB_8888)
-                        android.view.PixelCopy.request(view, bmp, { res ->
-                            if (res == android.view.PixelCopy.SUCCESS) {
-                                val frameFile = File(dir, String.format("frame_%06d.jpg", remoteRecordingFrameCount++))
-                                try {
-                                    FileOutputStream(frameFile).use { out ->
-                                        bmp.compress(android.graphics.Bitmap.CompressFormat.JPEG, 80, out)
-                                    }
-                                } catch (_: Throwable) {}
-                            }
-                        }, Handler(Looper.getMainLooper()))
-                    }
-                    remoteRecordingHandler?.postDelayed(this, 200) // 5 fps periodic snapshot recording
+            try {
+                val recorder = RemoteStreamMp4Recorder(mp4File, view.width, view.height, 30, 4_000_000)
+                recorder.start()
+                remoteMp4Recorder = recorder
+                isRemoteRecording = true
+
+                if (remoteRecordingHandler == null) {
+                    val thread = HandlerThread("RemoteRecordingThread")
+                    thread.start()
+                    remoteRecordingHandler = Handler(thread.looper)
                 }
+
+                val encSurface = recorder.getInputSurface()
+                remoteRecordingRunnable = object : Runnable {
+                    override fun run() {
+                        if (!isRemoteRecording) return
+                        if (encSurface != null && encSurface.isValid && Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
+                            val bmp = android.graphics.Bitmap.createBitmap(view.width, view.height, android.graphics.Bitmap.Config.ARGB_8888)
+                            android.view.PixelCopy.request(view, bmp, { res ->
+                                if (res == android.view.PixelCopy.SUCCESS) {
+                                    try {
+                                        val canvas = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+                                            encSurface.lockHardwareCanvas()
+                                        } else {
+                                            encSurface.lockCanvas(null)
+                                        }
+                                        canvas.drawBitmap(bmp, 0f, 0f, null)
+                                        encSurface.unlockCanvasAndPost(canvas)
+                                        remoteRecordingFrameCount++
+                                    } catch (_: Throwable) {}
+                                }
+                            }, Handler(Looper.getMainLooper()))
+                        }
+                        remoteRecordingHandler?.postDelayed(this, 33) // ~30 fps hardware video recording
+                    }
+                }
+                remoteRecordingHandler?.post(remoteRecordingRunnable!!)
+                Toast.makeText(this, "Remote MP4 recording started (${mp4File.name})", Toast.LENGTH_SHORT).show()
+            } catch (e: Throwable) {
+                Log.e(TAG, "Failed to start MP4 recorder: ${e.message}", e)
+                Toast.makeText(this, "Recording failed: ${e.message}", Toast.LENGTH_LONG).show()
             }
-            remoteRecordingHandler?.post(remoteRecordingRunnable!!)
-            Toast.makeText(this, "Remote stream recording started (saving to ${dir.name})", Toast.LENGTH_SHORT).show()
         }
     }
 

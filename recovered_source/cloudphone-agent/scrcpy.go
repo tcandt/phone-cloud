@@ -41,18 +41,23 @@ func NewScrcpyProcess(cfg *AgentConfig) *ScrcpyProcess {
 }
 
 func (sp *ScrcpyProcess) buildArgs(opts ScrcpyOptions, videoSock, audioSock, ctrlSock string) []string {
-	maxSize := sp.config.MaxSize
-	if opts.MaxSize > 0 {
-		maxSize = opts.MaxSize
-	}
 	bitrate := sp.config.Bitrate
 	if opts.VideoBitRate > 0 {
 		bitrate = opts.VideoBitRate
+	} else if opts.Bitrate > 0 {
+		bitrate = opts.Bitrate
 	}
+
 	maxFPS := sp.config.MaxFPS
 	if opts.MaxFPS > 0 {
 		maxFPS = opts.MaxFPS
 	}
+
+	maxSize := sp.config.MaxSize
+	if opts.MaxSize > 0 {
+		maxSize = opts.MaxSize
+	}
+
 	audio := sp.config.Audio
 	if opts.Audio != nil {
 		audio = *opts.Audio
@@ -106,13 +111,30 @@ func (sp *ScrcpyProcess) buildArgs(opts ScrcpyOptions, videoSock, audioSock, ctr
 		args = append(args, "video_source=display")
 	}
 
+	// Audio source selection (mic for surveillance camera or explicit audio_source)
+	audioSource := opts.AudioSource
+	if audioSource == "" && opts.VideoSource == "camera" {
+		audioSource = "mic"
+	}
+	if audioSource != "" {
+		args = append(args, fmt.Sprintf("audio_source=%s", audioSource))
+	}
+
+	if opts.AudioDup {
+		args = append(args, "audio_dup=true")
+	}
+
 	// Remote hardware camera streaming requires stay_awake so device stays awake with screen off
 	if opts.StayAwake || opts.VideoSource == "camera" {
 		args = append(args, "stay_awake=true")
 	}
 
-	if sp.config.VideoCodecOptions != "" {
-		args = append(args, fmt.Sprintf("video_codec_options=%s", sp.config.VideoCodecOptions))
+	videoCodecOpts := sp.config.VideoCodecOptions
+	if opts.VideoCodecOptions != "" {
+		videoCodecOpts = opts.VideoCodecOptions
+	}
+	if videoCodecOpts != "" {
+		args = append(args, fmt.Sprintf("video_codec_options=%s", videoCodecOpts))
 	}
 
 	return args
@@ -122,12 +144,12 @@ func (sp *ScrcpyProcess) NeedsRestart(opts ScrcpyOptions) bool {
 	sp.mu.Lock()
 	defer sp.mu.Unlock()
 
-	// If video_source is explicitly specified and changed (e.g. display -> camera, or camera -> display)
+	// 1. Video source change (display <-> camera)
 	if opts.VideoSource != "" && opts.VideoSource != sp.currentOptions.VideoSource {
 		return true
 	}
 
-	// If in camera mode, check if camera attributes changed
+	// 2. Camera attributes if running in or switching to camera mode
 	if opts.VideoSource == "camera" || (opts.VideoSource == "" && sp.currentOptions.VideoSource == "camera") {
 		if opts.CameraFacing != "" && opts.CameraFacing != sp.currentOptions.CameraFacing {
 			return true
@@ -147,20 +169,63 @@ func (sp *ScrcpyProcess) NeedsRestart(opts ScrcpyOptions) bool {
 		if opts.CameraOrientation != "" && opts.CameraOrientation != sp.currentOptions.CameraOrientation {
 			return true
 		}
+		if opts.CameraHighSpeed != sp.currentOptions.CameraHighSpeed {
+			return true
+		}
+		if opts.CameraAr != "" && opts.CameraAr != sp.currentOptions.CameraAr {
+			return true
+		}
 	}
 
-	// If max_size changed significantly
+	// 3. Resolution, Bitrate and Framerate changes
 	if opts.MaxSize > 0 && opts.MaxSize != sp.currentOptions.MaxSize {
+		return true
+	}
+
+	targetBitrate := opts.VideoBitRate
+	if targetBitrate == 0 {
+		targetBitrate = opts.Bitrate
+	}
+	currentBitrate := sp.currentOptions.VideoBitRate
+	if currentBitrate == 0 {
+		currentBitrate = sp.currentOptions.Bitrate
+	}
+	if targetBitrate > 0 && currentBitrate > 0 && targetBitrate != currentBitrate {
+		return true
+	}
+
+	if opts.MaxFPS > 0 && opts.MaxFPS != sp.currentOptions.MaxFPS {
+		return true
+	}
+
+	// 4. Audio settings
+	if opts.Audio != nil {
+		if sp.currentOptions.Audio == nil || *opts.Audio != *sp.currentOptions.Audio {
+			return true
+		}
+	}
+	if opts.AudioSource != "" && opts.AudioSource != sp.currentOptions.AudioSource {
+		return true
+	}
+	if opts.AudioDup != sp.currentOptions.AudioDup {
+		return true
+	}
+
+	// 5. Lifecycle and Codec settings
+	if opts.StayAwake != sp.currentOptions.StayAwake {
+		return true
+	}
+	if opts.VideoCodecOptions != "" && opts.VideoCodecOptions != sp.currentOptions.VideoCodecOptions {
 		return true
 	}
 
 	return false
 }
 
-func (sp *ScrcpyProcess) Start() error {
+func (sp *ScrcpyProcess) Start(streamer *StreamerBridge) error {
 	sp.mu.Lock()
 	defer sp.mu.Unlock()
-	return sp.startLocked(nil)
+	return sp.startLocked(streamer)
 }
 
 func (sp *ScrcpyProcess) Restart(opts ScrcpyOptions, streamer *StreamerBridge) error {
@@ -169,6 +234,11 @@ func (sp *ScrcpyProcess) Restart(opts ScrcpyOptions, streamer *StreamerBridge) e
 
 	log.Printf("[Scrcpy] Reconfiguring helper: VideoSource=%s, Facing=%s, ID=%s, Size=%s, FPS=%d, Zoom=%.2f, StayAwake=%t",
 		opts.VideoSource, opts.CameraFacing, opts.CameraID, opts.CameraSize, opts.CameraFPS, opts.CameraZoom, opts.StayAwake)
+
+	// Atomically reset media generation so new viewers do not receive stale SPS/PPS
+	if streamer != nil {
+		streamer.ResetSourceGeneration()
+	}
 
 	if sp.cmd != nil && sp.cmd.Process != nil {
 		_ = sp.cmd.Process.Kill()
@@ -182,6 +252,10 @@ func (sp *ScrcpyProcess) Restart(opts ScrcpyOptions, streamer *StreamerBridge) e
 	if sp.audioConn != nil {
 		_ = sp.audioConn.Close()
 		sp.audioConn = nil
+	}
+	if sp.controlConn != nil {
+		_ = sp.controlConn.Close()
+		sp.controlConn = nil
 	}
 
 	sp.currentOptions = opts
@@ -253,6 +327,8 @@ func (sp *ScrcpyProcess) startLocked(streamer *StreamerBridge) error {
 		log.Printf("[Scrcpy] Note: app_process start failed (running outside Android): %v", err)
 	}
 
+	readyCh := make(chan struct{}, 1)
+
 	acceptConn := func(listener net.Listener, name string) (net.Conn, error) {
 		ch := make(chan net.Conn, 1)
 		errCh := make(chan error, 1)
@@ -270,7 +346,7 @@ func (sp *ScrcpyProcess) startLocked(streamer *StreamerBridge) error {
 			return c, nil
 		case err := <-errCh:
 			return nil, err
-		case <-time.After(5 * time.Second):
+		case <-time.After(3 * time.Second):
 			return nil, fmt.Errorf("timeout waiting for %s socket connection", name)
 		}
 	}
@@ -321,7 +397,21 @@ func (sp *ScrcpyProcess) startLocked(streamer *StreamerBridge) error {
 				_ = sp.control.RequestKeyframe()
 			}
 		}
+
+		// Notify readiness once sockets are connected
+		select {
+		case readyCh <- struct{}{}:
+		default:
+		}
 	}()
+
+	// Wait up to 3 seconds for sockets to be ready so callers do not encounter races
+	select {
+	case <-readyCh:
+		log.Printf("[Scrcpy] CoreService helper sockets connected and ready")
+	case <-time.After(3 * time.Second):
+		log.Printf("[Scrcpy] Note: Continuing after socket wait timeout (running outside Android or mocked)")
+	}
 
 	return nil
 }
