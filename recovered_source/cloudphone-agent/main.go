@@ -344,28 +344,29 @@ func main() {
 						if optsJSON, err := json.Marshal(scrcpyOptsRaw); err == nil {
 							var clientOpts ScrcpyOptions
 							if err := json.Unmarshal(optsJSON, &clientOpts); err == nil {
-								// Security Permission Gate: camera streaming requires verified CanCamera capability
+								// Strict Security Gate: camera streaming requires verified CanCamera capability.
+								// Reject reconfiguration completely (ignore scrcpy_options); do NOT mutate VideoSource
+								// to "display" which would allow unauthorized clients to disrupt active camera streams.
 								if clientOpts.VideoSource == "camera" && !caps.CanCamera {
-									log.Printf("[Agent] Security alert: Client %s attempted camera stream reconfiguration without CanCamera capability; reverting to display", clientID)
-									clientOpts.VideoSource = "display"
-								}
-
-								if scrcpy.NeedsRestart(clientOpts) {
-									log.Printf("[Agent] Client %s requested stream reconfiguration (VideoSource=%s, Facing=%s, Size=%s)",
-										clientID, clientOpts.VideoSource, clientOpts.CameraFacing, clientOpts.CameraSize)
-									if err := scrcpy.Restart(clientOpts, streamer); err != nil {
-										log.Printf("[Agent] Failed to reconfigure scrcpy: %v", err)
-									} else {
-										ctrl = scrcpy.GetControlWriter()
+									log.Printf("[Agent] Security denial: Client %s attempted camera stream reconfiguration without CanCamera capability; rejecting scrcpy_options", clientID)
+								} else {
+									if scrcpy.NeedsRestart(clientOpts) {
+										log.Printf("[Agent] Client %s requested stream reconfiguration (VideoSource=%s, Facing=%s, Size=%s)",
+											clientID, clientOpts.VideoSource, clientOpts.CameraFacing, clientOpts.CameraSize)
+										if err := scrcpy.Restart(clientOpts, streamer); err != nil {
+											log.Printf("[Agent] Failed to reconfigure scrcpy: %v", err)
+										} else {
+											ctrl = scrcpy.GetControlWriter()
+										}
 									}
-								}
-								// Security Permission Gate: screen power_off requires CanControl capability
-								if clientOpts.PowerOff {
-									if !caps.CanControl {
-										log.Printf("[Agent] Security alert: Client %s attempted screen power_off without CanControl capability; denied", clientID)
-									} else if cw := scrcpy.GetControlWriter(); cw != nil {
-										_ = cw.SetDisplayPower(false)
-										log.Printf("[Agent] Screen power off applied for remote surveillance mode")
+									// Security Permission Gate: screen power_off requires CanControl capability
+									if clientOpts.PowerOff {
+										if !caps.CanControl {
+											log.Printf("[Agent] Security alert: Client %s attempted screen power_off without CanControl capability; denied", clientID)
+										} else if cw := scrcpy.GetControlWriter(); cw != nil {
+											_ = cw.SetDisplayPower(false)
+											log.Printf("[Agent] Screen power off applied for remote surveillance mode")
+										}
 									}
 								}
 							}

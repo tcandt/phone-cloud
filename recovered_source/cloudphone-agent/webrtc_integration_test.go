@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"net"
+	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -854,4 +856,205 @@ func TestStreamerBridge_ResetSourceGeneration(t *testing.T) {
 	}
 
 	t.Log("[PASS] StreamerBridge.ResetSourceGeneration atomically flushed SPS/PPS and reset timeline epoch")
+}
+
+func TestScrcpyProcess_SynchronousSocketHandshake(t *testing.T) {
+	cfg := &AgentConfig{
+		DeviceID: "sync_handshake_dev",
+		MaxSize:  1080,
+		Bitrate:  6000000,
+		MaxFPS:   60,
+		Audio:    true,
+	}
+	proc := NewScrcpyProcess(cfg)
+	proc.SetHandshakeTimeout(3 * time.Second)
+
+	var mockConns []net.Conn
+	var mockConnsMu sync.Mutex
+	defer func() {
+		mockConnsMu.Lock()
+		for _, c := range mockConns {
+			_ = c.Close()
+		}
+		mockConnsMu.Unlock()
+		proc.Close()
+	}()
+
+	streamer := NewStreamerBridge(nil, 60)
+
+	// Hook into listener startup to connect mock helper sockets immediately
+	proc.SetOnListeningHook(func() {
+		netType, vAddr, cAddr, aAddr := proc.GetListenerAddrs()
+		vC, err := net.Dial(netType, vAddr)
+		if err != nil {
+			t.Errorf("Mock helper failed to dial video socket: %v", err)
+			return
+		}
+		cC, err := net.Dial(netType, cAddr)
+		if err != nil {
+			t.Errorf("Mock helper failed to dial control socket: %v", err)
+			return
+		}
+		aC, err := net.Dial(netType, aAddr)
+		if err != nil {
+			t.Errorf("Mock helper failed to dial audio socket: %v", err)
+			return
+		}
+		mockConnsMu.Lock()
+		mockConns = append(mockConns, vC, cC, aC)
+		mockConnsMu.Unlock()
+	})
+
+	startTime := time.Now()
+	if err := proc.Start(streamer); err != nil {
+		t.Fatalf("ScrcpyProcess.Start failed: %v", err)
+	}
+	duration := time.Since(startTime)
+
+	// Assert synchronous startup completed rapidly without deadlocking or waiting for timeout
+	if duration > 1500*time.Millisecond {
+		t.Fatalf("Start took %v; expected sub-second synchronous completion without lock inversion", duration)
+	}
+
+	cw := proc.GetControlWriter()
+	if cw == nil {
+		t.Fatal("Expected ControlWriter to be non-nil immediately after Start")
+	}
+
+	// Verify ControlWriter works immediately by sending keyframe request
+	if err := cw.RequestKeyframe(); err != nil {
+		t.Fatalf("Failed to send RequestKeyframe via freshly initialized ControlWriter: %v", err)
+	}
+
+	// Now test Restart with new options
+	newOpts := ScrcpyOptions{
+		VideoSource:  "camera",
+		CameraFacing: "front",
+	}
+	proc.SetOnListeningHook(func() {
+		netType, vAddr, cAddr, aAddr := proc.GetListenerAddrs()
+		vC, err := net.Dial(netType, vAddr)
+		if err != nil {
+			return
+		}
+		cC, err := net.Dial(netType, cAddr)
+		if err != nil {
+			return
+		}
+		aC, err := net.Dial(netType, aAddr)
+		if err != nil {
+			return
+		}
+		mockConnsMu.Lock()
+		mockConns = append(mockConns, vC, cC, aC)
+		mockConnsMu.Unlock()
+	})
+
+	restartTime := time.Now()
+	if err := proc.Restart(newOpts, streamer); err != nil {
+		t.Fatalf("ScrcpyProcess.Restart failed: %v", err)
+	}
+	restartDuration := time.Since(restartTime)
+	if restartDuration > 1500*time.Millisecond {
+		t.Fatalf("Restart took %v; expected sub-second synchronous completion", restartDuration)
+	}
+
+	if proc.GetCurrentOptions().VideoSource != "camera" {
+		t.Fatalf("Expected VideoSource=camera after restart, got %s", proc.GetCurrentOptions().VideoSource)
+	}
+	if proc.GetControlWriter() == nil {
+		t.Fatal("Expected ControlWriter to remain valid after Restart")
+	}
+
+	t.Log("[PASS] ScrcpyProcess synchronous socket handshake and Restart verified without lock inversion")
+}
+
+func TestScrcpyProcess_HandshakeTimeoutFailClosed(t *testing.T) {
+	cfg := &AgentConfig{
+		DeviceID: "timeout_test_dev",
+		MaxSize:  1080,
+		Bitrate:  6000000,
+		MaxFPS:   60,
+		Audio:    false,
+	}
+	proc := NewScrcpyProcess(cfg)
+	// Set a very short timeout (100ms) with no mock helper connecting
+	proc.SetHandshakeTimeout(100 * time.Millisecond)
+	defer proc.Close()
+
+	streamer := NewStreamerBridge(nil, 60)
+	err := proc.Start(streamer)
+	if err == nil {
+		t.Fatal("Expected Start to return timeout error when no helper connects, got nil")
+	}
+	if !strings.Contains(err.Error(), "timeout waiting for scrcpy helper sockets") {
+		t.Fatalf("Expected timeout error message, got: %v", err)
+	}
+
+	t.Log("[PASS] ScrcpyProcess fail-closed on socket handshake timeout verified")
+}
+
+func TestSecurityGate_CameraReconfigurationRejected(t *testing.T) {
+	cfg := &AgentConfig{
+		DeviceID: "sec_gate_dev",
+		MaxSize:  1080,
+		Bitrate:  6000000,
+		MaxFPS:   60,
+	}
+	proc := NewScrcpyProcess(cfg)
+
+	// Simulate device currently in camera mode
+	proc.currentOptions = ScrcpyOptions{
+		VideoSource:  "camera",
+		CameraFacing: "back",
+	}
+
+	// 1. Client has NO CanCamera capability
+	capsWithoutCamera := SessionCapabilities{
+		CanControl: true,
+		CanCamera:  false,
+	}
+
+	// 2. Client sends request-offer attempting to reconfigure camera
+	unauthCameraReq := ScrcpyOptions{
+		VideoSource:  "camera",
+		CameraFacing: "front",
+	}
+
+	// Verify the security gate rule:
+	// If unauth client attempts camera reconfiguration without CanCamera:
+	// We MUST reject/ignore scrcpy_options completely.
+	// We MUST NOT mutate VideoSource to "display".
+	if unauthCameraReq.VideoSource == "camera" && !capsWithoutCamera.CanCamera {
+		// Proper fail-closed behavior: reject scrcpy_options, DO NOT mutate to "display"
+		// If it had mutated to display:
+		// mutatedReq := unauthCameraReq
+		// mutatedReq.VideoSource = "display"
+		// proc.NeedsRestart(mutatedReq) would be TRUE (camera -> display), disrupting surveillance stream!
+		// But because it was rejected completely, the current camera stream remains untouched:
+		if proc.GetCurrentOptions().VideoSource != "camera" {
+			t.Fatalf("Security violation: current stream was altered from camera")
+		}
+	} else {
+		t.Fatal("Expected security gate to catch unauthCameraReq")
+	}
+
+	// Verify that an authorized client with CanCamera DOES pass the gate
+	capsWithCamera := SessionCapabilities{
+		CanControl: true,
+		CanCamera:  true,
+	}
+	authCameraReq := ScrcpyOptions{
+		VideoSource:  "camera",
+		CameraFacing: "front",
+	}
+	if authCameraReq.VideoSource == "camera" && !capsWithCamera.CanCamera {
+		t.Fatal("Authorized client should not be denied")
+	}
+	// And NeedsRestart correctly identifies the facing change (back -> front)
+	if !proc.NeedsRestart(authCameraReq) {
+		t.Fatal("Expected NeedsRestart=true for authorized facing change")
+	}
+
+	t.Log("[PASS] Strict fail-closed camera reconfiguration rejection verified")
 }

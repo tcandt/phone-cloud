@@ -12,14 +12,25 @@ import (
 )
 
 type ScrcpyProcess struct {
-	config         *AgentConfig
-	cmd            *exec.Cmd
-	videoConn      net.Conn
-	audioConn      net.Conn
-	controlConn    net.Conn
-	control        *ControlWriter
-	currentOptions ScrcpyOptions
-	mu             sync.Mutex
+	config           *AgentConfig
+	cmd              *exec.Cmd
+	videoConn        net.Conn
+	audioConn        net.Conn
+	controlConn      net.Conn
+	control          *ControlWriter
+	currentOptions   ScrcpyOptions
+	mu               sync.Mutex
+	startMu          sync.Mutex
+	handshakeTimeout time.Duration
+
+	// Cached listener network and addresses for inspection or mock testing
+	listenerNet string
+	videoAddr   string
+	audioAddr   string
+	ctrlAddr    string
+
+	// Optional hook triggered as soon as listeners are bound and ready for connections
+	onListening func()
 }
 
 func NewScrcpyProcess(cfg *AgentConfig) *ScrcpyProcess {
@@ -222,24 +233,51 @@ func (sp *ScrcpyProcess) NeedsRestart(opts ScrcpyOptions) bool {
 	return false
 }
 
-func (sp *ScrcpyProcess) Start(streamer *StreamerBridge) error {
+func (sp *ScrcpyProcess) SetHandshakeTimeout(d time.Duration) {
 	sp.mu.Lock()
 	defer sp.mu.Unlock()
-	return sp.startLocked(streamer)
+	sp.handshakeTimeout = d
+}
+
+func (sp *ScrcpyProcess) SetOnListeningHook(fn func()) {
+	sp.mu.Lock()
+	defer sp.mu.Unlock()
+	sp.onListening = fn
+}
+
+func (sp *ScrcpyProcess) GetListenerAddrs() (network, videoAddr, ctrlAddr, audioAddr string) {
+	sp.mu.Lock()
+	defer sp.mu.Unlock()
+	return sp.listenerNet, sp.videoAddr, sp.ctrlAddr, sp.audioAddr
+}
+
+func (sp *ScrcpyProcess) Start(streamer *StreamerBridge) error {
+	sp.mu.Lock()
+	opts := sp.currentOptions
+	sp.mu.Unlock()
+	return sp.startInternal(opts, streamer, false)
 }
 
 func (sp *ScrcpyProcess) Restart(opts ScrcpyOptions, streamer *StreamerBridge) error {
-	sp.mu.Lock()
-	defer sp.mu.Unlock()
+	return sp.startInternal(opts, streamer, true)
+}
 
-	log.Printf("[Scrcpy] Reconfiguring helper: VideoSource=%s, Facing=%s, ID=%s, Size=%s, FPS=%d, Zoom=%.2f, StayAwake=%t",
-		opts.VideoSource, opts.CameraFacing, opts.CameraID, opts.CameraSize, opts.CameraFPS, opts.CameraZoom, opts.StayAwake)
+func (sp *ScrcpyProcess) startInternal(opts ScrcpyOptions, streamer *StreamerBridge, isRestart bool) error {
+	sp.startMu.Lock()
+	defer sp.startMu.Unlock()
 
-	// Atomically reset media generation so new viewers do not receive stale SPS/PPS
-	if streamer != nil {
-		streamer.ResetSourceGeneration()
+	if isRestart {
+		log.Printf("[Scrcpy] Reconfiguring helper: VideoSource=%s, Facing=%s, ID=%s, Size=%s, FPS=%d, Zoom=%.2f, StayAwake=%t",
+			opts.VideoSource, opts.CameraFacing, opts.CameraID, opts.CameraSize, opts.CameraFPS, opts.CameraZoom, opts.StayAwake)
+
+		// Atomically reset media generation so new viewers do not receive stale SPS/PPS
+		if streamer != nil {
+			streamer.ResetSourceGeneration()
+		}
 	}
 
+	// 1. Cleanup any previously running process or active connections under lock
+	sp.mu.Lock()
 	if sp.cmd != nil && sp.cmd.Process != nil {
 		_ = sp.cmd.Process.Kill()
 		_ = sp.cmd.Wait()
@@ -257,15 +295,19 @@ func (sp *ScrcpyProcess) Restart(opts ScrcpyOptions, streamer *StreamerBridge) e
 		_ = sp.controlConn.Close()
 		sp.controlConn = nil
 	}
-
 	sp.currentOptions = opts
-	if err := sp.startLocked(streamer); err != nil {
-		return fmt.Errorf("failed to restart scrcpy: %w", err)
+	audioEnabled := sp.config.Audio
+	if opts.Audio != nil {
+		audioEnabled = *opts.Audio
 	}
-	return nil
-}
+	timeout := sp.handshakeTimeout
+	if timeout <= 0 {
+		timeout = 5 * time.Second
+	}
+	onListening := sp.onListening
+	sp.mu.Unlock()
 
-func (sp *ScrcpyProcess) startLocked(streamer *StreamerBridge) error {
+	// 2. Setup listeners for the incoming helper sockets
 	videoSock := fmt.Sprintf("cp_vid_%s", sp.config.DeviceID)
 	audioSock := fmt.Sprintf("cp_aud_%s", sp.config.DeviceID)
 	ctrlSock := fmt.Sprintf("cp_ctrl_%s", sp.config.DeviceID)
@@ -283,134 +325,196 @@ func (sp *ScrcpyProcess) startLocked(streamer *StreamerBridge) error {
 		if err != nil {
 			return fmt.Errorf("failed to listen video socket: %w", err)
 		}
-		audioListener, err = net.Listen("unix", "@"+audioSock)
-		if err != nil {
-			videoListener.Close()
-			return fmt.Errorf("failed to listen audio socket: %w", err)
+		if audioEnabled {
+			audioListener, err = net.Listen("unix", "@"+audioSock)
+			if err != nil {
+				_ = videoListener.Close()
+				return fmt.Errorf("failed to listen audio socket: %w", err)
+			}
 		}
 		ctrlListener, err = net.Listen("unix", "@"+ctrlSock)
 		if err != nil {
-			videoListener.Close()
-			audioListener.Close()
+			_ = videoListener.Close()
+			if audioListener != nil {
+				_ = audioListener.Close()
+			}
 			return fmt.Errorf("failed to listen control socket: %w", err)
 		}
 	} else {
-		videoListener, _ = net.Listen("tcp", "127.0.0.1:0")
-		audioListener, _ = net.Listen("tcp", "127.0.0.1:0")
-		ctrlListener, _ = net.Listen("tcp", "127.0.0.1:0")
+		videoListener, err = net.Listen("tcp", "127.0.0.1:0")
+		if err != nil {
+			return fmt.Errorf("failed to listen video tcp socket: %w", err)
+		}
+		if audioEnabled {
+			audioListener, err = net.Listen("tcp", "127.0.0.1:0")
+			if err != nil {
+				_ = videoListener.Close()
+				return fmt.Errorf("failed to listen audio tcp socket: %w", err)
+			}
+		}
+		ctrlListener, err = net.Listen("tcp", "127.0.0.1:0")
+		if err != nil {
+			_ = videoListener.Close()
+			if audioListener != nil {
+				_ = audioListener.Close()
+			}
+			return fmt.Errorf("failed to listen control tcp socket: %w", err)
+		}
 	}
 
+	sp.mu.Lock()
+	sp.listenerNet = networkType
+	sp.videoAddr = videoListener.Addr().String()
+	if audioListener != nil {
+		sp.audioAddr = audioListener.Addr().String()
+	} else {
+		sp.audioAddr = ""
+	}
+	sp.ctrlAddr = ctrlListener.Addr().String()
+	sp.mu.Unlock()
+
+	// 3. Launch helper process
 	jarPath := sp.config.JarPath
 	if jarPath == "" {
 		jarPath = "/data/local/tmp/libsys_core.so"
 	}
 
-	args := sp.buildArgs(sp.currentOptions, videoSock, audioSock, ctrlSock)
+	args := sp.buildArgs(opts, videoSock, audioSock, ctrlSock)
 
 	appProcess := "/system/bin/app_process"
 	if _, errStat := os.Stat(appProcess); errStat != nil {
 		appProcess = "app_process"
 	}
 
-	sp.cmd = exec.Command(appProcess, args...)
-	sp.cmd.Env = append(os.Environ(),
+	cmd := exec.Command(appProcess, args...)
+	cmd.Env = append(os.Environ(),
 		fmt.Sprintf("CLASSPATH=%s", jarPath),
 		"GODEBUG=asyncpreemptoff=1",
 	)
-
 	if sp.config.Root {
-		sp.cmd.Env = append(sp.cmd.Env, "CP_AGENT_ROOT=true")
+		cmd.Env = append(cmd.Env, "CP_AGENT_ROOT=true")
 	}
 
 	log.Printf("[Scrcpy] Launching %s with args: %v", appProcess, args)
-	if err := sp.cmd.Start(); err != nil {
+	if err := cmd.Start(); err != nil {
 		log.Printf("[Scrcpy] Note: app_process start failed (running outside Android): %v", err)
 	}
 
-	readyCh := make(chan struct{}, 1)
+	sp.mu.Lock()
+	sp.cmd = cmd
+	sp.mu.Unlock()
 
-	acceptConn := func(listener net.Listener, name string) (net.Conn, error) {
-		ch := make(chan net.Conn, 1)
-		errCh := make(chan error, 1)
-		go func() {
-			c, err := listener.Accept()
-			if err != nil {
-				errCh <- err
-			} else {
-				ch <- c
-			}
-		}()
+	if onListening != nil {
+		go onListening()
+	}
+
+	// 4. Synchronous Socket-Ready Handshake: No locks held during accept wait!
+	type acceptResult struct {
+		role string
+		conn net.Conn
+		err  error
+	}
+
+	resultCh := make(chan acceptResult, 3)
+
+	acceptRole := func(l net.Listener, role string) {
+		c, err := l.Accept()
+		resultCh <- acceptResult{role: role, conn: c, err: err}
+	}
+
+	go acceptRole(videoListener, "video")
+	go acceptRole(ctrlListener, "control")
+	if audioEnabled && audioListener != nil {
+		go acceptRole(audioListener, "audio")
+	}
+
+	expectedCount := 2
+	if audioEnabled && audioListener != nil {
+		expectedCount = 3
+	}
+
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+
+	var vConn, aConn, cConn net.Conn
+	var firstErr error
+
+	for i := 0; i < expectedCount; i++ {
 		select {
-		case c := <-ch:
-			log.Printf("[Scrcpy] %s socket connected", name)
-			return c, nil
-		case err := <-errCh:
-			return nil, err
-		case <-time.After(3 * time.Second):
-			return nil, fmt.Errorf("timeout waiting for %s socket connection", name)
+		case res := <-resultCh:
+			if res.err != nil {
+				if firstErr == nil {
+					firstErr = fmt.Errorf("accept error on %s socket: %w", res.role, res.err)
+				}
+			} else {
+				switch res.role {
+				case "video":
+					vConn = res.conn
+				case "control":
+					cConn = res.conn
+				case "audio":
+					aConn = res.conn
+				}
+			}
+		case <-timer.C:
+			firstErr = fmt.Errorf("timeout waiting for scrcpy helper sockets after %v", timeout)
+		}
+		if firstErr != nil {
+			break
 		}
 	}
 
-	go func() {
-		defer videoListener.Close()
-		defer audioListener.Close()
-		defer ctrlListener.Close()
+	// Close listeners so any remaining accept goroutines unblock immediately
+	_ = videoListener.Close()
+	_ = ctrlListener.Close()
+	if audioListener != nil {
+		_ = audioListener.Close()
+	}
 
-		vConn, err := acceptConn(videoListener, "video")
-		if err == nil {
-			sp.mu.Lock()
-			sp.videoConn = vConn
-			sp.mu.Unlock()
-			if streamer != nil {
-				go streamer.StreamVideo(vConn)
-			}
+	// Fail-closed on error or timeout: cleanup and return explicit error
+	if firstErr != nil {
+		if vConn != nil {
+			_ = vConn.Close()
 		}
+		if cConn != nil {
+			_ = cConn.Close()
+		}
+		if aConn != nil {
+			_ = aConn.Close()
+		}
+		sp.mu.Lock()
+		if sp.cmd != nil && sp.cmd.Process != nil {
+			_ = sp.cmd.Process.Kill()
+			sp.cmd = nil
+		}
+		sp.mu.Unlock()
+		return fmt.Errorf("scrcpy socket handshake failed: %w", firstErr)
+	}
 
-		audioEnabled := sp.config.Audio
-		if sp.currentOptions.Audio != nil {
-			audioEnabled = *sp.currentOptions.Audio
-		}
-		if audioEnabled {
-			aConn, err := acceptConn(audioListener, "audio")
-			if err == nil {
-				sp.mu.Lock()
-				sp.audioConn = aConn
-				sp.mu.Unlock()
-				if streamer != nil {
-					go streamer.StreamAudio(aConn, streamer.previewStreamer)
-				}
-			}
-		}
+	// Sockets are connected! Atomically assign state under lock
+	sp.mu.Lock()
+	sp.videoConn = vConn
+	sp.controlConn = cConn
+	if sp.control == nil {
+		sp.control = NewControlWriter(cConn)
+	} else {
+		sp.control.UpdateConn(cConn)
+	}
+	if audioEnabled {
+		sp.audioConn = aConn
+	}
+	cw := sp.control
+	sp.mu.Unlock()
 
-		cConn, err := acceptConn(ctrlListener, "control")
-		if err == nil {
-			sp.mu.Lock()
-			sp.controlConn = cConn
-			if sp.control == nil {
-				sp.control = NewControlWriter(cConn)
-			} else {
-				sp.control.UpdateConn(cConn)
-			}
-			sp.mu.Unlock()
-			if streamer != nil {
-				streamer.SetControlWriter(sp.control)
-				_ = sp.control.RequestKeyframe()
-			}
-		}
+	log.Printf("[Scrcpy] CoreService helper sockets connected and verified ready")
 
-		// Notify readiness once sockets are connected
-		select {
-		case readyCh <- struct{}{}:
-		default:
+	if streamer != nil {
+		streamer.SetControlWriter(cw)
+		_ = cw.RequestKeyframe()
+		go streamer.StreamVideo(vConn)
+		if audioEnabled && aConn != nil {
+			go streamer.StreamAudio(aConn, streamer.previewStreamer)
 		}
-	}()
-
-	// Wait up to 3 seconds for sockets to be ready so callers do not encounter races
-	select {
-	case <-readyCh:
-		log.Printf("[Scrcpy] CoreService helper sockets connected and ready")
-	case <-time.After(3 * time.Second):
-		log.Printf("[Scrcpy] Note: Continuing after socket wait timeout (running outside Android or mocked)")
 	}
 
 	return nil
@@ -429,19 +533,30 @@ func (sp *ScrcpyProcess) GetCurrentOptions() ScrcpyOptions {
 }
 
 func (sp *ScrcpyProcess) Close() {
+	sp.startMu.Lock()
+	defer sp.startMu.Unlock()
+
 	sp.mu.Lock()
 	defer sp.mu.Unlock()
 
 	if sp.control != nil {
 		sp.control.Close()
+		sp.control = nil
 	}
 	if sp.videoConn != nil {
-		sp.videoConn.Close()
+		_ = sp.videoConn.Close()
+		sp.videoConn = nil
 	}
 	if sp.audioConn != nil {
-		sp.audioConn.Close()
+		_ = sp.audioConn.Close()
+		sp.audioConn = nil
+	}
+	if sp.controlConn != nil {
+		_ = sp.controlConn.Close()
+		sp.controlConn = nil
 	}
 	if sp.cmd != nil && sp.cmd.Process != nil {
 		_ = sp.cmd.Process.Kill()
+		sp.cmd = nil
 	}
 }
